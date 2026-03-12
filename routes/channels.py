@@ -5,6 +5,7 @@ Channels 管理路由
 import os
 import json
 import copy
+import asyncio
 
 from core.env import env_bool
 import httpx
@@ -312,12 +313,30 @@ async def test_channel(
     if model not in model_dict:
         raise HTTPException(status_code=400, detail=f"model '{model}' 不在当前渠道模型配置中")
 
-    # 构建测试请求
+    # 构建测试请求（允许外部覆盖部分参数，默认保持轻量）
+    prompt = test_config.get("prompt") or "Hi"
+    messages = [{"role": "user", "content": str(prompt)}]
+
+    stream = bool(test_config.get("stream", False))
+
+    max_tokens = test_config.get("max_tokens", 16)
+    try:
+        max_tokens = int(max_tokens) if max_tokens is not None else 16
+    except Exception:
+        max_tokens = 16
+
+    temperature = test_config.get("temperature", 0.5)
+    try:
+        temperature = float(temperature) if temperature is not None else 0.5
+    except Exception:
+        temperature = 0.5
+
     test_request = RequestModel(
         model=model,
-        messages=[{"role": "user", "content": "Hi"}],
-        max_tokens=1000,
-        stream=False,
+        messages=messages,
+        max_tokens=max_tokens,
+        stream=stream,
+        temperature=temperature,
     )
 
     # 获取代理配置（优先级：test_config > provider > global）
@@ -327,7 +346,7 @@ async def test_channel(
         proxy = safe_get(provider, "preferences", "proxy", default=proxy)
 
     start_time = time()
-    
+
     try:
         # 使用正式链路的 payload 构建逻辑（包含参数覆写、请求插件）
         url, headers, payload = await get_payload(test_request, engine, provider, selected_api_key)
@@ -351,17 +370,76 @@ async def test_channel(
             logger.info(f"Channel test - URL: {url}")
             logger.info(f"Channel test - Headers: {headers}")
             logger.info(f"Channel test - Payload (truncated): {pretty_payload[:2000]}")
-        
+
         async with app.state.client_manager.get_client(url, proxy) as client:
+            # stream 模式：只读取少量响应验证连通性
+            if stream:
+                async with client.stream(
+                    "POST",
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=timeout,
+                ) as response:
+                    latency_ms = int((time() - start_time) * 1000)
+                    upstream_status_code = int(response.status_code)
+                    auth_failed = upstream_status_code in (401, 403)
+
+                    preview = ""
+                    try:
+                        it = response.aiter_text()
+                        preview = await asyncio.wait_for(it.__anext__(), timeout=min(10, timeout))
+                        preview = (preview or "")[:800]
+                    except StopAsyncIteration:
+                        preview = ""
+                    except Exception as e:
+                        preview = f"<stream read failed: {type(e).__name__}>"[:800]
+
+                    if 200 <= upstream_status_code < 300:
+                        return JSONResponse(content={
+                            "success": True,
+                            "latency_ms": latency_ms,
+                            "message": "测试成功",
+                            "upstream_status_code": upstream_status_code,
+                            "auth_failed": auth_failed,
+                            "stream": True,
+                            "response_preview": preview,
+                        })
+
+                    err_text = ""
+                    try:
+                        err_text = (await response.aread()).decode("utf-8", errors="ignore")[:800]
+                    except Exception:
+                        err_text = ""
+                    if not err_text:
+                        err_text = f"HTTP {upstream_status_code}"
+
+                    return JSONResponse(
+                        status_code=200,
+                        content={
+                            "success": False,
+                            "latency_ms": latency_ms,
+                            "message": f"HTTP {upstream_status_code}",
+                            "error": err_text,
+                            "upstream_status_code": upstream_status_code,
+                            "auth_failed": auth_failed,
+                            "stream": True,
+                            "response_preview": preview,
+                        },
+                    )
+
+            # 非 stream：正常 POST
             response = await client.post(
                 url,
                 headers=headers,
                 json=payload,
-                timeout=timeout
+                timeout=timeout,
             )
-            
+
             latency_ms = int((time() - start_time) * 1000)
-            
+            upstream_status_code = int(response.status_code)
+            auth_failed = upstream_status_code in (401, 403)
+
             # 统一解析响应体
             resp_json = None
             error_detail = ""
@@ -369,7 +447,7 @@ async def test_channel(
                 resp_json = response.json()
             except Exception:
                 resp_json = None
-            
+
             if isinstance(resp_json, dict):
                 if resp_json.get("error") is not None:
                     err_obj = resp_json.get("error")
@@ -384,37 +462,43 @@ async def test_channel(
                         error_detail = str(err_obj)
                 elif resp_json.get("detail") and not resp_json.get("choices"):
                     error_detail = str(resp_json.get("detail"))
-            
+
             if not error_detail:
                 try:
                     body_text = response.text
                     if body_text and body_text.strip() and response.status_code >= 400:
-                        error_detail = body_text[:500]
+                        error_detail = body_text[:800]
                 except Exception:
                     pass
-            
-            is_success = 200 <= response.status_code < 300 and not error_detail
-            
+
+            is_success = 200 <= upstream_status_code < 300 and not error_detail
+
             if is_success:
                 return JSONResponse(content={
                     "success": True,
                     "latency_ms": latency_ms,
-                    "message": "测试成功"
+                    "message": "测试成功",
+                    "upstream_status_code": upstream_status_code,
+                    "auth_failed": auth_failed,
+                    "stream": False,
                 })
-            else:
-                if not error_detail:
-                    error_detail = f"HTTP {response.status_code}"
-                
-                return JSONResponse(
-                    status_code=200,
-                    content={
-                        "success": False,
-                        "latency_ms": latency_ms,
-                        "message": f"HTTP {response.status_code}",
-                        "error": error_detail
-                    }
-                )
-                
+
+            if not error_detail:
+                error_detail = f"HTTP {upstream_status_code}"
+
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": False,
+                    "latency_ms": latency_ms,
+                    "message": f"HTTP {upstream_status_code}",
+                    "error": error_detail,
+                    "upstream_status_code": upstream_status_code,
+                    "auth_failed": auth_failed,
+                    "stream": False,
+                },
+            )
+
     except httpx.TimeoutException:
         latency_ms = int((time() - start_time) * 1000)
         return JSONResponse(
@@ -423,7 +507,10 @@ async def test_channel(
                 "success": False,
                 "latency_ms": latency_ms,
                 "message": "请求超时",
-                "error": f"请求超时（{timeout}秒）"
+                "error": f"请求超时（{timeout}秒）",
+                "upstream_status_code": None,
+                "auth_failed": False,
+                "stream": stream,
             }
         )
     except httpx.ConnectError as e:
@@ -433,12 +520,15 @@ async def test_channel(
                 "success": False,
                 "latency_ms": None,
                 "message": "连接失败",
-                "error": str(e)
+                "error": str(e),
+                "upstream_status_code": None,
+                "auth_failed": False,
+                "stream": stream,
             }
         )
     except Exception as e:
         latency_ms = int((time() - start_time) * 1000) if time() - start_time > 0 else None
-        
+
         error_message = str(e)
         if hasattr(e, 'response'):
             try:
@@ -451,19 +541,22 @@ async def test_channel(
                 )
             except Exception:
                 pass
-        
+
         logger.error(f"Channel test failed: {error_message}")
         if is_debug:
             import traceback
             traceback.print_exc()
-        
+
         return JSONResponse(
             status_code=200,
             content={
                 "success": False,
                 "latency_ms": latency_ms,
                 "message": "测试失败",
-                "error": error_message
+                "error": error_message,
+                "upstream_status_code": None,
+                "auth_failed": False,
+                "stream": stream,
             }
         )
 
