@@ -200,7 +200,7 @@ export default function Channels() {
         preferences: {
           ...basePreferences,
           weight: basePreferences.weight ?? provider.weight ?? 10,
-          cooldown_period: basePreferences.cooldown_period ?? 300,
+          cooldown_period: basePreferences.cooldown_period ?? 3,
           api_key_schedule_algorithm: basePreferences.api_key_schedule_algorithm || 'round_robin',
           proxy: basePreferences.proxy || '',
           tools: basePreferences.tools !== false,
@@ -221,7 +221,7 @@ export default function Channels() {
         groups: ['default'],
         models: [],
         mappings: [],
-        preferences: { weight: 10, cooldown_period: 300, api_key_schedule_algorithm: 'round_robin', tools: true, enabled_plugins: [] }
+        preferences: { weight: 10, cooldown_period: 3, api_key_schedule_algorithm: 'round_robin', tools: true, enabled_plugins: [] }
       });
     }
     setIsModalOpen(true);

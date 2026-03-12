@@ -22,6 +22,18 @@ from ..response import check_response
 
 
 # ============================================================
+# 工具函数
+# ============================================================
+
+def _normalize_claude_base_url(base_url: str) -> str:
+    """归一化 Claude base_url，去除末尾的 /messages 端点路径，确保只保留到 /v1 层级。
+    兼容旧配置 https://api.anthropic.com/v1/messages 和新配置 https://api.anthropic.com/v1。"""
+    url = base_url.rstrip('/')
+    if url.endswith('/v1/messages'):
+        url = url[:-len('/messages')]
+    return url
+
+# ============================================================
 # Claude 格式化函数
 # ============================================================
 
@@ -150,7 +162,7 @@ async def get_claude_payload(request, engine, provider, api_key=None):
         "anthropic-version": "2023-06-01",
         "anthropic-beta": anthropic_beta,
     }
-    url = provider['base_url']
+    url = _normalize_claude_base_url(provider['base_url']) + '/messages'
 
     messages = []
     system_prompt = None
@@ -510,6 +522,41 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
     yield "data: [DONE]" + end_of_line
 
 
+async def fetch_claude_models(client, provider):
+    """获取 Anthropic Claude API 的模型列表"""
+    base_url = _normalize_claude_base_url(provider.get('base_url', 'https://api.anthropic.com/v1'))
+    api_key = provider.get('api')
+    if isinstance(api_key, list):
+        api_key = api_key[0] if api_key else None
+
+    headers = {
+        'Content-Type': 'application/json',
+        'anthropic-version': '2023-06-01',
+    }
+    if api_key:
+        headers['x-api-key'] = api_key
+
+    models = []
+    after_id = None
+    while True:
+        url = f"{base_url}/models?limit=1000"
+        if after_id:
+            url += f"&after_id={after_id}"
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, dict) and 'data' in data:
+            models.extend(m.get('id') for m in data['data'] if m.get('id'))
+            if data.get('has_more') and data.get('last_id'):
+                after_id = data['last_id']
+            else:
+                break
+        else:
+            break
+
+    return models
+
+
 def register():
     """注册 Claude 渠道到注册中心"""
     from .registry import register_channel
@@ -517,12 +564,12 @@ def register():
     register_channel(
         id="claude",
         type_name="anthropic",
-        default_base_url="https://api.anthropic.com/v1/messages",
+        default_base_url="https://api.anthropic.com/v1",
         auth_header="x-api-key: {api_key}",
         description="Anthropic Claude API",
         request_adapter=get_claude_payload,
         passthrough_payload_adapter=patch_passthrough_claude_payload,
         response_adapter=fetch_claude_response,
         stream_adapter=fetch_claude_response_stream,
-        models_adapter=None,
+        models_adapter=fetch_claude_models,
     )

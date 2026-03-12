@@ -309,7 +309,7 @@ export default function Settings() {
                 <label className="text-sm font-medium text-foreground mb-1.5 block">渠道冷却时间 (秒)</label>
                 <input
                   type="number" min="0"
-                  value={preferences.cooldown_period ?? 300}
+                  value={preferences.cooldown_period ?? 3}
                   onChange={e => updatePreference('cooldown_period', parseInt(e.target.value))}
                   className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
                 />

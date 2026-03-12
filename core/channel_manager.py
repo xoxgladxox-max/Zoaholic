@@ -17,7 +17,7 @@ class ChannelManager:
     - get_available_providers: 从 provider 列表中过滤掉冷却中的模型
     """
 
-    def __init__(self, cooldown_period: int = 300) -> None:
+    def __init__(self, cooldown_period: int = 3) -> None:
         # key: "provider/model" -> value: datetime 上次被标记不可用的时间
         self._excluded_models = defaultdict(lambda: None)
         self.cooldown_period = cooldown_period
