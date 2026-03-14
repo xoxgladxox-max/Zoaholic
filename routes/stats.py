@@ -15,7 +15,7 @@ from db import RequestStat, ChannelStat, async_session_scope, DISABLE_DATABASE, 
 from core.stats import get_usage_data
 from utils import safe_get, query_channel_key_stats
 from routes.deps import rate_limit_dependency, verify_api_key, verify_admin_api_key, get_app
-from core.d1_client import parse_d1_datetime
+from core.d1_client import parse_d1_datetime, format_d1_datetime
 
 router = APIRouter()
 
@@ -541,8 +541,8 @@ async def get_usage_analysis(
     start_datetime: Optional[str] = None,
     end_datetime: Optional[str] = None,
     hours: Optional[int] = Query(default=24, ge=1, le=8760, description="Lookback hours (used when start/end not provided)"),
-    provider: Optional[str] = None,
-    model: Optional[str] = None,
+    provider: Optional[str] = Query(default=None, description="Provider filter, comma-separated for multiple"),
+    model: Optional[str] = Query(default=None, description="Model filter, comma-separated for multiple"),
 ):
     """
     按渠道和模型分组的用量分析，返回请求次数和 Token 消耗量，用于费用模拟。
@@ -553,6 +553,9 @@ async def get_usage_analysis(
     now = datetime.now(timezone.utc)
     start_dt = None
     end_dt = None
+
+    provider_list = [p.strip() for p in provider.split(',') if p.strip()] if provider else []
+    model_list = [m.strip() for m in model.split(',') if m.strip()] if model else []
 
     if start_datetime or end_datetime:
         try:
@@ -590,12 +593,22 @@ async def get_usage_analysis(
         if end_dt:
             sql += " AND timestamp <= ?"
             params.append(end_dt)
-        if provider:
-            sql += " AND provider = ?"
-            params.append(provider)
-        if model:
-            sql += " AND model = ?"
-            params.append(model)
+        if provider_list:
+            if len(provider_list) == 1:
+                sql += " AND provider = ?"
+                params.append(provider_list[0])
+            else:
+                placeholders = ','.join(['?'] * len(provider_list))
+                sql += f" AND provider IN ({placeholders})"
+                params.extend(provider_list)
+        if model_list:
+            if len(model_list) == 1:
+                sql += " AND model = ?"
+                params.append(model_list[0])
+            else:
+                placeholders = ','.join(['?'] * len(model_list))
+                sql += f" AND model IN ({placeholders})"
+                params.extend(model_list)
         sql += " AND provider IS NOT NULL AND provider != ''"
         sql += " AND model IS NOT NULL AND model != ''"
         sql += " GROUP BY provider, model ORDER BY request_count DESC"
@@ -626,10 +639,16 @@ async def get_usage_analysis(
                 query = query.where(RequestStat.timestamp >= start_dt)
             if end_dt:
                 query = query.where(RequestStat.timestamp <= end_dt)
-            if provider:
-                query = query.where(RequestStat.provider == provider)
-            if model:
-                query = query.where(RequestStat.model == model)
+            if provider_list:
+                if len(provider_list) == 1:
+                    query = query.where(RequestStat.provider == provider_list[0])
+                else:
+                    query = query.where(RequestStat.provider.in_(provider_list))
+            if model_list:
+                if len(model_list) == 1:
+                    query = query.where(RequestStat.model == model_list[0])
+                else:
+                    query = query.where(RequestStat.model.in_(model_list))
             query = query.where(
                 RequestStat.provider.isnot(None),
                 RequestStat.provider != '',
@@ -658,6 +677,112 @@ async def get_usage_analysis(
         "end_datetime": end_detail,
         "provider_filter": provider or "all",
         "model_filter": model or "all",
+    })
+
+
+@router.get("/v1/stats/model_trend", dependencies=[Depends(rate_limit_dependency)])
+async def get_model_trend(
+    request: Request,
+    token: str = Depends(verify_admin_api_key),
+    start_datetime: Optional[str] = None,
+    end_datetime: Optional[str] = None,
+    hours: Optional[int] = Query(default=24, ge=1, le=8760),
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+):
+    """
+    获取筛选模型的时间趋势数据，用于折线图展示。
+    按小时聚合请求次数和 token 使用量。
+    """
+    if DISABLE_DATABASE:
+        return JSONResponse(content={"data": []})
+
+    now = datetime.now(timezone.utc)
+    start_dt = parse_datetime_input(start_datetime) if start_datetime else (now - timedelta(hours=hours or 24))
+    end_dt = parse_datetime_input(end_datetime) if end_datetime else now
+
+    provider_list = [p.strip() for p in provider.split(',') if p.strip()] if provider else []
+    model_list = [m.strip() for m in model.split(',') if m.strip()] if model else []
+
+    if (DB_TYPE or "sqlite").lower() == "d1":
+        from db import d1_client
+        # D1/SQLite 使用 strftime 聚合。D1 存储的是字符串，通常格式为 'YYYY-MM-DD HH:MM:SS'
+        # 我们将其截断到小时 'YYYY-MM-DD HH'
+        time_group = "strftime('%Y-%m-%d %H:00:00', timestamp)"
+        sql = f"""
+            SELECT {time_group} AS hour, model, COUNT(*) AS count,
+            SUM(COALESCE(total_tokens, 0)) AS tokens
+            FROM request_stats WHERE timestamp >= ? AND timestamp <= ?
+        """
+        params = [format_d1_datetime(start_dt), format_d1_datetime(end_dt)]
+        if provider_list:
+            sql += f" AND provider IN ({','.join(['?']*len(provider_list))})"
+            params.extend(provider_list)
+        if model_list:
+            sql += f" AND model IN ({','.join(['?']*len(model_list))})"
+            params.extend(model_list)
+        sql += f" GROUP BY hour, model ORDER BY hour ASC"
+        
+        rows = await d1_client.query_all(sql, params)
+        data = rows
+    else:
+        async with async_session_scope() as session:
+            # PostgreSQL/MySQL 等数据库使用不同的日期截断函数
+            if (DB_TYPE or "").lower() == "postgres":
+                time_group = func.date_trunc('hour', RequestStat.timestamp)
+                order_expr = time_group
+            elif (DB_TYPE or "").lower() == "mysql":
+                time_group = func.date_format(RequestStat.timestamp, '%Y-%m-%d %H:00:00')
+                order_expr = time_group
+            else: # SQLite fallback
+                time_group = func.strftime('%Y-%m-%d %H:00:00', RequestStat.timestamp)
+                order_expr = time_group
+
+            query = select(
+                time_group.label('hour'),
+                RequestStat.model,
+                func.count().label('count'),
+                func.sum(func.coalesce(RequestStat.total_tokens, 0)).label('tokens')
+            ).where(RequestStat.timestamp >= start_dt, RequestStat.timestamp <= end_dt)
+
+            if provider_list:
+                query = query.where(RequestStat.provider.in_(provider_list))
+            if model_list:
+                query = query.where(RequestStat.model.in_(model_list))
+            query = query.where(
+         RequestStat.model.isnot(None),
+      RequestStat.model != ''
+            )
+            
+            query = query.group_by(time_group, RequestStat.model).order_by(order_expr)
+            result = await session.execute(query)
+            data = [
+                {"hour": str(row.hour), "model": row.model, "count": int(row.count), "tokens": int(row.tokens or 0)}
+                for row in result.fetchall()
+            ]
+
+    # 后处理：为了方便前端绘图，将数据转换为按时间点对齐的格式
+    # [{'hour': '...', 'model1': count, 'model2': count, ...}, ...]
+    chart_dict = {}
+    models_seen = set()
+    for item in data:
+        h = item['hour']
+        m = item['model']
+        models_seen.add(m)
+        if h not in chart_dict:
+            chart_dict[h] = {"hour": h}
+        # 这里默认展示请求次数，如果想展示 token 可以改名或增加字段
+        chart_dict[h][m] = item['count']
+        # 可选：增加 tokens 维度
+        # chart_dict[h][f"{m}_tokens"] = item['tokens']
+
+    chart_data = sorted(chart_dict.values(), key=lambda x: x['hour'])
+    
+    return JSONResponse(content={
+        "data": chart_data,
+        "models": sorted(list(models_seen)),
+        "start_datetime": start_dt.isoformat(),
+        "end_datetime": end_dt.isoformat(),
     })
 
 

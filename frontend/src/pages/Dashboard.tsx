@@ -1,12 +1,15 @@
 import { useEffect, useState } from 'react';
 import {
   Activity, Cpu, Zap, BarChart3, AlertCircle, CheckCircle2,
-  RefreshCw, Server, ChevronDown, ChevronUp, DollarSign, Search
+  RefreshCw, Server, ChevronDown, ChevronUp, DollarSign, Search, X
 } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
   PieChart, Pie, Legend
+} from 'recharts';
+import {
+  LineChart, Line, CartesianGrid
 } from 'recharts';
 
 interface StatData {
@@ -23,6 +26,11 @@ interface AnalysisEntry {
   total_prompt_tokens: number;
   total_completion_tokens: number;
   total_tokens: number;
+}
+
+interface RowPrice {
+  prompt: number;
+  completion: number;
 }
 
 const TIME_RANGES = [
@@ -47,6 +55,18 @@ const SUCCESS_COLOR = 'hsl(160 84% 39%)';
 const WARNING_COLOR = 'hsl(38 92% 50%)';
 const ERROR_COLOR = 'hsl(var(--destructive))';
 
+// 折线图专用色板，颜色间差异大，避免混淆
+const LINE_COLORS = [
+  '#3b82f6', // 蓝
+  '#ef4444', // 红
+  '#22c55e', // 绿
+  '#f59e0b', // 橙
+  '#8b5cf6', // 紫
+  '#ec4899', // 粉
+  '#06b6d4', // 青
+  '#84cc16', // 黄绿
+];
+
 const formatTokens = (n: number) => {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -60,6 +80,78 @@ const formatCost = (n: number) => {
   if (n >= 0.01) return `$${n.toFixed(4)}`;
   return `$${n.toFixed(6)}`;
 };
+
+/** 多选下拉组件 */
+function MultiSelect({
+  label,
+  options,
+  selected,
+  onChange,
+  placeholder,
+}: {
+  label: string;
+  options: string[];
+  selected: string[];
+  onChange: (val: string[]) => void;
+  placeholder: string;
+}) {
+  const toggle = (val: string) => {
+    if (selected.includes(val)) {
+      onChange(selected.filter(v => v !== val));
+    } else {
+      onChange([...selected, val]);
+    }
+  };
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1.5">
+        <label className="text-xs font-medium text-muted-foreground">{label}</label>
+        <div className="flex items-center gap-2">
+          {options.length > 0 && (
+            <button
+              type="button"
+              onClick={() => onChange(selected.length === options.length ? [] : [...options])}
+              className="text-xs text-primary hover:underline"
+            >
+              {selected.length === options.length ? '清除' : '全选'}
+            </button>
+          )}
+          {selected.length > 0 && selected.length < options.length && (
+            <button
+              type="button"
+              onClick={() => onChange([])}
+              className="text-xs text-muted-foreground hover:text-foreground"
+            >
+              清除
+            </button>
+          )}
+        </div>
+      </div>
+      <div className="flex flex-wrap gap-1.5 p-2 bg-background border border-border rounded-lg min-h-[36px] max-h-32 overflow-y-auto">
+        {options.length === 0 ? (
+          <span className="text-xs text-muted-foreground py-0.5">{placeholder}</span>
+        ) : (
+          options.map(opt => (
+            <button
+              key={opt}
+              type="button"
+              onClick={() => toggle(opt)}
+              className={`inline-flex items-center gap-1 px-2 py-1 text-xs rounded-md border transition-colors ${
+                selected.includes(opt)
+                  ? 'bg-primary text-primary-foreground border-primary'
+                  : 'bg-muted/50 text-muted-foreground border-border hover:bg-muted hover:text-foreground'
+              }`}
+            >
+              <span className="truncate max-w-[150px]">{opt}</span>
+              {selected.includes(opt) && <X className="w-3 h-3 shrink-0" />}
+            </button>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
 
 export default function Dashboard() {
   const [stats, setStats] = useState<StatData | null>(null);
@@ -78,13 +170,17 @@ export default function Dashboard() {
   const [analysisOpen, setAnalysisOpen] = useState(false);
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [analysisData, setAnalysisData] = useState<AnalysisEntry[]>([]);
-  const [analysisProvider, setAnalysisProvider] = useState('');
-  const [analysisModel, setAnalysisModel] = useState('');
+  const [analysisProviders, setAnalysisProviders] = useState<string[]>([]);
+  const [analysisModels, setAnalysisModels] = useState<string[]>([]);
   const [analysisStart, setAnalysisStart] = useState('');
   const [analysisEnd, setAnalysisEnd] = useState('');
-  const [promptPrice, setPromptPrice] = useState(0.3);
-  const [completionPrice, setCompletionPrice] = useState(1.0);
+  const [defaultPromptPrice, setDefaultPromptPrice] = useState(0.3);
+  const [defaultCompletionPrice, setDefaultCompletionPrice] = useState(1.0);
+  const [rowPrices, setRowPrices] = useState<Record<number, RowPrice>>({});
   const [analysisQueried, setAnalysisQueried] = useState(false);
+  const [trendData, setTrendData] = useState<any[]>([]);
+  const [trendModels, setTrendModels] = useState<string[]>([]);
+  const [trendLoading, setTrendLoading] = useState(false);
 
   const fetchData = async () => {
     if (!token) return;
@@ -98,7 +194,6 @@ export default function Dashboard() {
         setStats(data.stats || data);
       }
 
-      // Token 使用量：跟随当前 timeRange（单位小时），而不是固定 30 天
       const end = new Date();
       const start = new Date(end.getTime() - timeRange * 60 * 60 * 1000);
       const tokenUrl = `/v1/token_usage?start_datetime=${encodeURIComponent(start.toISOString())}&end_datetime=${encodeURIComponent(end.toISOString())}`;
@@ -120,6 +215,7 @@ export default function Dashboard() {
     if (!token) return;
     setAnalysisLoading(true);
     setAnalysisQueried(true);
+    setTrendData([]);
     try {
       const headers = { Authorization: `Bearer ${token}` };
       const params = new URLSearchParams();
@@ -133,23 +229,79 @@ export default function Dashboard() {
       if (!analysisStart && !analysisEnd) {
         params.set('hours', String(timeRange));
       }
-      if (analysisProvider) {
-        params.set('provider', analysisProvider);
+      if (analysisProviders.length > 0) {
+        params.set('provider', analysisProviders.join(','));
       }
-      if (analysisModel) {
-        params.set('model', analysisModel);
+      if (analysisModels.length > 0) {
+        params.set('model', analysisModels.join(','));
       }
 
       const res = await fetch(`/v1/stats/usage_analysis?${params}`, { headers });
+      const trendResPromise = fetch(`/v1/stats/model_trend?${params}`, { headers });
+
       if (res.ok) {
         const result = await res.json();
-        setAnalysisData(result.data || []);
+        const data: AnalysisEntry[] = result.data || [];
+        
+        setAnalysisData(prevData => {
+          // 修复价格保留逻辑：根据 provider+model 匹配旧价格
+          const newPrices: Record<number, RowPrice> = {};
+          data.forEach((entry, i) => {
+            const key = `${entry.provider}:${entry.model}`;
+            const oldIdx = prevData.findIndex(p => `${p.provider}:${p.model}` === key);
+            if (oldIdx !== -1 && rowPrices[oldIdx]) {
+              newPrices[i] = rowPrices[oldIdx];
+            } else {
+              newPrices[i] = { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
+            }
+          });
+          setRowPrices(newPrices);
+          return data;
+        });
+      }
+
+      setTrendLoading(true);
+      const trendRes = await trendResPromise;
+      if (trendRes.ok) {
+        const contentType = trendRes.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+          console.error('Trend API did not return JSON. The backend may not be restarted and the request likely fell back to index.html.');
+          setTrendData([]);
+          setTrendModels([]);
+        } else {
+          const trendResult = await trendRes.json();
+          setTrendData(trendResult.data ||[]);
+          setTrendModels(trendResult.models || []);
+        }
+      } else {
+        const text = await trendRes.text().catch(() => '');
+        console.error('Trend API request failed:', trendRes.status, text.slice(0, 200));
+        setTrendData([]);
+        setTrendModels([]);
       }
     } catch (err) {
       console.error('Failed to fetch analysis:', err);
+      setTrendData([]);
+      setTrendModels([]);
     } finally {
       setAnalysisLoading(false);
+      setTrendLoading(false);
     }
+  };
+
+  const applyDefaultPricesToAll = () => {
+    const prices: Record<number, RowPrice> = {};
+    analysisData.forEach((_, i) => {
+      prices[i] = { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
+    });
+    setRowPrices(prices);
+  };
+
+  const updateRowPrice = (index: number, field: 'prompt' | 'completion', value: number) => {
+    setRowPrices(prev => ({
+      ...prev,
+      [index]: { ...prev[index], [field]: value }
+    }));
   };
 
   useEffect(() => {
@@ -168,7 +320,6 @@ export default function Dashboard() {
 
   const timeRangeLabel = TIME_RANGES.find(r => r.value === timeRange)?.label ?? `${timeRange} 小时`;
 
-  // 从已有 stats 数据中提取可用的渠道和模型列表，用于下拉筛选
   const availableProviders = Array.from(new Set(channelStats.map(c => c.provider))).sort();
   const availableModels = Array.from(new Set(modelStats.map(m => m.model))).sort();
 
@@ -177,7 +328,10 @@ export default function Dashboard() {
   const analysisTotalPrompt = analysisData.reduce((s, r) => s + r.total_prompt_tokens, 0);
   const analysisTotalCompletion = analysisData.reduce((s, r) => s + r.total_completion_tokens, 0);
   const analysisTotalTokensAll = analysisData.reduce((s, r) => s + r.total_tokens, 0);
-  const analysisTotalCost = (analysisTotalPrompt * promptPrice + analysisTotalCompletion * completionPrice) / 1_000_000;
+  const analysisTotalCost = analysisData.reduce((s, entry, i) => {
+    const p = rowPrices[i] || { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
+    return s + (entry.total_prompt_tokens * p.prompt + entry.total_completion_tokens * p.completion) / 1_000_000;
+  }, 0);
 
   const topCards = [
     { label: '总请求量', value: totalRequests.toLocaleString(), icon: Zap, color: 'text-amber-500', bg: 'bg-amber-500/10' },
@@ -439,65 +593,55 @@ export default function Dashboard() {
               </div>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
-              {/* 渠道筛选 */}
+            {/* 渠道 & 模型多选 */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <MultiSelect
+                label="渠道（多选）"
+                options={availableProviders}
+                selected={analysisProviders}
+                onChange={setAnalysisProviders}
+                placeholder="全部渠道"
+              />
+              <MultiSelect
+                label="模型（多选）"
+                options={availableModels}
+                selected={analysisModels}
+                onChange={setAnalysisModels}
+                placeholder="全部模型"
+              />
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              {/* 默认输入价格 */}
               <div>
-                <label className="block text-xs font-medium text-muted-foreground mb-1.5">渠道</label>
-                <select
-                  value={analysisProvider}
-                  onChange={e => setAnalysisProvider(e.target.value)}
-                  className="w-full px-3 py-2 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 text-foreground"
-                >
-                  <option value="">全部渠道</option>
-                  {availableProviders.map(p => (
-                    <option key={p} value={p}>{p}</option>
-                  ))}
-                </select>
-              </div>
-              {/* 模型筛选 */}
-              <div>
-                <label className="block text-xs font-medium text-muted-foreground mb-1.5">模型</label>
-                <select
-                  value={analysisModel}
-                  onChange={e => setAnalysisModel(e.target.value)}
-                  className="w-full px-3 py-2 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 text-foreground"
-                >
-                  <option value="">全部模型</option>
-                  {availableModels.map(m => (
-                    <option key={m} value={m}>{m}</option>
-                  ))}
-                </select>
-              </div>
-              {/* 输入价格 */}
-              <div>
-                <label className="block text-xs font-medium text-muted-foreground mb-1.5">输入价格 ($/百万Token)</label>
+                <label className="block text-xs font-medium text-muted-foreground mb-1.5">默认输入价格 ($/M)</label>
                 <input
                   type="number"
                   step="0.01"
                   min="0"
-                  value={promptPrice}
-                  onChange={e => setPromptPrice(parseFloat(e.target.value) || 0)}
+                  value={defaultPromptPrice}
+                  onChange={e => setDefaultPromptPrice(parseFloat(e.target.value) || 0)}
                   className="w-full px-3 py-2 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 text-foreground"
                 />
               </div>
-              {/* 输出价格 */}
+              {/* 默认输出价格 */}
               <div>
-                <label className="block text-xs font-medium text-muted-foreground mb-1.5">输出价格 ($/百万Token)</label>
+                <label className="block text-xs font-medium text-muted-foreground mb-1.5">默认输出价格 ($/M)</label>
                 <input
                   type="number"
                   step="0.01"
                   min="0"
-                  value={completionPrice}
-                  onChange={e => setCompletionPrice(parseFloat(e.target.value) || 0)}
+                  value={defaultCompletionPrice}
+                  onChange={e => setDefaultCompletionPrice(parseFloat(e.target.value) || 0)}
                   className="w-full px-3 py-2 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 text-foreground"
                 />
               </div>
               {/* 查询按钮 */}
-              <div className="flex items-end">
+              <div className="flex items-end gap-2">
                 <button
                   onClick={fetchAnalysis}
                   disabled={analysisLoading}
-                  className="w-full px-4 py-2 text-sm font-medium bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
+                  className="flex-1 px-4 py-2 text-sm font-medium bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
                 >
                   {analysisLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
                   查询
@@ -508,6 +652,64 @@ export default function Dashboard() {
             {/* 查询结果 */}
             {analysisQueried && (
               <div className="space-y-4">
+                {/* 模型趋势折线图 */}
+                <div className="bg-muted/30 rounded-xl p-6 border border-border">
+                  <h4 className="text-sm font-semibold text-foreground mb-4 flex items-center gap-2">
+                    <Activity className="w-4 h-4 text-primary" />
+                    所选模型请求频率趋势（按小时）
+                  </h4>
+                  <p className="text-xs text-muted-foreground mb-4">
+                    如果这里持续显示“暂无趋势数据”，且浏览器控制台提示返回了 HTML，请重启后端服务，使新增的统计接口生效。
+                  </p>
+                  {trendLoading ? (
+                    <div className="h-64 flex items-center justify-center text-sm text-muted-foreground">
+                      <RefreshCw className="w-4 h-4 animate-spin mr-2" />
+                      正在加载趋势数据
+                    </div>
+                  ) : trendData.length > 0 && trendModels.length > 0 ? (
+                    <div className="h-64">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <LineChart data={trendData}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--muted))" vertical={false} />
+                          <XAxis
+                            dataKey="hour"
+                            stroke={AXIS_COLOR}
+                            fontSize={10}
+                            tickFormatter={(str) => {
+                              const parts = String(str).split(' ');
+                              return parts.length > 1 ? parts[1].slice(0, 5) : String(str);
+                            }}
+                          />
+                          <YAxis stroke={AXIS_COLOR} fontSize={10} />
+                          <Tooltip
+                            contentStyle={tooltipStyle}
+                            itemStyle={{ fontSize: '12px' }}
+                            labelStyle={{ fontSize: '12px', fontWeight: 'bold', marginBottom: '4px' }}
+                          />
+                          <Legend iconType="circle" wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
+                          {trendModels.map((m, i) => (
+                            <Line
+                              key={m}
+                              type="monotone"
+                              dataKey={m}
+                              name={m}
+                              stroke={LINE_COLORS[i % LINE_COLORS.length]}
+                              strokeWidth={2}
+                              dot={false}
+                              connectNulls
+                              activeDot={{ r: 4 }}
+                            />
+                          ))}
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+                  ) : (
+                    <div className="h-64 flex items-center justify-center text-sm text-muted-foreground">
+                      当前筛选条件下暂无趋势数据
+                    </div>
+                  )}
+                </div>
+
                 {/* 汇总卡片 */}
                 {analysisData.length > 0 && (
                   <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
@@ -534,6 +736,19 @@ export default function Dashboard() {
                   </div>
                 )}
 
+                {/* 应用默认价格按钮 */}
+                {analysisData.length > 0 && (
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={applyDefaultPricesToAll}
+                      className="px-3 py-1.5 text-xs font-medium bg-muted hover:bg-muted/80 text-foreground border border-border rounded-lg transition-colors"
+                    >
+                      将默认价格应用到所有行
+                    </button>
+                    <span className="text-xs text-muted-foreground">可在表格中逐行调整每个模型的价格</span>
+                  </div>
+                )}
+
                 {/* 结果表格 */}
                 <div className="overflow-x-auto border border-border rounded-lg">
                   <table className="w-full text-left text-sm">
@@ -544,20 +759,22 @@ export default function Dashboard() {
                         <th className="px-4 py-3 text-right">请求次数</th>
                         <th className="px-4 py-3 text-right">输入 Token</th>
                         <th className="px-4 py-3 text-right">输出 Token</th>
-                        <th className="px-4 py-3 text-right">总 Token</th>
+                        <th className="px-4 py-3 text-center">输入价格 ($/M)</th>
+                        <th className="px-4 py-3 text-center">输出价格 ($/M)</th>
                         <th className="px-4 py-3 text-right">模拟费用</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-border">
                       {analysisData.length === 0 ? (
                         <tr>
-                          <td colSpan={7} className="px-4 py-8 text-center text-muted-foreground">
+                          <td colSpan={8} className="px-4 py-8 text-center text-muted-foreground">
                             {analysisLoading ? '查询中...' : '暂无数据'}
                           </td>
                         </tr>
                       ) : (
                         analysisData.map((entry, i) => {
-                          const rowCost = (entry.total_prompt_tokens * promptPrice + entry.total_completion_tokens * completionPrice) / 1_000_000;
+                          const p = rowPrices[i] || { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
+                          const rowCost = (entry.total_prompt_tokens * p.prompt + entry.total_completion_tokens * p.completion) / 1_000_000;
                           return (
                             <tr key={i} className="hover:bg-muted/50 transition-colors">
                               <td className="px-4 py-3 font-medium text-foreground">{entry.provider}</td>
@@ -565,7 +782,26 @@ export default function Dashboard() {
                               <td className="px-4 py-3 text-right text-muted-foreground">{entry.request_count.toLocaleString()}</td>
                               <td className="px-4 py-3 text-right text-muted-foreground">{entry.total_prompt_tokens.toLocaleString()}</td>
                               <td className="px-4 py-3 text-right text-muted-foreground">{entry.total_completion_tokens.toLocaleString()}</td>
-                              <td className="px-4 py-3 text-right text-muted-foreground">{entry.total_tokens.toLocaleString()}</td>
+                              <td className="px-2 py-1 text-center">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  min="0"
+                                  value={p.prompt}
+                                  onChange={e => updateRowPrice(i, 'prompt', parseFloat(e.target.value) || 0)}
+                                  className="w-20 px-2 py-1 text-xs text-center bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary/50 text-foreground"
+                                />
+                              </td>
+                              <td className="px-2 py-1 text-center">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  min="0"
+                                  value={p.completion}
+                                  onChange={e => updateRowPrice(i, 'completion', parseFloat(e.target.value) || 0)}
+                                  className="w-20 px-2 py-1 text-xs text-center bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary/50 text-foreground"
+                                />
+                              </td>
                               <td className="px-4 py-3 text-right font-mono font-bold text-amber-600 dark:text-amber-400">{formatCost(rowCost)}</td>
                             </tr>
                           );

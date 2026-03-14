@@ -33,7 +33,7 @@ from core.models import (
 from core.utils import get_engine, provider_api_circular_list, truncate_for_logging
 from core.routing import get_right_order_providers
 from core.error_response import openai_error_response
-from utils import safe_get, error_handling_wrapper, apply_custom_headers
+from utils import safe_get, error_handling_wrapper, apply_custom_headers, has_header_case_insensitive
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -541,9 +541,10 @@ async def process_request_passthrough(
     url, adapter_headers, _ = await adapter(request, engine, provider, api_key)
 
     headers: Dict[str, Any] = dict(adapter_headers or {})
-    headers.update(_filter_passthrough_headers(passthrough_ctx.original_headers))
+    apply_custom_headers(headers, _filter_passthrough_headers(passthrough_ctx.original_headers))
     apply_custom_headers(headers, safe_get(provider, "preferences", "headers", default={}))
-    headers.setdefault("Content-Type", "application/json")
+    if not has_header_case_insensitive(headers, "Content-Type"):
+        headers["Content-Type"] = "application/json"
 
     payload = apply_passthrough_modifications(
         passthrough_ctx.original_payload,
@@ -709,6 +710,49 @@ class ModelRequestHandler:
         self.last_provider_indices = defaultdict(lambda: -1)
         self.locks = defaultdict(asyncio.Lock)
 
+    async def _build_attempt_providers(
+        self,
+        providers: List[Dict[str, Any]],
+        request_model_name: str,
+        scheduling_algorithm: str,
+        advance_cursor: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """构造单次请求真正用于尝试的渠道列表。
+
+        保留权重展开后的起点选择，但在一次请求内部去掉重复 provider，
+        避免同一渠道因为权重槽位被重复尝试很多次。
+        """
+        if not providers:
+            return []
+
+        provider_names = [provider.get("provider") for provider in providers]
+        has_duplicate_slots = len(set(provider_names)) != len(provider_names)
+        should_rotate_slots = scheduling_algorithm != "fixed_priority" or has_duplicate_slots
+
+        start_index = 0
+        if should_rotate_slots:
+            async with self.locks[request_model_name]:
+                if advance_cursor:
+                    self.last_provider_indices[request_model_name] = (
+                        self.last_provider_indices[request_model_name] + 1
+                    ) % len(providers)
+                elif self.last_provider_indices[request_model_name] < 0:
+                    self.last_provider_indices[request_model_name] = 0
+                start_index = self.last_provider_indices[request_model_name] % len(providers)
+
+        ordered_slots = providers[start_index:] + providers[:start_index]
+
+        unique_providers: List[Dict[str, Any]] = []
+        seen_provider_names = set()
+        for provider in ordered_slots:
+            provider_name = provider.get("provider")
+            if provider_name in seen_provider_names:
+                continue
+            seen_provider_names.add(provider_name)
+            unique_providers.append(provider)
+
+        return unique_providers
+
     async def request_model(
         self,
         request_data: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest],
@@ -758,18 +802,16 @@ class ModelRequestHandler:
             request_model_name, config, api_index, scheduling_algorithm, 
             self.app, request_total_tokens=request_total_tokens
         )
+        matching_providers = await self._build_attempt_providers(
+            matching_providers,
+            request_model_name=request_model_name,
+            scheduling_algorithm=scheduling_algorithm,
+            advance_cursor=True,
+        )
         num_matching_providers = len(matching_providers)
 
         status_code = 500
         error_message = None
-
-        start_index = 0
-        if scheduling_algorithm != "fixed_priority":
-            async with self.locks[request_model_name]:
-                self.last_provider_indices[request_model_name] = (
-                    self.last_provider_indices[request_model_name] + 1
-                ) % num_matching_providers
-                start_index = self.last_provider_indices[request_model_name]
 
         auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
         role = safe_get(
@@ -835,7 +877,7 @@ class ModelRequestHandler:
         while True:
             if index >= max_attempts:
                 break
-            current_index = (start_index + index) % num_matching_providers
+            current_index = index % num_matching_providers
             index += 1
             provider = matching_providers[current_index]
 
@@ -1015,6 +1057,12 @@ class ModelRequestHandler:
                     matching_providers = await get_right_order_providers(
                         request_model_name, config, api_index, scheduling_algorithm, 
                         self.app, request_total_tokens=request_total_tokens
+                    )
+                    matching_providers = await self._build_attempt_providers(
+                        matching_providers,
+                        request_model_name=request_model_name,
+                        scheduling_algorithm=scheduling_algorithm,
+                        advance_cursor=False,
                     )
                     last_num_matching_providers = num_matching_providers
                     num_matching_providers = len(matching_providers)
