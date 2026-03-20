@@ -675,9 +675,14 @@ export default function Dashboard() {
                             dataKey="hour"
                             stroke={AXIS_COLOR}
                             fontSize={10}
-                            tickFormatter={(str) => {
-                              const parts = String(str).split(' ');
-                              return parts.length > 1 ? parts[1].slice(0, 5) : String(str);
+                            tickFormatter={(utcStr) => {
+                              try {
+                                const d = new Date(String(utcStr).replace(' ', 'T') + 'Z');
+                                if (isNaN(d.getTime())) return String(utcStr);
+                                return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+                              } catch {
+                                return String(utcStr);
+                              }
                             }}
                           />
                           <YAxis stroke={AXIS_COLOR} fontSize={10} />
