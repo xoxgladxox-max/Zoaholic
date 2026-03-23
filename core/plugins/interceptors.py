@@ -44,6 +44,7 @@ register_response_interceptor("my_plugin", my_response_interceptor, priority=50)
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 import asyncio
+from contextvars import ContextVar
 from contextlib import asynccontextmanager
 import re
 
@@ -51,6 +52,10 @@ from ..log_config import logger
 
 
 # ==================== 插件参数解析工具 ====================
+
+# 响应拦截器调用期间的 enabled_plugins 上下文
+# 由 apply_response_interceptors 在调用回调前设置，插件通过 get_current_plugin_options() 读取
+_current_enabled_plugins: ContextVar[Optional[List[str]]] = ContextVar('_current_enabled_plugins', default=None)
 
 def parse_plugin_entry(entry: str) -> Tuple[str, Optional[str]]:
     """
@@ -174,6 +179,28 @@ def is_plugin_enabled(plugin_name: str, provider: Dict[str, Any]) -> bool:
     
     plugin_options = parse_enabled_plugins(enabled_plugins)
     return plugin_name in plugin_options
+
+
+def get_current_plugin_options(plugin_name: str) -> Optional[str]:
+    """在响应拦截器回调内部读取当前插件的参数。
+
+    该函数利用 ContextVar 获取当前调用链的 enabled_plugins，
+    从中解析出指定插件的 options 字符串。
+
+    仅在 apply_response_interceptors 调用回调期间有效，
+    其他时刻调用返回 None。
+
+    Args:
+        plugin_name: 插件名称
+
+    Returns:
+        插件参数字符串，未启用或无参数时返回 None
+    """
+    enabled_plugins = _current_enabled_plugins.get()
+    if not enabled_plugins:
+        return None
+    plugin_map = parse_enabled_plugins(enabled_plugins)
+    return plugin_map.get(plugin_name)
 
 
 # 类型定义
@@ -401,8 +428,8 @@ class InterceptorRegistry:
         
         按优先级顺序依次调用每个拦截器，每个拦截器可以修改响应内容。
         
-        支持插件参数：enabled_plugins 中的条目可以是 "plugin_name:options" 格式。
-        注意：响应拦截器无法直接访问 provider，如需读取参数请在请求阶段缓存。
+        enabled_plugins 会通过 ContextVar 暴露给回调，插件可通过
+        get_current_plugin_options(plugin_name) 读取自己的参数。
         
         Args:
             response_chunk: 响应数据（流式时为单个 chunk，非流式时为完整响应）
@@ -416,6 +443,9 @@ class InterceptorRegistry:
             经过所有拦截器处理后的响应数据
         """
         interceptors = self.get_response_interceptors(enabled_only=True)
+        
+        # 将 enabled_plugins 写入 ContextVar，供回调通过 get_current_plugin_options() 读取
+        token = _current_enabled_plugins.set(enabled_plugins)
         
         # 解析 enabled_plugins，提取插件名（忽略参数部分用于过滤）
         enabled_plugin_names = None
@@ -436,6 +466,9 @@ class InterceptorRegistry:
             except Exception as e:
                 logger.error(f"Response interceptor '{interceptor.id}' error: {e}")
                 # 继续执行其他拦截器
+        
+        # 恢复 ContextVar
+        _current_enabled_plugins.reset(token)
         
         return response_chunk
     

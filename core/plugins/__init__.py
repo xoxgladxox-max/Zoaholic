@@ -49,6 +49,7 @@ from .interceptors import (
     parse_plugin_entry,
     parse_enabled_plugins,
     get_plugin_options,
+    get_current_plugin_options,
     is_plugin_enabled,
 )
 
@@ -79,5 +80,6 @@ __all__ = [
     "parse_plugin_entry",
     "parse_enabled_plugins",
     "get_plugin_options",
+    "get_current_plugin_options",
     "is_plugin_enabled",
 ]

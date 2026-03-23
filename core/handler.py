@@ -252,7 +252,7 @@ async def process_request(
                     debug=is_debug
                 )
             else:
-                generator = fetch_response(client, url, headers, payload, engine, original_model, timeout_value)
+                generator = fetch_response(client, url, headers, payload, engine, original_model, timeout_value, enabled_plugins=enabled_plugins)
                 wrapped_generator, first_response_time = await error_handling_wrapper(
                     generator, channel_id, engine, request.stream,
                     app.state.error_triggers, keepalive_interval=keepalive_interval,
@@ -329,7 +329,7 @@ def _filter_passthrough_headers(original_headers: Optional[Dict[str, str]]) -> D
     }
 
 
-async def _fetch_passthrough_stream(client, url, headers, payload, timeout):
+async def _fetch_passthrough_stream(client, url, headers, payload, timeout, engine=None, model=None, enabled_plugins=None):
     """
     透传模式的流式响应处理
     
@@ -352,9 +352,11 @@ async def _fetch_passthrough_stream(client, url, headers, payload, timeout):
     
     json_payload = await asyncio.to_thread(json.dumps, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=stream_timeout) as response:
+        from core.plugins.interceptors import apply_response_interceptors
         error_message = await check_response(response, "passthrough_stream")
         if error_message:
-            yield error_message
+            error_message = await apply_response_interceptors(error_message, engine or "passthrough", model or "", is_stream=True, enabled_plugins=enabled_plugins)
+            yield error_message            
             return
         
         # 使用 aiter_bytes 替代 aiter_text，然后手动解码
@@ -370,6 +372,7 @@ async def _fetch_passthrough_stream(client, url, headers, payload, timeout):
                 text = buffer.decode("utf-8", errors="replace")
                 buffer = b""  # 成功解码后清空缓冲区
                 if text:
+                    text = await apply_response_interceptors(text, engine or "passthrough", model or "", is_stream=True, enabled_plugins=enabled_plugins)
                     yield text
             except UnicodeDecodeError:
                 # 如果解码失败（可能是不完整的 UTF-8 序列），保留缓冲区等待更多数据
@@ -378,16 +381,18 @@ async def _fetch_passthrough_stream(client, url, headers, payload, timeout):
                     text = buffer.decode("utf-8", errors="replace")
                     buffer = b""
                     if text:
+                        text = await apply_response_interceptors(text, engine or "passthrough", model or "", is_stream=True, enabled_plugins=enabled_plugins)
                         yield text
         
         # 处理剩余的缓冲区数据
         if buffer:
             text = buffer.decode("utf-8", errors="replace")
             if text:
+                text = await apply_response_interceptors(text, engine or "passthrough", model or "", is_stream=True, enabled_plugins=enabled_plugins)
                 yield text
 
 
-async def _fetch_passthrough_response(client, url, headers, payload, timeout):
+async def _fetch_passthrough_response(client, url, headers, payload, timeout, engine=None, model=None, enabled_plugins=None):
     """
     透传模式的非流式响应处理
     
@@ -395,6 +400,7 @@ async def _fetch_passthrough_response(client, url, headers, payload, timeout):
     """
     import time as _time
     t0 = _time.time()
+    from core.plugins.interceptors import apply_response_interceptors
     
     json_payload = await asyncio.to_thread(json.dumps, payload)
     t1 = _time.time()
@@ -415,14 +421,17 @@ async def _fetch_passthrough_response(client, url, headers, payload, timeout):
     
     error_message = await check_response(response, "passthrough_non_stream")
     if error_message:
-        yield error_message
+        error_message = await apply_response_interceptors(error_message, engine or "passthrough", model or "", is_stream=False, enabled_plugins=enabled_plugins)
+        yield error_message        
         return
     
     response_bytes = await response.aread()
     t3 = _time.time()
     logger.debug(f"[passthrough] aread() took {t3-t2:.3f}s, size={len(response_bytes)} bytes")
     
-    yield response_bytes.decode("utf-8")
+    result = response_bytes.decode("utf-8")
+    result = await apply_response_interceptors(result, engine or "passthrough", model or "", is_stream=False, enabled_plugins=enabled_plugins)
+    yield result
 
 
 async def _passthrough_error_wrapper(generator, channel_id):
@@ -634,7 +643,9 @@ async def process_request_passthrough(
             if request.stream:
                 # 透传模式：使用原始流处理，不做格式转换
                 generator = _fetch_passthrough_stream(
-                    client, url, headers, payload, timeout_value
+                    client, url, headers, payload, timeout_value,
+                    engine=engine, model=request.model,
+                    enabled_plugins=enabled_plugins,
                 )
                 # 使用简单的透传错误包装器，不做 JSON 解析
                 wrapped_generator, first_response_time = await _passthrough_error_wrapper(
@@ -650,7 +661,9 @@ async def process_request_passthrough(
             else:
                 # 透传模式：使用原始响应处理，不做格式转换
                 generator = _fetch_passthrough_response(
-                    client, url, headers, payload, timeout_value
+                    client, url, headers, payload, timeout_value,
+                    engine=engine, model=request.model,
+                    enabled_plugins=enabled_plugins,
                 )
                 # 使用简单的透传错误包装器，不做 JSON 解析
                 wrapped_generator, first_response_time = await _passthrough_error_wrapper(

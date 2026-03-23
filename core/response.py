@@ -127,20 +127,21 @@ def _save_upstream_response_for_non_stream(response):
         logger.error(f"Error saving upstream response for non-stream: {str(e)}")
 
 
-async def fetch_response(client, url, headers, payload, engine, model, timeout=200):
+async def fetch_response(client, url, headers, payload, engine, model, timeout=200, enabled_plugins=None):
     """
     处理非流式 API 响应，通过渠道适配器进行分发
     """
     from .channels import get_channel
+    from .plugins.interceptors import apply_response_interceptors
     
     channel = get_channel(engine)
     if channel and channel.response_adapter:
         async for chunk in channel.response_adapter(client, url, headers, payload, model, timeout):
             # 如果适配器返回的是字典且包含 error，则它是一个预处理过的错误
-            if isinstance(chunk, dict) and "error" in chunk:
-                yield chunk
-                return
+            chunk = await apply_response_interceptors(chunk, engine, model, is_stream=False, enabled_plugins=enabled_plugins)
             yield chunk
+            if isinstance(chunk, dict) and "error" in chunk:
+                return
         return
 
     # 回退逻辑：如果渠道没有适配器，执行默认的 OpenAI 兼容逻辑
@@ -153,7 +154,8 @@ async def fetch_response(client, url, headers, payload, engine, model, timeout=2
     
     error_message = await check_response(response, "fetch_response_fallback")
     if error_message:
-        yield error_message
+        error_message = await apply_response_interceptors(error_message, engine, model, is_stream=False, enabled_plugins=enabled_plugins)
+        yield error_message        
         return
     
     _save_upstream_response_for_non_stream(response)
@@ -185,14 +187,12 @@ async def fetch_response_stream(
     channel = get_channel(engine)
     if channel and channel.stream_adapter:
         async for chunk in channel.stream_adapter(client, url, headers, payload, model, timeout):
-            # 如果适配器返回的是字典且包含 error，则它是一个预处理过的错误
-            if isinstance(chunk, dict) and "error" in chunk:
-                yield chunk
-                continue
-                
             # 应用响应拦截器
             chunk = await apply_response_interceptors(chunk, engine, model, is_stream=True, enabled_plugins=enabled_plugins)
             yield chunk
+            # 如果适配器返回的是字典且包含 error，则它是一个预处理过的错误
+            if isinstance(chunk, dict) and "error" in chunk:
+                return
         
         return
     
