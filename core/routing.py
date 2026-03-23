@@ -135,6 +135,9 @@ async def get_provider_rules(
             model_rule = model_rule[1:-1]
             # 处理带斜杠的模型名
             for provider in config['providers']:
+                # 跳过禁用的渠道
+                if provider.get("enabled") is False:
+                    continue
                 model_dict = provider["_model_dict_cache"]
                 if model_rule in model_dict.keys():
                     provider_rules.append(provider['provider'] + "/" + model_rule)
@@ -151,6 +154,9 @@ async def get_provider_rules(
                     models_list = []
             else:
                 for provider in config['providers']:
+                    # 跳过禁用的渠道
+                    if provider.get("enabled") is False:
+                        continue
                     model_dict = provider["_model_dict_cache"]
                     if provider['provider'] == provider_name:
                         models_list.extend(list(model_dict.keys()))
@@ -180,6 +186,9 @@ async def get_provider_rules(
 
     else:
         for provider in config["providers"]:
+            # 跳过禁用的渠道
+            if provider.get("enabled") is False:
+                continue
             model_dict = provider["_model_dict_cache"]
             if model_rule in model_dict.keys():
                 provider_rules.append(provider["provider"] + "/" + model_rule)
