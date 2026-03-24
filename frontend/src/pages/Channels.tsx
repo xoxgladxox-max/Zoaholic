@@ -14,6 +14,7 @@ import { InterceptorSheet } from '../components/InterceptorSheet';
 import { ChannelTestDialog } from '../components/ChannelTestDialog';
 import { ApiKeyTestDialog } from '../components/ApiKeyTestDialog';
 import { ChannelAnalyticsSheet } from '../components/ChannelAnalyticsSheet';
+import { ProviderLogo } from '../components/ProviderLogos';
 
 // ========== Types ==========
 interface ApiKeyObj {
@@ -723,14 +724,6 @@ export default function Channels() {
     }
   };
 
-  const ProviderLogo = ({ name }: { name: string }) => {
-    const lName = name.toLowerCase();
-    if (lName.includes('openai')) return <div className="w-8 h-8 rounded-full bg-emerald-500/20 text-emerald-500 flex items-center justify-center font-bold">O</div>;
-    if (lName.includes('claude') || lName.includes('anthropic')) return <div className="w-8 h-8 rounded-full bg-amber-500/20 text-amber-500 flex items-center justify-center font-bold">A</div>;
-    if (lName.includes('gemini') || lName.includes('vertex')) return <div className="w-8 h-8 rounded-full bg-blue-500/20 text-blue-500 flex items-center justify-center font-bold">G</div>;
-    return <div className="w-8 h-8 rounded-full bg-muted text-muted-foreground flex items-center justify-center font-bold">{name[0].toUpperCase()}</div>;
-  };
-
   // Mobile Card Component
   const ProviderCard = ({ p, idx }: { p: any; idx: number }) => {
     const isEnabled = p.enabled !== false;
@@ -742,12 +735,12 @@ export default function Channels() {
       <div className={`bg-card border border-border rounded-xl p-4 ${!isEnabled && 'opacity-60'}`}>
         <div className="flex items-start justify-between mb-3">
           <div className="flex items-center gap-3">
-            <ProviderLogo name={p.provider} />
+            <ProviderLogo name={p.provider} engine={p.engine} />
             <div>
               <div className={`font-medium ${isEnabled ? 'text-foreground' : 'text-muted-foreground'}`}>{p.provider}</div>
               <div className="text-xs text-muted-foreground font-mono">{p.engine || 'openai'}</div>
               {p.remark && (
-                <div className="mt-1 text-xs text-muted-foreground break-words whitespace-pre-wrap max-w-[220px]">
+                <div className="mt-1 text-xs text-muted-foreground break-words whitespace-pre-wrap max-w-full">
                   {p.remark}
                 </div>
               )}
@@ -856,11 +849,11 @@ export default function Channels() {
                   <tr key={idx} className={`transition-colors ${isEnabled ? 'hover:bg-muted/50' : 'bg-muted/30 opacity-60'}`}>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2">
-                        <ProviderLogo name={p.provider} />
+                        <ProviderLogo name={p.provider} engine={p.engine} />
                         <div className="min-w-0">
                           <div className={`font-medium truncate ${isEnabled ? 'text-foreground' : 'text-muted-foreground'}`}>{p.provider}</div>
                           {p.remark && (
-                            <div className="text-xs text-muted-foreground truncate max-w-[220px]" title={p.remark}>
+                            <div className="text-xs text-muted-foreground truncate max-w-xs" title={p.remark}>
                               {p.remark}
                             </div>
                           )}
@@ -978,7 +971,7 @@ export default function Channels() {
                       <textarea
                         value={formData.remark}
                         onChange={e => updateFormData('remark', e.target.value)}
-                        rows={3} placeholder="填写该渠道的用途、来源、限制说明等" className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm outline-none text-foreground"
+                        rows={3} maxLength={500} placeholder="填写该渠道的用途、来源、限制说明等" className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm outline-none text-foreground"
                       />
                     </div>
                     <div>
