@@ -168,9 +168,13 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
             debug = getattr(resp, "debug", False)
 
             async def convert_stream():
+                # 优先使用有状态的流渲染器工厂（如 Claude 方言），
+                # 每次流请求创建独立实例以维护 message_start 等生命周期状态
+                stream_renderer = dialect.render_stream_factory() if dialect.render_stream_factory else None
+                render_fn = stream_renderer or dialect.render_stream
                 async for chunk in resp.body_iterator:
                     chunk_text = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
-                    converted = await dialect.render_stream(chunk_text) if dialect.render_stream else chunk_text
+                    converted = await render_fn(chunk_text) if render_fn else chunk_text
                     if converted:
                         yield converted
 

@@ -316,120 +316,236 @@ async def render_claude_response(
     }
 
 
-async def render_claude_stream(canonical_sse_chunk: str) -> str:
+class ClaudeStreamRenderer:
     """
-    Canonical SSE -> Claude SSE
+    有状态的 Claude SSE 流渲染器。
+
+    维护流的完整生命周期，按照 Claude Messages API 标准协议
+    生成完整的 SSE 事件序列：
+    message_start → content_block_start → content_block_delta(s) →
+    content_block_stop → message_delta → message_stop
     """
-    if not isinstance(canonical_sse_chunk, str):
-        return canonical_sse_chunk
 
-    if not canonical_sse_chunk.startswith("data: "):
-        return canonical_sse_chunk
+    def __init__(self):
+        self._message_started = False
+        self._current_block_type = None  # "thinking" | "text" | "tool_use" | None
+        self._block_index = -1  # 每个新块 +1
+        self._model = ""
+        self._msg_id = ""
+        self._tool_block_indices = {}  # OpenAI tool_call index -> Claude block index
 
-    data_str = canonical_sse_chunk[6:].strip()
-    if data_str == "[DONE]":
-        return "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    def _make_message_start(self, canonical: dict) -> str:
+        """生成 message_start 事件"""
+        import uuid
+        self._model = canonical.get("model", "") or self._model
+        raw_id = canonical.get("id", "") or uuid.uuid4().hex[:24]
+        self._msg_id = f"msg_{raw_id}"
 
-    try:
-        canonical = await asyncio.to_thread(json.loads, data_str)
-    except json.JSONDecodeError:
-        return canonical_sse_chunk
+        event = {
+            "type": "message_start",
+            "message": {
+                "id": self._msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": self._model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                },
+            },
+        }
+        return f"event: message_start\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
 
-    choices = canonical.get("choices") or []
-    if not choices:
+    def _make_block_start(self, block_type: str, **kwargs) -> str:
+        """生成 content_block_start 事件"""
+        self._block_index += 1
+        self._current_block_type = block_type
+
+        if block_type == "thinking":
+            content_block = {"type": "thinking", "thinking": ""}
+        elif block_type == "text":
+            content_block = {"type": "text", "text": ""}
+        elif block_type == "tool_use":
+            content_block = {
+                "type": "tool_use",
+                "id": kwargs.get("id", ""),
+                "name": kwargs.get("name", ""),
+                "input": {},
+            }
+        else:
+            content_block = {"type": block_type}
+
+        event = {
+            "type": "content_block_start",
+            "index": self._block_index,
+            "content_block": content_block,
+        }
+        return f"event: content_block_start\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    def _make_block_stop(self) -> str:
+        """生成 content_block_stop 事件"""
+        if self._current_block_type is None:
+            return ""
+        event = {
+            "type": "content_block_stop",
+            "index": self._block_index,
+        }
+        self._current_block_type = None
+        return f"event: content_block_stop\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    def _ensure_message_start(self, canonical: dict) -> str:
+        """确保 message_start 已发送"""
+        if not self._message_started:
+            self._message_started = True
+            return self._make_message_start(canonical)
         return ""
 
-    delta = choices[0].get("delta") or {}
-    
-    # 1. 处理思维链 (Thinking)
-    reasoning = delta.get("reasoning_content") or ""
-    if reasoning:
-        claude_event = {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {
-                "type": "thinking_delta",
-                "thinking": reasoning,
-            },
-        }
-        json_data = await asyncio.to_thread(json.dumps, claude_event, ensure_ascii=False)
-        return f"event: content_block_delta\ndata: {json_data}\n\n"
+    def _transition_to_block(self, block_type: str, **kwargs) -> str:
+        """切换到新的内容块，必要时关闭旧块并打开新块"""
+        result = ""
+        # tool_use 每次调用都是新块；其他类型仅在类型变化时切换
+        if self._current_block_type != block_type or block_type == "tool_use":
+            if self._current_block_type is not None:
+                result += self._make_block_stop()
+            result += self._make_block_start(block_type, **kwargs)
+        return result
 
-    # 2. 处理文本
-    content = delta.get("content") or ""
-    if content:
-        claude_event = {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {
-                "type": "text_delta",
-                "text": content,
-            },
-        }
-        json_data = await asyncio.to_thread(json.dumps, claude_event, ensure_ascii=False)
-        return f"event: content_block_delta\ndata: {json_data}\n\n"
+    async def __call__(self, canonical_sse_chunk: str) -> str:
+        if not isinstance(canonical_sse_chunk, str):
+            return canonical_sse_chunk
 
-    # 2. 处理工具调用开始
-    tool_calls = delta.get("tool_calls") or []
-    if tool_calls:
-        tc = tool_calls[0]
-        # 如果有 name，说明是新的 block 开始
-        if tc.get("function", {}).get("name"):
-            event_start = {
-                "type": "content_block_start",
-                "index": 1,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": tc.get("id"),
-                    "name": tc["function"]["name"],
-                    "input": {}
-                }
+        if not canonical_sse_chunk.startswith("data: "):
+            return canonical_sse_chunk
+
+        data_str = canonical_sse_chunk[6:].strip()
+        if data_str == "[DONE]":
+            result = ""
+            if self._current_block_type is not None:
+                result += self._make_block_stop()
+            result += 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+            return result
+
+        try:
+            canonical = json.loads(data_str)
+        except json.JSONDecodeError:
+            return canonical_sse_chunk
+
+        choices = canonical.get("choices") or []
+        if not choices:
+            return ""
+
+        delta = choices[0].get("delta") or {}
+        result = ""
+
+        # 确保 message_start 已发送
+        result += self._ensure_message_start(canonical)
+
+        # 1. 思维链 (Thinking)
+        reasoning = delta.get("reasoning_content") or ""
+        if reasoning:
+            result += self._transition_to_block("thinking")
+            event = {
+                "type": "content_block_delta",
+                "index": self._block_index,
+                "delta": {"type": "thinking_delta", "thinking": reasoning},
             }
-            # 如果同时有 arguments，追加一个 delta
-            if tc["function"].get("arguments"):
-                event_delta = {
+            result += f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            return result
+
+        # 2. 文本
+        content = delta.get("content") or ""
+        if content:
+            result += self._transition_to_block("text")
+            event = {
+                "type": "content_block_delta",
+                "index": self._block_index,
+                "delta": {"type": "text_delta", "text": content},
+            }
+            result += f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            return result
+
+        # 3. 工具调用
+        tool_calls = delta.get("tool_calls") or []
+        if tool_calls:
+            tc = tool_calls[0]
+            tc_index = tc.get("index", 0)
+
+            if tc.get("function", {}).get("name"):
+                # 新工具调用 → 新的 content_block
+                result += self._transition_to_block(
+                    "tool_use",
+                    id=tc.get("id", ""),
+                    name=tc["function"]["name"],
+                )
+                self._tool_block_indices[tc_index] = self._block_index
+
+                if tc["function"].get("arguments"):
+                    event = {
+                        "type": "content_block_delta",
+                        "index": self._block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": tc["function"]["arguments"],
+                        },
+                    }
+                    result += f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            elif tc.get("function", {}).get("arguments"):
+                # arguments 续传
+                idx = self._tool_block_indices.get(tc_index, self._block_index)
+                event = {
                     "type": "content_block_delta",
-                    "index": 1,
+                    "index": idx,
                     "delta": {
                         "type": "input_json_delta",
-                        "partial_json": tc["function"]["arguments"]
-                    }
+                        "partial_json": tc["function"]["arguments"],
+                    },
                 }
-                json_start = await asyncio.to_thread(json.dumps, event_start, ensure_ascii=False)
-                json_delta = await asyncio.to_thread(json.dumps, event_delta, ensure_ascii=False)
-                return f"event: content_block_start\ndata: {json_start}\n\n" + \
-                       f"event: content_block_delta\ndata: {json_delta}\n\n"
-            return f"event: content_block_start\ndata: {json.dumps(event_start, ensure_ascii=False)}\n\n"
-        
-        # 只有 arguments，则是 delta
-        elif tc.get("function", {}).get("arguments"):
-            event_delta = {
-                "type": "content_block_delta",
-                "index": 1,
+                result += f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            return result
+
+        # 4. 完成
+        if choices[0].get("finish_reason"):
+            if self._current_block_type is not None:
+                result += self._make_block_stop()
+
+            finish_reason = choices[0]["finish_reason"]
+            stop_reason = "tool_use" if finish_reason == "tool_calls" else "end_turn"
+
+            event = {
+                "type": "message_delta",
                 "delta": {
-                    "type": "input_json_delta",
-                    "partial_json": tc["function"]["arguments"]
-                }
+                    "stop_reason": stop_reason,
+                    "stop_sequence": None,
+                },
+                "usage": {
+                    "output_tokens": canonical.get("usage", {}).get("completion_tokens", 0),
+                },
             }
-            json_delta = await asyncio.to_thread(json.dumps, event_delta, ensure_ascii=False)
-            return f"event: content_block_delta\ndata: {json_delta}\n\n"
+            result += f"event: message_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            return result
 
-    # 3. 处理完成
-    if choices[0].get("finish_reason"):
-        event_msg_delta = {
-            "type": "message_delta",
-            "delta": {
-                "stop_reason": "tool_use" if choices[0].get("finish_reason") == "tool_calls" else "end_turn",
-                "stop_sequence": None
-            },
-            "usage": {
-               "output_tokens": canonical.get("usage", {}).get("completion_tokens", 0)
-            }
-        }
-        json_msg_delta = await asyncio.to_thread(json.dumps, event_msg_delta, ensure_ascii=False)
-        return f"event: message_delta\ndata: {json_msg_delta}\n\n"
+        return result or ""
 
-    return ""
+
+def create_claude_stream_renderer():
+    """工厂函数：为每次流请求创建独立的有状态 Claude SSE 渲染器"""
+    return ClaudeStreamRenderer()
+
+
+async def render_claude_stream(canonical_sse_chunk: str) -> str:
+    """
+    无状态兼容接口（保留供直接调用场景使用）。
+
+    注意：此函数不生成 message_start / content_block_start / content_block_stop
+    等生命周期事件。完整协议兼容请使用 create_claude_stream_renderer() 工厂。
+    """
+    renderer = ClaudeStreamRenderer()
+    renderer._message_started = True  # 跳过 message_start，保持旧行为
+    return await renderer(canonical_sse_chunk)
+
 
 
 def parse_claude_usage(data: Any) -> Optional[Dict[str, int]]:
@@ -464,6 +580,7 @@ def register() -> None:
             parse_request=parse_claude_request,
             render_response=render_claude_response,
             render_stream=render_claude_stream,
+            render_stream_factory=create_claude_stream_renderer,
             parse_usage=parse_claude_usage,
             target_engine="claude",
             endpoints=[

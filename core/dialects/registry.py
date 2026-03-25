@@ -28,6 +28,9 @@ RenderResponse = Callable[
 # RenderStream: canonical SSE chunk -> native SSE chunk
 RenderStream = Callable[[str], Awaitable[str]]
 
+# RenderStreamFactory: 每次流请求创建独立的有状态渲染器
+RenderStreamFactory = Callable[[], RenderStream]
+
 # DetectPassthrough: (dialect_id, target_engine) -> bool
 DetectPassthrough = Callable[[str, str], bool]
 
@@ -96,6 +99,8 @@ class DialectDefinition:
         parse_request: 将原生请求转为 Canonical 的函数
         render_response: 将 Canonical 响应转为原生格式的函数
         render_stream: 将 Canonical SSE 流转为原生流格式的函数
+        render_stream_factory: 有状态流渲染器工厂（每次流请求创建独立实例，
+            优先级高于 render_stream）
         detect_passthrough: 检测是否可透传的函数（宽松模式：仅格式匹配）
         target_engine: 该方言对应的上游 engine（用于透传匹配）
         sanitize_response: 透传响应净化函数（替换模型名、过滤敏感信息）
@@ -110,6 +115,7 @@ class DialectDefinition:
     parse_request: Optional[ParseRequest] = None
     render_response: Optional[RenderResponse] = None
     render_stream: Optional[RenderStream] = None
+    render_stream_factory: Optional[RenderStreamFactory] = None
     detect_passthrough: Optional[DetectPassthrough] = None
     target_engine: Optional[str] = None
     sanitize_response: Optional[SanitizeResponse] = None
