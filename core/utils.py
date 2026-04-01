@@ -641,6 +641,7 @@ class ThreadSafeCircularList:
             model_key = "default"
 
         rate_limit = None
+        matched_default = False
         # 先尝试精确匹配
         if model and model in self.rate_limits:
             rate_limit = self.rate_limits[model]
@@ -653,12 +654,20 @@ class ThreadSafeCircularList:
 
         # 如果都没匹配到，使用默认值
         if rate_limit is None:
-            rate_limit = self.rate_limits.get("default", [(999999, 60)])  # 默认限制
+            rate_limit = self.rate_limits.get("default", [(999999, 60)])  #默认限制
+            matched_default = True
 
         # 检查所有速率限制条件
         for limit_count, limit_period in rate_limit:
-            # 使用特定模型的请求记录进行计算
-            recent_requests = sum(1 for req in self.requests[item][model_key] if req > now - limit_period)
+            if matched_default:
+                # default 规则：跨所有模型汇总计数，作为该 key 的总量限制
+                recent_requests = sum(
+                    1 for mk_reqs in self.requests[item].values()
+                    for req in mk_reqs if req > now - limit_period
+                )
+            else:
+                # 模型特定规则：仅计算该模型的请求数
+                recent_requests = sum(1 for req in self.requests[item][model_key] if req > now - limit_period)
             if recent_requests >= limit_count:
                 if not is_check:
                     logger.warning(f"API key {item}: model: {model_key} has been rate limited ({limit_count}/{limit_period} seconds)")
@@ -673,6 +682,7 @@ class ThreadSafeCircularList:
             self.requests[item][model_key].append(now)
 
         return False
+
 
     async def next(self, model: str = None):
         async with self.lock:

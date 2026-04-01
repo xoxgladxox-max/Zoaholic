@@ -547,6 +547,16 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
 
                 no_stream_content = safe_get(line, "choices", 0, "message", "content", default=None)
                 openrouter_reasoning = safe_get(line, "choices", 0, "delta", "reasoning", default="")
+                # reasoning_details 数组格式回退：部分模型只返回 reasoning_details 而不带 reasoning
+                if not openrouter_reasoning:
+                    _reasoning_details = safe_get(line, "choices", 0, "delta", "reasoning_details", default=None)
+                    if _reasoning_details and isinstance(_reasoning_details, list):
+                        _parts = []
+                        for _rd_item in _reasoning_details:
+                            if isinstance(_rd_item, dict) and _rd_item.get("text"):
+                                _parts.append(_rd_item["text"])
+                        if _parts:
+                            openrouter_reasoning = "".join(_parts)
                 openrouter_base64_image = safe_get(line, "choices", 0, "delta", "images", 0, "image_url", "url", default="")
                 if openrouter_base64_image:
                     b64_pure = extract_base64_data(openrouter_base64_image if openrouter_base64_image.startswith("data:image/") else f"data:image/png;base64,{openrouter_base64_image}")
