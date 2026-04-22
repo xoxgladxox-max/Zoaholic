@@ -148,14 +148,17 @@ async def get_image_payload(request, engine, provider, api_key=None):
         payload["image"] = images[0]  # 取第一张
 
     # 清理 Chat Completions 的字段，Image API 不认这些
+    # 注意：response_format 不清理，上面已设为 "b64_json"（Image API 需要的格式）
     for k in (
         "messages", "stream", "tools", "tool_choice",
         "temperature", "top_p", "max_tokens", "max_completion_tokens",
         "presence_penalty", "frequency_penalty",
-        "response_format",  # Image API 用的是 response_format，但我们已经设了 b64_json
         "stream_options", "logprobs", "top_logprobs",
     ):
         payload.pop(k, None)
+
+    # 强制 response_format 为 b64_json（防止 overrides 覆盖成 Chat Completions 的对象格式）
+    payload["response_format"] = "b64_json"
 
     return url, headers, payload
 
