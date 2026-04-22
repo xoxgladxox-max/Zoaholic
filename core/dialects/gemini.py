@@ -13,7 +13,7 @@ import asyncio
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from core.json_utils import json_loads, json_dumps_text
-from core.models import RequestModel, Message, ContentItem
+from core.models import RequestModel, Message, ContentItem, ImageUrl
 
 from .registry import DialectDefinition, EndpointDefinition, register_dialect
 
@@ -169,12 +169,23 @@ async def parse_gemini_request(
                 inline = part["inlineData"]
                 mime_type = inline.get("mimeType", "image/png")
                 data = inline.get("data", "")
-                content_items.append(
-                    ContentItem(
-                        type="file",
-                        file={"mime_type": mime_type, "data": data},
+                if mime_type.startswith("image/"):
+                    # 图片 → OAI 标准 image_url 格式（data URI）
+                    data_uri = f"data:{mime_type};base64,{data}"
+                    content_items.append(
+                        ContentItem(
+                            type="image_url",
+                            image_url=ImageUrl(url=data_uri),
+                        )
                     )
-                )
+                else:
+                    # 非图片（音频/PDF等） → file 格式
+                    content_items.append(
+                        ContentItem(
+                            type="file",
+                            file={"mime_type": mime_type, "data": data},
+                        )
+                    )
             elif "fileData" in part and isinstance(part.get("fileData"), dict):
                 file_data = part["fileData"]
                 mime_type = file_data.get("mimeType", "application/octet-stream")
