@@ -27,6 +27,7 @@ from . import aws_channel
 from . import vertex_channel
 from . import openrouter_channel
 from . import cloudflare_channel
+from . import openai_image_channel
 
 # 调用各渠道的 register() 函数
 openai_channel.register()
@@ -38,6 +39,7 @@ aws_channel.register()
 vertex_channel.register()
 openrouter_channel.register()
 cloudflare_channel.register()
+openai_image_channel.register()
 
 __all__ = [
     # 类型定义
