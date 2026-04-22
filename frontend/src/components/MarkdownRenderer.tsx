@@ -152,7 +152,7 @@ function renderInline(text: string, keyPrefix: string, tone: MarkdownTone): Reac
   const tokens: ReactNode[] = [];
   const styles = TONE_STYLES[tone];
 
-  const pattern = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|`([^`]+)`|(?<!\$)\$(?!\$)([^$\n]+?)\$(?!\$)|\*\*([^*]+)\*\*|__([^_]+)__|~~([^~]+)~~|\*([^*\n]+)\*|_([^_\n]+)_|\[\^(\w+)\]/g;
+  const pattern = /!\[([^\]]*)\]\(([^\s)]+)\)|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|`([^`]+)`|(?<!\$)\$(?!\$)([^$\n]+?)\$(?!\$)|\*\*([^*]+)\*\*|__([^_]+)__|~~([^~]+)~~|\*([^*\n]+)\*|_([^_\n]+)_|\[\^(\w+)\]/g;
   let cursor = 0;
   let match: RegExpExecArray | null;
 
@@ -163,58 +163,69 @@ function renderInline(text: string, keyPrefix: string, tone: MarkdownTone): Reac
     }
 
     const [matched] = match;
-    if (match[1] && match[2]) {
+    if (match[1] !== undefined && match[2]) {
+      // Image: ![alt](url) — supports data: URIs and https://
+      tokens.push(
+        <img
+          key={`${keyPrefix}-img-${match.index}`}
+          src={match[2]}
+          alt={match[1] || 'image'}
+          className="max-w-full rounded-lg my-1 max-h-[512px] object-contain"
+          loading="lazy"
+        />
+      );
+    } else if (match[3] && match[4]) {
       tokens.push(
         <a
           key={`${keyPrefix}-link-${match.index}`}
-          href={match[2]}
+          href={match[4]}
           target="_blank"
           rel="noreferrer"
           className={`font-medium underline decoration-1 underline-offset-[3px] transition-colors break-all ${styles.link}`}
         >
-          {renderInline(match[1], `${keyPrefix}-link-text-${match.index}`, tone)}
+          {renderInline(match[3], `${keyPrefix}-link-text-${match.index}`, tone)}
         </a>
       );
-    } else if (match[3]) {
+    } else if (match[5]) {
       tokens.push(
         <code
           key={`${keyPrefix}-code-${match.index}`}
           className={styles.inlineCode}
         >
-          {match[3]}
+          {match[5]}
         </code>
       );
-    } else if (match[4]) {
+    } else if (match[6]) {
       tokens.push(
         <KatexSpan
           key={`${keyPrefix}-math-${match.index}`}
-          latex={match[4]}
+          latex={match[6]}
           displayMode={false}
           tone={tone}
         />
       );
-    } else if (match[5] || match[6]) {
-      const strongText = match[5] || match[6] || '';
+    } else if (match[7] || match[8]) {
+      const strongText = match[7] || match[8] || '';
       tokens.push(
         <strong key={`${keyPrefix}-strong-${match.index}`} className="font-semibold">
           {renderInline(strongText, `${keyPrefix}-strong-text-${match.index}`, tone)}
         </strong>
       );
-    } else if (match[7]) {
+    } else if (match[9]) {
       tokens.push(
         <del key={`${keyPrefix}-del-${match.index}`} className="opacity-70">
-          {renderInline(match[7], `${keyPrefix}-del-text-${match.index}`, tone)}
+          {renderInline(match[9], `${keyPrefix}-del-text-${match.index}`, tone)}
         </del>
       );
-    } else if (match[8] || match[9]) {
-      const emText = match[8] || match[9] || '';
+    } else if (match[10] || match[11]) {
+      const emText = match[10] || match[11] || '';
       tokens.push(
         <em key={`${keyPrefix}-em-${match.index}`} className="italic">
           {renderInline(emText, `${keyPrefix}-em-text-${match.index}`, tone)}
         </em>
       );
-    } else if (match[10]) {
-      const fnId = match[10];
+    } else if (match[12]) {
+      const fnId = match[12];
       tokens.push(
         <sup key={`${keyPrefix}-fnref-${match.index}`}>
           <a
