@@ -13,12 +13,16 @@
 5. 修正空顶层 system 字段：移除 Claude API 格式中空白的顶层 "system" 字段
 6. 解决 temperature/top_p 冲突：部分模型不允许同时传 temperature 和 top_p，
    当两者同时存在时移除 top_p（保留 temperature）
+7. 修正 assistant 消息末尾空白：去除最后一条 assistant 消息 content 的尾部空白
+   （"final assistant content cannot end with trailing whitespace"）
 
 可选参数（通过 enabled_plugins 配置）：
 - "request_sanitizer"                → 仅执行上述默认修正规则
 - "request_sanitizer:merge_system"   → 额外合并连续的 system 消息为一条
 - "request_sanitizer:merge_all"      → 额外合并所有连续同角色消息（system/user/assistant 等）
 - "request_sanitizer:ensure_system"  → 若 messages 中没有 system 消息，在开头插入一条空 system
+- "request_sanitizer:no_prefill"     → 若最后一条消息是 assistant（预填充），移除它
+                                       （适用于不支持 assistant prefill 的渠道）
 
 参数可组合使用（逗号分隔），如 "request_sanitizer:merge_system,ensure_system"
 
@@ -52,7 +56,8 @@ PLUGIN_INFO = {
             "  merge_system  = 额外合并连续 system 消息\n"
             "  merge_all     = 额外合并所有连续同角色消息\n"
             "  ensure_system = 若无 system 消息则在开头插入一条\n"
-            "  可组合: merge_system,ensure_system"
+            "  no_prefill    = 移除末尾 assistant 预填充消息\n"
+            "  可组合: merge_system,ensure_system,no_prefill"
         ),
     },
 }
@@ -165,24 +170,99 @@ def _fix_empty_top_level_system(payload: Dict[str, Any]) -> bool:
 
 
 def _fix_empty_system_messages(payload: Dict[str, Any]) -> bool:
-    """移除内容为空白的 system 消息，返回是否做了修改"""
+    """修正空白 system 消息，返回是否做了修改。
+
+    处理两种情况：
+    1. content 完全为空白 → 移除该消息
+    2. content 有实际内容但首尾有空白 → trim 掉首尾空白
+       （Claude 对 system 消息的空白检查非常严格）
+    """
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         return False
 
-    original_len = len(messages)
-    cleaned = [
-        msg for msg in messages
-        if not (
-            isinstance(msg, dict)
-            and msg.get("role") == "system"
-            and _is_blank_text(msg.get("content"))
-        )
-    ]
+    modified = False
+    cleaned = []
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "system":
+            cleaned.append(msg)
+            continue
 
-    if len(cleaned) < original_len:
+        content = msg.get("content")
+        # 完全空白 → 移除
+        if _is_blank_text(content):
+            modified = True
+            continue
+
+        # 字符串格式：trim 首尾空白
+        if isinstance(content, str):
+            trimmed = content.strip()
+            if trimmed != content:
+                msg = dict(msg)
+                msg["content"] = trimmed
+                modified = True
+
+        # list 格式：trim 每个 text block
+        elif isinstance(content, list):
+            new_content = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text = item.get("text", "")
+                    if isinstance(text, str):
+                        stripped = text.strip()
+                        if not stripped:
+                            modified = True
+                            continue  # 移除空白 text block
+                        if stripped != text:
+                            item = dict(item)
+                            item["text"] = stripped
+                            modified = True
+                new_content.append(item)
+            if not new_content:
+                modified = True
+                continue  # 所有 block 都是空白，移除整条消息
+            if new_content != content:
+                msg = dict(msg)
+                msg["content"] = new_content
+
+        cleaned.append(msg)
+
+    if modified:
         payload["messages"] = cleaned
         return True
+    return False
+
+
+def _fix_trailing_whitespace_assistant(payload: Dict[str, Any]) -> bool:
+    """去除最后一条 assistant 消息 content 的尾部空白，返回是否做了修改。
+
+    Claude API 不允许最后一条 assistant 消息的 content 以空白字符结尾：
+    "final assistant content cannot end with trailing whitespace"
+    """
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return False
+
+    # 从后往前找最后一条 assistant 消息
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+
+        content = msg.get("content")
+        if isinstance(content, str) and content != content.rstrip():
+            msg["content"] = content.rstrip()
+            return True
+        # list 格式：检查最后一个 text block
+        if isinstance(content, list) and content:
+            last_block = content[-1]
+            if isinstance(last_block, dict) and last_block.get("type") == "text":
+                text = last_block.get("text", "")
+                if isinstance(text, str) and text != text.rstrip():
+                    last_block["text"] = text.rstrip()
+                    return True
+        break  # 只处理最后一条 assistant
+
     return False
 
 
@@ -317,6 +397,24 @@ def _ensure_system_message(payload: Dict[str, Any]) -> bool:
     return False
 
 
+def _remove_trailing_assistant(payload: Dict[str, Any]) -> bool:
+    """若 messages 最后一条是 assistant 消息（预填充），移除它。
+
+    某些渠道/模型不支持 assistant message prefill，报错：
+    "This model does not support assistant message prefill.
+     The conversation must end with a user message"
+    """
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return False
+
+    last = messages[-1]
+    if isinstance(last, dict) and last.get("role") == "assistant":
+        messages.pop()
+        return True
+    return False
+
+
 # ==================== 拦截器主函数 ====================
 
 async def request_sanitizer_request_interceptor(
@@ -353,6 +451,9 @@ async def request_sanitizer_request_interceptor(
     if _fix_empty_top_level_system(payload):
         fixes.append("removed empty top-level system field")
 
+    if _fix_trailing_whitespace_assistant(payload):
+        fixes.append("trimmed trailing whitespace from final assistant message")
+
     # ── 可选参数（支持逗号组合，如 merge_system,ensure_system） ──
 
     options = get_plugin_options(PLUGIN_NAME, provider) or ""
@@ -381,6 +482,10 @@ async def request_sanitizer_request_interceptor(
     if "ensure_system" in option_set:
         if _ensure_system_message(payload):
             fixes.append("inserted empty system message at beginning")
+
+    if "no_prefill" in option_set:
+        if _remove_trailing_assistant(payload):
+            fixes.append("removed trailing assistant prefill message")
 
     # ── 日志 ──
 
