@@ -1098,19 +1098,16 @@ class ModelRequestHandler:
                     status_code = 500  # Internal Server Error
                     error_message = str(e) or f"Unknown error: {e.__class__.__name__}"
 
-                # ── 渠道级状态码映射 ──
-                # 把上游返回的非标准状态码映射为我们重试逻辑能识别的标准码。
-                # 例如 Cloudflare 529 → 429，使其触发限流退避而不是立即重试。
-                _sc_overrides = safe_get(provider, "preferences", "status_code_overrides", default=None)
-                if _sc_overrides and isinstance(_sc_overrides, dict):
-                    _mapped = _sc_overrides.get(str(status_code)) or _sc_overrides.get(status_code)
-                    if _mapped is not None:
-                        try:
-                            _mapped = int(_mapped)
-                            if 100 <= _mapped <= 599:
-                                status_code = _mapped
-                        except (TypeError, ValueError):
-                            pass
+                # ── Key Rules 统一错误处理 ──
+                from core.key_rules import resolve_key_rules, match_key_rules
+                _key_rules = resolve_key_rules(provider.get("preferences") or {})
+                _rule_result = match_key_rules(_key_rules, status_code, error_message) if _key_rules else None
+
+                # 规则中的 remap: 把上游非标准状态码映射为标准码
+                if _rule_result and _rule_result.get("remap"):
+                    _mapped = _rule_result["remap"]
+                    if 100 <= _mapped <= 599:
+                        status_code = _mapped
 
                 exclude_error_rate_limit = [
                     "BrokenResourceError",
@@ -1150,8 +1147,7 @@ class ModelRequestHandler:
                     if num_matching_providers != last_num_matching_providers:
                         index = 0
 
-                cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
-                # 仅统计“启用”的 key 数量，避免禁用 key 造成误判
+                # 仅统计"启用"的 key 数量，避免禁用 key 造成误判
                 try:
                     api_key_count = provider_api_circular_list[channel_id].get_enabled_items_count()
                 except Exception:
@@ -1163,28 +1159,21 @@ class ModelRequestHandler:
                 current_api = _current_info_for_key.get("_used_api_key") or \
                     await provider_api_circular_list[channel_id].after_next_current()
 
-                if (cooling_time > 0 and api_key_count > 1
-                    and all(error not in error_message for error in exclude_error_rate_limit)):
-                    await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=cooling_time)
-
-                # ── Key 自动禁用 ──
-                # 根据渠道配置的 auto_disable_key，当 Key 遇到特定错误码或错误信息包含关键词时自动禁用
-                auto_disable_cfg = safe_get(provider, "preferences", "auto_disable_key", default=None)
-                if auto_disable_cfg and isinstance(auto_disable_cfg, dict):
-                    trigger_codes = auto_disable_cfg.get("status_codes", [401, 403])
-                    if not isinstance(trigger_codes, list):
-                        trigger_codes = [trigger_codes]
-                    trigger_codes_set = set(int(c) for c in trigger_codes if str(c).isdigit())
-                    keywords = [k.strip() for k in (auto_disable_cfg.get("keywords") or []) if isinstance(k, str) and k.strip()]
-                    re_enable_seconds = int(auto_disable_cfg.get("duration", 0))
-
-                    error_lower = (error_message or "").lower()
-                    code_matched = status_code in trigger_codes_set
-                    keyword_matched = any(kw.lower() in error_lower for kw in keywords) if keywords else False
-
-                    if (code_matched or keyword_matched) and current_api:
-                        reason = f"status={status_code}" if code_matched else "keyword_match"
-                        await provider_api_circular_list[channel_id].set_auto_disabled(current_api, duration=re_enable_seconds, reason=reason)
+                # ── 应用 Key Rules 规则：冷却 / 禁用 ──
+                if _rule_result and current_api:
+                    _duration = _rule_result.get("duration", 0)
+                    _reason = _rule_result.get("reason", "key_rule")
+                    if _duration == -1:
+                        # 永久禁用
+                        await provider_api_circular_list[channel_id].set_auto_disabled(
+                            current_api, duration=0, reason=_reason
+                        )
+                    elif _duration > 0 and api_key_count > 1:
+                        # 定时冷却（仅多 key 时生效）
+                        if all(error not in error_message for error in exclude_error_rate_limit):
+                            await provider_api_circular_list[channel_id].set_auto_disabled(
+                                current_api, duration=_duration, reason=_reason
+                            )
 
                 # 有些错误并没有请求成功，所以需要删除请求记录
                 if (current_api 

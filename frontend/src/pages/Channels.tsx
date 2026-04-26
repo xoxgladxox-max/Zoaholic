@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { useEffect, useMemo, useState, KeyboardEvent, ClipboardEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, KeyboardEvent, ClipboardEvent } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
 import {
@@ -142,35 +142,101 @@ function formatCountdown(seconds: number) {
   return `${s}s`;
 }
 
-// ── 冷却中 Key 行组件 ──
-function CoolingKeyRow({ idx, keyObj, remainSec, focused, onFocus, onBlur, onRecover, onToggle, onTest, onDelete }: {
-  idx: number; keyObj: { key: string; disabled: boolean }; remainSec: number;
+// ── SVG 圆角矩形路径生成 ──
+function buildRoundRectPath(x: number, y: number, w: number, h: number, r: number) {
+  return [
+    `M ${x + r} ${y}`,
+    `L ${x + w - r} ${y}`,
+    `A ${r} ${r} 0 0 1 ${x + w} ${y + r}`,
+    `L ${x + w} ${y + h - r}`,
+    `A ${r} ${r} 0 0 1 ${x + w - r} ${y + h}`,
+    `L ${x + r} ${y + h}`,
+    `A ${r} ${r} 0 0 1 ${x} ${y + h - r}`,
+    `L ${x} ${y + r}`,
+    `A ${r} ${r} 0 0 1 ${x + r} ${y}`,
+    `Z`
+  ].join(' ');
+}
+
+// ── 冷却中 Key 行组件（SVG 边框进度） ──
+function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus, onBlur, onRecover, onToggle, onTest, onDelete }: {
+  idx: number; keyObj: { key: string; disabled: boolean }; remainSec: number; totalDuration: number;
   focused: boolean;
   onFocus: () => void; onBlur: () => void;
   onRecover: () => void; onToggle: () => void; onTest: () => void; onDelete: () => void;
 }) {
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const [svgViewBox, setSvgViewBox] = useState('');
+  const [pathD, setPathD] = useState('');
+
+  // 计算进度百分比
+  const progress = totalDuration > 0 ? Math.max(0, Math.min(100, (remainSec / totalDuration) * 100)) : 0;
+
+  // 初始化 & resize 时更新 SVG path
+  useEffect(() => {
+    const el = wrapperRef.current;
+    if (!el) return;
+    const update = () => {
+      const w = el.offsetWidth;
+      const h = el.offsetHeight;
+      setSvgViewBox(`0 0 ${w} ${h}`);
+      setPathD(buildRoundRectPath(1, 1, w - 2, h - 2, 7));
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // SVG stroke-dasharray / dashoffset
+  const dasharray = progress > 0 ? `${progress} 100` : '0 100';
+  const dashoffset = progress > 0 ? `${-(100 - progress)}` : '0';
+
   return (
-    <div className={`relative flex items-center gap-2 px-3 py-2 rounded-lg border overflow-hidden transition-colors ${focused ? 'border-blue-500 bg-muted/50' : 'border-red-300 dark:border-red-900/60 bg-red-50 dark:bg-red-950/30'}`}>
-      <span className="text-xs text-muted-foreground w-4 text-right relative z-[2]">{idx + 1}</span>
-      <div className="flex-1 min-w-0 relative z-[2]" style={!focused ? { WebkitMaskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)', maskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)' } : undefined}>
-        <input
-          type="text" value={keyObj.key || ''} readOnly placeholder="sk-..."
-          onFocus={onFocus} onBlur={onBlur}
-          className={`w-full bg-transparent border-none text-sm font-mono outline-none ${focused ? 'text-foreground' : 'text-red-600 dark:text-red-300 line-through decoration-red-500/40'}`}
-        />
-      </div>
-      {!focused && (
-        <>
-          <span className="flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded text-red-400 bg-red-500/10 relative z-[2]">
-            {formatCountdown(remainSec)}
-          </span>
-          <button onClick={onRecover} className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 cursor-pointer flex-shrink-0 relative z-[2]">恢复</button>
-        </>
+    <div ref={wrapperRef} className="relative rounded-lg" style={{ isolation: 'isolate' }}>
+      {/* SVG 边框进度 */}
+      {!focused && pathD && (
+        <svg
+          className="absolute inset-0 w-full h-full pointer-events-none z-[1]"
+          viewBox={svgViewBox}
+          style={{ overflow: 'visible' }}
+        >
+          <path
+            d={pathD}
+            pathLength={100}
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={2}
+            strokeLinecap="round"
+            className="text-red-500"
+            style={{ strokeDasharray: dasharray, strokeDashoffset: dashoffset, transition: 'stroke-dasharray 1s linear, stroke-dashoffset 1s linear' }}
+          />
+        </svg>
       )}
-      <div className="actions flex items-center gap-1 flex-shrink-0 relative z-[2]">
-        <button onClick={onToggle} className="text-muted-foreground" title="禁用"><ToggleRight className="w-5 h-5" /></button>
-        <button onClick={onTest} disabled={!keyObj.key.trim()} className="text-blue-600 dark:text-blue-400 disabled:opacity-50"><Play className="w-4 h-4" /></button>
-        <button onClick={onDelete} className="text-red-500 hover:text-red-400 ml-1"><Trash2 className="w-4 h-4" /></button>
+      {/* 内容 */}
+      <div className={`relative flex items-center gap-2 px-3 py-2 rounded-lg border-2 transition-colors ${focused ? 'border-blue-500 bg-muted/50' : 'border-border bg-background dark:bg-card'}`}>
+        <span className="text-xs text-muted-foreground w-4 text-right relative z-[2]">{idx + 1}</span>
+        <div className="flex-1 min-w-0 relative z-[2]">
+          <input
+            type="text" value={keyObj.key || ''} readOnly placeholder="sk-..."
+            onFocus={onFocus} onBlur={onBlur}
+            className={`w-full bg-transparent border-none text-sm font-mono outline-none ${focused ? 'text-foreground' : 'text-red-400 dark:text-red-300 line-through decoration-red-500/40'}`}
+          />
+          {/* 倒计时叠加 */}
+          {!focused && (
+            <span className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-[11px] font-semibold font-mono text-red-500 bg-background/85 dark:bg-card/85 rounded px-2 py-0.5 pointer-events-none z-[3]">
+              {formatCountdown(remainSec)}
+            </span>
+          )}
+        </div>
+        {!focused && (
+          <button onClick={onRecover} className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 cursor-pointer flex-shrink-0 relative z-[2]">恢复</button>
+        )}
+        <div className="actions flex items-center gap-1 flex-shrink-0 relative z-[2]">
+          <button onClick={onToggle} className="text-muted-foreground" title="禁用"><ToggleRight className="w-5 h-5" /></button>
+          <button onClick={onTest} disabled={!keyObj.key.trim()} className="text-blue-600 dark:text-blue-400 disabled:opacity-50"><Play className="w-4 h-4" /></button>
+          <button onClick={onDelete} className="text-red-500 hover:text-red-400 ml-1"><Trash2 className="w-4 h-4" /></button>
+        </div>
       </div>
     </div>
   );
@@ -478,7 +544,7 @@ export default function Channels() {
         groups: ['default'],
         models: [],
         mappings: [],
-        preferences: { weight: 10, cooldown_period: 3, api_key_schedule_algorithm: 'round_robin', tools: true, enabled_plugins: [] },
+        preferences: { weight: 10, api_key_schedule_algorithm: 'round_robin', tools: true, enabled_plugins: [], key_rules: [{ match: { status: [401, 403] }, duration: -1 }, { match: 'default', duration: 3 }] },
         sub_channels: [],
       });
     }
@@ -1812,6 +1878,7 @@ export default function Channels() {
                             idx={idx}
                             keyObj={keyObj}
                             remainSec={remainSec}
+                            totalDuration={countdown?.duration ?? rtEntry?.duration ?? remainSec}
                             focused={isFocused}
                             onFocus={() => setFocusedKeyIdx(idx)}
                             onBlur={() => setFocusedKeyIdx(null)}
@@ -2246,100 +2313,183 @@ export default function Channels() {
                   <div className="flex items-center gap-2 text-sm font-semibold text-foreground mb-4 border-b border-border pb-2">
                     <Network className="w-4 h-4 text-yellow-500" /> 路由与限流
                   </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div>
-                      <label className="text-sm font-medium text-foreground mb-1.5 block">渠道权重 (Weight)</label>
-                      <input type="number" value={formData.preferences.weight || ''} onChange={e => updatePreference('weight', Number(e.target.value))} className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground" />
+                  <div className="space-y-4">
+                    {/* 权重 + 调度策略 并排 */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <label className="text-sm font-medium text-foreground mb-1.5 block">渠道权重 (Weight)</label>
+                        <input type="number" value={formData.preferences.weight || ''} onChange={e => updatePreference('weight', Number(e.target.value))} className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground" />
+                      </div>
+                      <div>
+                        <label className="text-sm font-medium text-foreground mb-1.5 block">Key 调度策略</label>
+                        <select value={formData.preferences.api_key_schedule_algorithm} onChange={e => updatePreference('api_key_schedule_algorithm', e.target.value)} className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground">
+                          {SCHEDULE_ALGORITHMS.map(a => <option key={a.value} value={a.value}>{a.label}</option>)}
+                        </select>
+                      </div>
                     </div>
-                    <div>
-                      <label className="text-sm font-medium text-foreground mb-1.5 block">错误冷却 (秒)</label>
-                      <input type="number" value={formData.preferences.cooldown_period || ''} onChange={e => updatePreference('cooldown_period', Number(e.target.value))} className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground" />
-                    </div>
-                    <div className="col-span-1 sm:col-span-2">
-                      <label className="text-sm font-medium text-foreground mb-1.5 block">Key 调度策略</label>
-                      <select value={formData.preferences.api_key_schedule_algorithm} onChange={e => updatePreference('api_key_schedule_algorithm', e.target.value)} className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground">
-                        {SCHEDULE_ALGORITHMS.map(a => <option key={a.value} value={a.value}>{a.label}</option>)}
-                      </select>
-                    </div>
-                    <div className="col-span-1 sm:col-span-2">
-                      <label className="text-sm font-medium text-foreground mb-1.5 block">错误码映射 (JSON)</label>
-                      <textarea
-                        value={statusCodeOverridesJson}
-                        onChange={e => setStatusCodeOverridesJson(e.target.value)}
-                        onBlur={() => formatJsonOnBlur(statusCodeOverridesJson, setStatusCodeOverridesJson, '错误码映射')}
-                        rows={2}
-                        placeholder='{"529": 429, "520": 502}'
-                        className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm font-mono focus:border-primary outline-none text-foreground"
-                      />
-                      <p className="text-xs text-muted-foreground mt-1">将上游非标准状态码映射为标准码以触发正确的重试策略。例如 529→429 使其按限流退避处理。</p>
-                    </div>
-                    {/* 自动禁用配置 */}
-                    <div className="col-span-1 sm:col-span-2 border-t border-border pt-4">
+
+                    {/* Key 错误处理规则 */}
+                    <div className="border-t border-border pt-4">
                       <div className="flex items-center justify-between mb-3">
                         <label className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                          <Power className="w-3.5 h-3.5 text-red-500" /> Key 自动禁用
+                          <Power className="w-3.5 h-3.5 text-red-500" /> Key 错误处理规则
                         </label>
-                        <Switch.Root
-                          checked={!!formData.preferences.auto_disable_key}
-                          onCheckedChange={val => {
-                            if (val) {
-                              updatePreference('auto_disable_key', { status_codes: [401, 403], keywords: [], duration: 0 });
-                            } else {
-                              // eslint-disable-next-line @typescript-eslint/no-unused-vars
-                              const { auto_disable_key: _, ...rest } = formData.preferences;
-                              updateFormData('preferences', rest);
-                            }
-                          }}
-                          className="w-9 h-5 bg-muted rounded-full relative data-[state=checked]:bg-red-500 transition-colors"
-                        >
-                          <Switch.Thumb className="block w-4 h-4 bg-white rounded-full shadow-md transition-transform translate-x-0.5 data-[state=checked]:translate-x-[18px]" />
-                        </Switch.Root>
-                      </div>
-                      <p className="text-xs text-muted-foreground mb-3">当 Key 请求返回指定错误码或响应包含指定关键词时，自动将其禁用一段时间或永久禁用。运行时状态不持久化，重启后重置。</p>
-                      {formData.preferences.auto_disable_key && (
-                        <div className="space-y-3 pl-1">
-                          <div>
-                            <label className="text-xs font-medium text-muted-foreground mb-1 block">触发状态码</label>
-                            <input
-                              type="text"
-                              value={(formData.preferences.auto_disable_key.status_codes || []).join(', ')}
-                              onChange={e => {
-                                const codes = e.target.value.split(/[,，\s]+/).map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-                                updatePreference('auto_disable_key', { ...formData.preferences.auto_disable_key, status_codes: codes });
-                              }}
-                              placeholder="401, 403"
-                              className="w-full bg-background border border-border px-3 py-1.5 rounded-lg text-xs font-mono focus:border-primary outline-none text-foreground"
-                            />
-                          </div>
-                          <div>
-                            <label className="text-xs font-medium text-muted-foreground mb-1 block">触发关键词（响应体包含，逗号分隔）</label>
-                            <input
-                              type="text"
-                              value={(formData.preferences.auto_disable_key.keywords || []).join(', ')}
-                              onChange={e => {
-                                const kws = e.target.value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
-                                updatePreference('auto_disable_key', { ...formData.preferences.auto_disable_key, keywords: kws });
-                              }}
-                              placeholder="insufficient_quota, billing"
-                              className="w-full bg-background border border-border px-3 py-1.5 rounded-lg text-xs font-mono focus:border-primary outline-none text-foreground"
-                            />
-                          </div>
-                          <div>
-                            <label className="text-xs font-medium text-muted-foreground mb-1 block">禁用时长（秒，0 = 永久）</label>
-                            <input
-                              type="number"
-                              value={formData.preferences.auto_disable_key.duration ?? 0}
-                              onChange={e => {
-                                updatePreference('auto_disable_key', { ...formData.preferences.auto_disable_key, duration: Math.max(0, parseInt(e.target.value) || 0) });
-                              }}
-                              min={0}
-                              placeholder="0"
-                              className="w-full bg-background border border-border px-3 py-1.5 rounded-lg text-xs font-mono focus:border-primary outline-none text-foreground"
-                            />
-                            <p className="text-xs text-muted-foreground mt-1">设为 0 表示永久禁用（需手动恢复）。设为正数则为冷却秒数，到期后自动恢复。</p>
-                          </div>
+                        <div className="flex gap-1.5">
+                          {[{ label: '标准', rules: [
+                            { match: { status: [429] }, duration: 30 },
+                            { match: { status: [401, 403] }, duration: -1 },
+                            { match: 'default', duration: 60 },
+                          ]}, { label: '激进', rules: [
+                            { match: { status: [429] }, duration: 10 },
+                            { match: { status: [401, 403, 500] }, duration: -1 },
+                            { match: 'default', duration: 30 },
+                          ]}, { label: '宽松', rules: [
+                            { match: { status: [429] }, duration: 60 },
+                            { match: { status: [401, 403] }, duration: -1 },
+                          ]}].map(tpl => (
+                            <button
+                              key={tpl.label}
+                              type="button"
+                              onClick={() => updatePreference('key_rules', tpl.rules)}
+                              className="text-[10px] font-medium px-2 py-1 rounded bg-muted hover:bg-muted/80 text-muted-foreground hover:text-foreground transition-colors"
+                            >
+                              {tpl.label}
+                            </button>
+                          ))}
                         </div>
-                      )}
+                      </div>
+                      <p className="text-xs text-muted-foreground mb-3">
+                        按顺序匹配，第一个命中的规则生效。duration: -1 = 永久禁用，0 = 仅映射不处理 Key，&gt;0 = 冷却秒数。
+                      </p>
+
+                      {/* 规则列表 */}
+                      <div className="space-y-2">
+                        {(formData.preferences.key_rules || []).map((rule: any, idx: number) => {
+                          const rules = formData.preferences.key_rules || [];
+                          const updateRule = (patch: any) => {
+                            const next = [...rules];
+                            next[idx] = { ...next[idx], ...patch };
+                            updatePreference('key_rules', next);
+                          };
+                          const removeRule = () => {
+                            updatePreference('key_rules', rules.filter((_: any, i: number) => i !== idx));
+                          };
+                          const matchType = rule.match === 'default' ? 'default' : rule.match?.status ? 'status' : rule.match?.keyword ? 'keyword' : 'status';
+                          const matchValue = matchType === 'status'
+                            ? (rule.match?.status || []).join(', ')
+                            : matchType === 'keyword'
+                            ? (Array.isArray(rule.match?.keyword) ? rule.match.keyword.join(', ') : rule.match?.keyword || '')
+                            : '';
+
+                          return (
+                            <div key={idx} className="flex items-center gap-2 bg-muted/30 border border-border rounded-lg px-3 py-2">
+                              {/* 匹配类型 */}
+                              <select
+                                value={matchType}
+                                onChange={e => {
+                                  const t = e.target.value;
+                                  if (t === 'default') updateRule({ match: 'default' });
+                                  else if (t === 'status') updateRule({ match: { status: [429] } });
+                                  else if (t === 'keyword') updateRule({ match: { keyword: [''] } });
+                                }}
+                                className="bg-background border border-border rounded px-2 py-1 text-xs text-foreground w-20 flex-shrink-0"
+                              >
+                                <option value="status">状态码</option>
+                                <option value="keyword">关键词</option>
+                                <option value="default">默认</option>
+                              </select>
+
+                              {/* 匹配值 */}
+                              {matchType !== 'default' && (
+                                <input
+                                  type="text"
+                                  value={matchValue}
+                                  onChange={e => {
+                                    const val = e.target.value;
+                                    if (matchType === 'status') {
+                                      const codes = val.split(/[,\s]+/).map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+                                      updateRule({ match: { status: codes } });
+                                    } else {
+                                      const kws = val.split(/[,]/).map(s => s.trim()).filter(Boolean);
+                                      updateRule({ match: { keyword: kws.length > 0 ? kws : [''] } });
+                                    }
+                                  }}
+                                  placeholder={matchType === 'status' ? '429, 500' : 'quota, billing'}
+                                  className="flex-1 min-w-0 bg-background border border-border rounded px-2 py-1 text-xs font-mono text-foreground"
+                                />
+                              )}
+                              {matchType === 'default' && <div className="flex-1 text-xs text-muted-foreground italic">兜底规则</div>}
+
+                              {/* 箭头 */}
+                              <span className="text-muted-foreground text-xs flex-shrink-0">→</span>
+
+                              {/* Duration */}
+                              <select
+                                value={rule.duration === -1 ? '-1' : rule.duration > 0 ? 'custom' : '0'}
+                                onChange={e => {
+                                  const v = e.target.value;
+                                  if (v === '-1') updateRule({ duration: -1 });
+                                  else if (v === '0') updateRule({ duration: 0 });
+                                  else updateRule({ duration: rule.duration > 0 ? rule.duration : 60 });
+                                }}
+                                className="bg-background border border-border rounded px-2 py-1 text-xs text-foreground w-24 flex-shrink-0"
+                              >
+                                <option value="-1">永久禁用</option>
+                                <option value="custom">冷却</option>
+                                <option value="0">仅映射</option>
+                              </select>
+
+                              {rule.duration > 0 && (
+                                <div className="flex items-center gap-1 flex-shrink-0">
+                                  <input
+                                    type="number"
+                                    value={rule.duration}
+                                    onChange={e => updateRule({ duration: Math.max(1, parseInt(e.target.value) || 1) })}
+                                    min={1}
+                                    className="w-16 bg-background border border-border rounded px-2 py-1 text-xs font-mono text-foreground"
+                                  />
+                                  <span className="text-xs text-muted-foreground">秒</span>
+                                </div>
+                              )}
+
+                              {/* Remap (可选) */}
+                              {matchType === 'status' && (
+                                <div className="flex items-center gap-1 flex-shrink-0">
+                                  <span className="text-[10px] text-muted-foreground">映射</span>
+                                  <input
+                                    type="number"
+                                    value={rule.remap || ''}
+                                    onChange={e => {
+                                      const v = parseInt(e.target.value);
+                                      if (!isNaN(v) && v >= 100 && v <= 599) updateRule({ remap: v });
+                                      else { const { remap: _, ...rest } = rules[idx]; const next = [...rules]; next[idx] = rest; updatePreference('key_rules', next); }
+                                    }}
+                                    placeholder="-"
+                                    className="w-14 bg-background border border-border rounded px-1.5 py-1 text-xs font-mono text-foreground"
+                                  />
+                                </div>
+                              )}
+
+                              {/* 删除 */}
+                              <button onClick={removeRule} className="text-red-500 hover:text-red-400 flex-shrink-0 p-0.5">
+                                <X className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      {/* 添加规则 */}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const rules = formData.preferences.key_rules || [];
+                          updatePreference('key_rules', [...rules, { match: { status: [429] }, duration: 30 }]);
+                        }}
+                        className="text-xs text-primary hover:text-primary/80 flex items-center gap-1 mt-2"
+                      >
+                        <Plus className="w-3 h-3" /> 添加规则
+                      </button>
                     </div>
                   </div>
                 </section>}
