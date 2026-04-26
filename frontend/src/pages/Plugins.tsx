@@ -12,6 +12,13 @@ import {
   Folder,
   Info,
   AlertTriangle,
+  ChevronDown,
+  ChevronRight,
+  Settings2,
+  Tag,
+  Code2,
+  FileText,
+  Zap,
 } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 
@@ -27,7 +34,19 @@ interface PluginInfo {
   dependencies?: any;
   loaded_at?: string | null;
   error?: string | null;
-  metadata?: any;
+  metadata?: {
+    category?: string;
+    tags?: string[];
+    params_hint?: string;
+    provider_config?: {
+      key: string;
+      type?: 'json' | 'text';
+      title?: string;
+      description?: string;
+      example?: unknown;
+    };
+    [key: string]: unknown;
+  };
 }
 
 type PluginStatus = {
@@ -48,6 +67,7 @@ export default function Plugins() {
   const [loading, setLoading] = useState(true);
 
   const [search, setSearch] = useState('');
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [uploading, setUploading] = useState(false);
@@ -95,10 +115,20 @@ export default function Plugins() {
     const q = search.trim().toLowerCase();
     if (!q) return plugins;
     return plugins.filter(p => {
-      const hay = `${p.name} ${p.version || ''} ${p.description || ''} ${p.author || ''} ${p.source || ''}`.toLowerCase();
+      const tags = p.metadata?.tags?.join(' ') || '';
+      const hay = `${p.name} ${p.version || ''} ${p.description || ''} ${p.author || ''} ${p.source || ''} ${tags}`.toLowerCase();
       return hay.includes(q);
     });
   }, [plugins, search]);
+
+  const toggleExpand = (name: string) => {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
 
   const callAction = async (
     url: string,
@@ -166,6 +196,16 @@ export default function Plugins() {
 
   const handleLoadAll = async () => {
     await callAction('/v1/plugins/load-all', { method: 'POST' }, '已触发重新加载所有插件');
+  };
+
+  // 解析 extensions 获取拦截器类型列表
+  const getInterceptorTypes = (ext: any): string[] => {
+    if (!ext || !Array.isArray(ext)) return [];
+    return ext.map((e: string) => {
+      if (e.includes('request')) return '请求拦截';
+      if (e.includes('response')) return '响应拦截';
+      return e;
+    });
   };
 
   if (loading) {
@@ -263,7 +303,7 @@ export default function Plugins() {
           <input
             value={search}
             onChange={e => setSearch(e.target.value)}
-            placeholder="搜索插件：名称/版本/作者/描述..."
+            placeholder="搜索插件：名称/版本/作者/描述/标签..."
             className="w-full bg-background border border-border rounded-lg pl-9 pr-3 py-2 text-sm text-foreground"
           />
         </div>
@@ -278,17 +318,48 @@ export default function Plugins() {
           <div className="bg-card border border-border rounded-xl p-8 text-center text-muted-foreground">
             <p>暂无插件</p>
             <p className="text-xs mt-2">
-              你可以点击右上角“上传插件”上传 <code className="bg-muted px-1 py-0.5 rounded">.py</code> 或{' '}
+              你可以点击右上角"上传插件"上传 <code className="bg-muted px-1 py-0.5 rounded">.py</code> 或{' '}
               <code className="bg-muted px-1 py-0.5 rounded">.zip</code>。
             </p>
           </div>
         ) : (
           filtered.map((p) => {
             const hasError = !!p.error;
+            const isExpanded = expanded.has(p.name);
+            const tags = p.metadata?.tags || [];
+            const category = p.metadata?.category;
+            const paramsHint = p.metadata?.params_hint;
+            const providerConfig = p.metadata?.provider_config;
+            const interceptorTypes = getInterceptorTypes(p.extensions);
+            const hasDetails = !!(p.description || paramsHint || providerConfig || p.path || p.author || p.loaded_at || hasError || interceptorTypes.length);
+
             return (
-              <div key={p.name} className="bg-card border border-border rounded-xl overflow-hidden">
-                <div className="p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-                  <div className="min-w-0">
+              <div
+                key={p.name}
+                className={`bg-card border rounded-xl overflow-hidden transition-colors ${
+                  p.enabled
+                    ? 'border-emerald-500/30'
+                    : hasError
+                    ? 'border-destructive/30'
+                    : 'border-border'
+                }`}
+              >
+                {/* Card Header — always visible */}
+                <div
+                  className="p-4 flex items-start gap-3 cursor-pointer select-none hover:bg-muted/20 transition-colors"
+                  onClick={() => hasDetails && toggleExpand(p.name)}
+                >
+                  {/* Expand icon */}
+                  <div className="text-muted-foreground flex-shrink-0 mt-0.5">
+                    {hasDetails ? (
+                      isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />
+                    ) : (
+                      <div className="w-4" />
+                    )}
+                  </div>
+
+                  {/* Info */}
+                  <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-semibold text-foreground">{p.name}</span>
                       {p.version && (
@@ -315,54 +386,60 @@ export default function Plugins() {
                       )}
                     </div>
 
-                    {p.description && <div className="text-sm text-muted-foreground mt-1 break-words">{p.description}</div>}
+                    {/* Description — visible in collapsed state */}
+                    {p.description && (
+                      <p className={`text-sm text-muted-foreground mt-1.5 ${isExpanded ? '' : 'line-clamp-2'}`}>
+                        {p.description}
+                      </p>
+                    )}
 
-                    <div className="text-xs text-muted-foreground mt-2 space-y-0.5">
-                      {p.author && (
-                        <div>
-                          <span className="font-medium">作者：</span>
-                          {p.author}
-                        </div>
-                      )}
-                      {p.path && (
-                        <div className="font-mono break-all">
-                          <span className="font-sans font-medium">路径：</span>
-                          {p.path}
-                        </div>
-                      )}
-                      {p.loaded_at && (
-                        <div>
-                          <span className="font-medium">加载时间：</span>
-                          {p.loaded_at}
-                        </div>
-                      )}
-                      {hasError && (
-                        <div className="text-destructive break-words">
-                          <span className="font-medium">错误：</span>
-                          {p.error}
-                        </div>
-                      )}
-                    </div>
+                    {/* Tags + interceptor types — visible in collapsed state */}
+                    {(tags.length > 0 || category || interceptorTypes.length > 0) && (
+                      <div className="flex items-center gap-1.5 mt-2 flex-wrap">
+                        {tags.map(tag => (
+                          <span
+                            key={tag}
+                            className="text-[10px] px-2 py-0.5 rounded-full font-mono bg-blue-500/10 text-blue-600 dark:text-blue-400"
+                          >
+                            {tag}
+                          </span>
+                        ))}
+                        {category && (
+                          <span className="text-[10px] px-2 py-0.5 rounded-full font-mono bg-amber-500/10 text-amber-600 dark:text-amber-400">
+                            {category}
+                          </span>
+                        )}
+                        {interceptorTypes.map((t, i) => (
+                          <span
+                            key={i}
+                            className="text-[10px] px-2 py-0.5 rounded-full font-mono bg-purple-500/10 text-purple-600 dark:text-purple-400 flex items-center gap-0.5"
+                          >
+                            <Zap className="w-2.5 h-2.5" /> {t}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                   </div>
 
-                  <div className="flex flex-wrap gap-2">
+                  {/* Actions */}
+                  <div className="flex flex-wrap gap-1.5 flex-shrink-0" onClick={e => e.stopPropagation()}>
                     {p.enabled ? (
                       <button
                         onClick={() =>
                           callAction(`/v1/plugins/${encodeURIComponent(p.name)}/disable`, { method: 'POST' }, `已禁用 ${p.name}`)
                         }
-                        className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg flex items-center gap-2 text-sm font-medium transition-colors"
+                        className="bg-muted hover:bg-muted/80 text-foreground px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium transition-colors"
                       >
-                        <PowerOff className="w-4 h-4" /> 禁用
+                        <PowerOff className="w-3.5 h-3.5" /> 禁用
                       </button>
                     ) : (
                       <button
                         onClick={() =>
                           callAction(`/v1/plugins/${encodeURIComponent(p.name)}/enable`, { method: 'POST' }, `已启用 ${p.name}`)
                         }
-                        className="bg-emerald-600 hover:bg-emerald-600/90 text-white px-3 py-2 rounded-lg flex items-center gap-2 text-sm font-medium transition-colors"
+                        className="bg-emerald-600 hover:bg-emerald-600/90 text-white px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium transition-colors"
                       >
-                        <Power className="w-4 h-4" /> 启用
+                        <Power className="w-3.5 h-3.5" /> 启用
                       </button>
                     )}
 
@@ -370,9 +447,9 @@ export default function Plugins() {
                       onClick={() =>
                         callAction(`/v1/plugins/${encodeURIComponent(p.name)}/reload`, { method: 'POST' }, `已重载 ${p.name}`)
                       }
-                      className="bg-primary hover:bg-primary/90 text-primary-foreground px-3 py-2 rounded-lg flex items-center gap-2 text-sm font-medium transition-colors"
+                      className="bg-primary hover:bg-primary/90 text-primary-foreground px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium transition-colors"
                     >
-                      <RotateCcw className="w-4 h-4" /> 重载
+                      <RotateCcw className="w-3.5 h-3.5" /> 重载
                     </button>
 
                     <button
@@ -381,12 +458,123 @@ export default function Plugins() {
                         if (!ok) return;
                         await callAction(`/v1/plugins/${encodeURIComponent(p.name)}`, { method: 'DELETE' }, `已卸载 ${p.name}`);
                       }}
-                      className="bg-destructive hover:bg-destructive/90 text-destructive-foreground px-3 py-2 rounded-lg flex items-center gap-2 text-sm font-medium transition-colors"
+                      className="bg-destructive hover:bg-destructive/90 text-destructive-foreground px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium transition-colors"
                     >
-                      <Trash2 className="w-4 h-4" /> 卸载
+                      <Trash2 className="w-3.5 h-3.5" /> 卸载
                     </button>
                   </div>
                 </div>
+
+                {/* Expanded Details */}
+                {isExpanded && (
+                  <div className="border-t border-border bg-muted/10 px-4 pb-4 pt-3 ml-7 space-y-4">
+                    {/* params_hint */}
+                    {paramsHint && (
+                      <div>
+                        <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                          <Settings2 className="w-3.5 h-3.5" /> 插件参数
+                        </div>
+                        <div className="bg-background border border-border rounded-lg p-3 font-mono text-xs text-foreground leading-relaxed">
+                          {paramsHint}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* provider_config */}
+                    {providerConfig && (
+                      <div>
+                        <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                          <Code2 className="w-3.5 h-3.5" /> 渠道级配置
+                          {providerConfig.title && (
+                            <span className="font-normal normal-case tracking-normal">— {providerConfig.title}</span>
+                          )}
+                        </div>
+                        {providerConfig.description && (
+                          <p className="text-xs text-muted-foreground mb-2">{providerConfig.description}</p>
+                        )}
+                        <div className="space-y-2">
+                          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                            <Tag className="w-3 h-3" />
+                            <span>配置 key: <code className="bg-muted px-1.5 py-0.5 rounded text-foreground font-mono">{providerConfig.key}</code></span>
+                            <span className="text-muted-foreground/60">·</span>
+                            <span>类型: <code className="bg-muted px-1.5 py-0.5 rounded text-foreground font-mono">{providerConfig.type || 'json'}</code></span>
+                          </div>
+                          {providerConfig.example != null && (
+                            <div>
+                              <div className="text-[10px] text-muted-foreground mb-1 flex items-center gap-1">
+                                <FileText className="w-3 h-3" /> 配置示例
+                              </div>
+                              <pre className="bg-background border border-border rounded-lg p-3 text-xs font-mono text-foreground overflow-x-auto max-h-48 overflow-y-auto leading-relaxed">
+                                {typeof providerConfig.example === 'string'
+                                  ? providerConfig.example
+                                  : JSON.stringify(providerConfig.example, null, 2)}
+                              </pre>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Extensions */}
+                    {p.extensions && Array.isArray(p.extensions) && p.extensions.length > 0 && (
+                      <div>
+                        <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                          <Zap className="w-3.5 h-3.5" /> 注册的扩展点
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {p.extensions.map((ext: string, i: number) => (
+                            <code
+                              key={i}
+                              className="text-[11px] bg-background border border-border px-2 py-1 rounded font-mono text-foreground"
+                            >
+                              {ext}
+                            </code>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Meta info */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs text-muted-foreground">
+                      {p.author && (
+                        <div className="bg-background border border-border rounded-lg p-2.5">
+                          <span className="font-medium text-foreground">作者</span>
+                          <div className="mt-0.5">{p.author}</div>
+                        </div>
+                      )}
+                      {p.path && (
+                        <div className="bg-background border border-border rounded-lg p-2.5">
+                          <span className="font-medium text-foreground">文件路径</span>
+                          <div className="mt-0.5 font-mono break-all">{p.path}</div>
+                        </div>
+                      )}
+                      {p.loaded_at && (
+                        <div className="bg-background border border-border rounded-lg p-2.5">
+                          <span className="font-medium text-foreground">加载时间</span>
+                          <div className="mt-0.5">{p.loaded_at}</div>
+                        </div>
+                      )}
+                      {p.dependencies && Array.isArray(p.dependencies) && p.dependencies.length > 0 && (
+                        <div className="bg-background border border-border rounded-lg p-2.5">
+                          <span className="font-medium text-foreground">依赖</span>
+                          <div className="mt-0.5 font-mono">{p.dependencies.join(', ')}</div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Error */}
+                    {hasError && (
+                      <div className="bg-destructive/5 border border-destructive/20 rounded-lg p-3">
+                        <div className="text-xs font-semibold text-destructive flex items-center gap-1.5 mb-1">
+                          <AlertTriangle className="w-3.5 h-3.5" /> 加载错误
+                        </div>
+                        <pre className="text-xs text-destructive font-mono whitespace-pre-wrap break-words">
+                          {p.error}
+                        </pre>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             );
           })
@@ -398,8 +586,9 @@ export default function Plugins() {
         <div className="font-medium text-foreground mb-2">提示</div>
         <ul className="list-disc pl-5 space-y-1">
           <li>上传插件会写入后端的 <code className="bg-muted px-1 py-0.5 rounded">plugins/</code> 目录，并尝试立即加载。</li>
-          <li>你也可以把插件文件直接放到服务器的 <code className="bg-muted px-1 py-0.5 rounded">plugins/</code> 目录，然后点“重新扫描并加载”。</li>
+          <li>你也可以把插件文件直接放到服务器的 <code className="bg-muted px-1 py-0.5 rounded">plugins/</code> 目录，然后点"重新扫描并加载"。</li>
           <li>禁用=卸载（保留文件）；卸载=卸载并删除文件。</li>
+          <li>点击插件卡片可展开查看详细参数说明、配置示例和扩展点信息。</li>
         </ul>
       </section>
     </div>

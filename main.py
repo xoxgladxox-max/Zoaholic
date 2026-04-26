@@ -517,6 +517,14 @@ async def lifespan(app: FastAPI):
             default_timeout=DEFAULT_TIMEOUT,
         )
 
+    # 恢复运行时自动禁用的 Key（从持久化快照）
+    try:
+        from core.utils import restore_auto_disabled
+        restore_auto_disabled()
+        logger.info("Restored auto-disabled keys from snapshot")
+    except Exception as e:
+        logger.debug(f"Failed to restore auto-disabled keys: {e}")
+
     app.state.startup_completed = True
     yield
     # 关闭时的代码

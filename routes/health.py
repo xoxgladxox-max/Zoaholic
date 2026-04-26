@@ -114,6 +114,14 @@ def _build_health_payload(app, *, readiness: bool) -> tuple[dict[str, Any], int]
         "probe": "readyz" if readiness else "healthz",
         "checks": checks,
     }
+
+    # ── 运行时指标（metrics）──
+    try:
+        from core.metrics import get_full_metrics_snapshot
+        payload["metrics"] = get_full_metrics_snapshot(state)
+    except Exception:
+        payload["metrics"] = {"available": False}
+
     return payload, status_code
 
 

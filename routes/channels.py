@@ -49,7 +49,8 @@ async def get_key_status(token: str = Depends(verify_admin_api_key)):
         for item in circular_list.items:
             # 只返回普通冷却中（非自动禁用）的 Key
             if item not in circular_list.auto_disabled_info and now < circular_list.cooling_until.get(item, 0):
-                remaining = int(circular_list.cooling_until[item] - now)
+                until = circular_list.cooling_until[item]
+                remaining = -1 if until == float('inf') else int(until - now)
                 cooling.append({"key": item, "remaining_seconds": remaining})
         if auto_disabled or cooling:
             result[provider_name] = {

@@ -509,6 +509,90 @@ def parse_rate_limit(limit_string):
 
     return limits
 
+
+# ==================== 运行时自动禁用 Key 持久化 ====================
+import os as _os
+import threading as _threading
+
+_RT_DISABLED_FILE = _os.path.join(
+    _os.getenv("DATA_DIR", "/home/data"), "runtime_disabled_keys.json"
+)
+_rt_save_lock = _threading.Lock()
+
+
+def _save_all_auto_disabled():
+    """将所有渠道的运行时自动禁用状态持久化到 JSON 文件。"""
+    try:
+        snapshot = {}
+        for pname, clist in provider_api_circular_list.items():
+            if clist.auto_disabled_info:
+                entries = {}
+                for k, info in clist.auto_disabled_info.items():
+                    cooling_val = clist.cooling_until.get(k, 0)
+                    entries[k] = {
+                        "cooling_until": None if cooling_val == float('inf') else cooling_val,
+                        "disabled_at": info.get("disabled_at", 0),
+                        "duration": info.get("duration", 0),
+                        "reason": info.get("reason", ""),
+                    }
+                snapshot[pname] = entries
+        with _rt_save_lock:
+            _os.makedirs(_os.path.dirname(_RT_DISABLED_FILE), exist_ok=True)
+            tmp = _RT_DISABLED_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False)
+            _os.replace(tmp, _RT_DISABLED_FILE)
+    except Exception as e:
+        logger.debug(f"[auto_disable_persist] save failed: {e}")
+
+
+def load_auto_disabled_snapshot() -> dict:
+    """从文件加载运行时自动禁用快照。返回 {provider_name: {key: {...}}}"""
+    try:
+        if _os.path.exists(_RT_DISABLED_FILE):
+            with open(_RT_DISABLED_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        logger.debug(f"[auto_disable_persist] load failed: {e}")
+    return {}
+
+
+def restore_auto_disabled():
+    """启动时从持久化文件恢复所有渠道的自动禁用状态。
+
+    应在 provider_api_circular_list 初始化完成后调用。
+    已过期的非永久禁用条目会被跳过。
+    """
+    snapshot = load_auto_disabled_snapshot()
+    if not snapshot:
+        return
+    now = time()
+    restored = 0
+    for pname, entries in snapshot.items():
+        clist = provider_api_circular_list.get(pname)
+        if not clist:
+            continue
+        for k, info in entries.items():
+            if k not in clist.items:
+                continue
+            cooling = info.get("cooling_until")
+            if cooling is None:
+                cooling = float('inf')  # 永久禁用
+            elif cooling <= now:
+                continue  # 已过期，跳过
+            clist.cooling_until[k] = cooling
+            clist.auto_disabled_info[k] = {
+                "disabled_at": info.get("disabled_at", 0),
+                "duration": info.get("duration", 0),
+                "reason": info.get("reason", ""),
+            }
+            restored += 1
+    if restored:
+        logger.info(f"[auto_disable_persist] Restored {restored} disabled key(s) from snapshot")
+
+
 class ThreadSafeCircularList:
     def __init__(self, items = [], rate_limit={"default": "999999/min"}, schedule_algorithm="round_robin", provider_name=None, disabled_keys=None):
         self.provider_name = provider_name
@@ -623,12 +707,14 @@ class ThreadSafeCircularList:
             f"[auto_disable] Key {item} disabled for provider {self.provider_name}, "
             f"duration={'permanent' if duration == 0 else f'{duration}s'}, reason: {reason}"
         )
+        _save_all_auto_disabled()
 
     async def clear_auto_disabled(self, item: str):
         """手动恢复一个被自动禁用的 Key，清除冷却和元数据。"""
         async with self.lock:
             self.cooling_until[item] = 0.0
             self.auto_disabled_info.pop(item, None)
+        _save_all_auto_disabled()
 
     async def get_auto_disabled_keys(self) -> list:
         """返回当前被自动禁用的 Key 列表及其剩余时间。
@@ -980,8 +1066,8 @@ async def generate_sse_response(
         delta_content = {"role": "assistant", "content": "", "reasoning_content": reasoning_content}
         if thought_signature:
             delta_content["thought_signature"] = thought_signature
-    # 优先级 7：普通文本内容
-    elif content:
+    # 优先级 7：普通文本内容（支持 string 或结构化 list）
+    elif content is not None and content != "":
         delta_content = {"role": "assistant", "content": content}
         if thought_signature:
             delta_content["thought_signature"] = thought_signature

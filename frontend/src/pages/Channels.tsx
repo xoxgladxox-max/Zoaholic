@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { useEffect, useMemo, useState, KeyboardEvent, ClipboardEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, KeyboardEvent, ClipboardEvent } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
 import {
@@ -32,6 +32,18 @@ interface HeaderEntry {
   value: string;
 }
 
+interface SubChannelFormData {
+  engine: string;
+  models: string[];
+  mappings: ModelMapping[];
+  preferences: Record<string, any>;
+  enabled?: boolean;
+  remark?: string;
+  base_url?: string;
+  model_prefix?: string;
+  _collapsed?: boolean;
+}
+
 interface ProviderFormData {
   provider: string;
   remark: string;
@@ -46,6 +58,7 @@ interface ProviderFormData {
   // 注意：preferences 允许包含任意插件的 per-provider 配置。
   // 因此这里用 Record<string, any>，避免为每个插件都在 Channels 页面硬编码字段。
   preferences: Record<string, any>;
+  sub_channels: SubChannelFormData[];
 }
 
 interface ChannelOption {
@@ -129,35 +142,101 @@ function formatCountdown(seconds: number) {
   return `${s}s`;
 }
 
-// ── 冷却中 Key 行组件 ──
-function CoolingKeyRow({ idx, keyObj, remainSec, focused, onFocus, onBlur, onRecover, onToggle, onTest, onDelete }: {
-  idx: number; keyObj: { key: string; disabled: boolean }; remainSec: number;
+// ── SVG 圆角矩形路径生成 ──
+function buildRoundRectPath(x: number, y: number, w: number, h: number, r: number) {
+  return [
+    `M ${x + r} ${y}`,
+    `L ${x + w - r} ${y}`,
+    `A ${r} ${r} 0 0 1 ${x + w} ${y + r}`,
+    `L ${x + w} ${y + h - r}`,
+    `A ${r} ${r} 0 0 1 ${x + w - r} ${y + h}`,
+    `L ${x + r} ${y + h}`,
+    `A ${r} ${r} 0 0 1 ${x} ${y + h - r}`,
+    `L ${x} ${y + r}`,
+    `A ${r} ${r} 0 0 1 ${x + r} ${y}`,
+    `Z`
+  ].join(' ');
+}
+
+// ── 冷却中 Key 行组件（SVG 边框进度） ──
+function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus, onBlur, onRecover, onToggle, onTest, onDelete }: {
+  idx: number; keyObj: { key: string; disabled: boolean }; remainSec: number; totalDuration: number;
   focused: boolean;
   onFocus: () => void; onBlur: () => void;
   onRecover: () => void; onToggle: () => void; onTest: () => void; onDelete: () => void;
 }) {
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const [svgViewBox, setSvgViewBox] = useState('');
+  const [pathD, setPathD] = useState('');
+
+  // 计算进度百分比
+  const progress = totalDuration > 0 ? Math.max(0, Math.min(100, (remainSec / totalDuration) * 100)) : 0;
+
+  // 初始化 & resize 时更新 SVG path
+  useEffect(() => {
+    const el = wrapperRef.current;
+    if (!el) return;
+    const update = () => {
+      const w = el.offsetWidth;
+      const h = el.offsetHeight;
+      setSvgViewBox(`0 0 ${w} ${h}`);
+      setPathD(buildRoundRectPath(1, 1, w - 2, h - 2, 7));
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // SVG stroke-dasharray / dashoffset
+  const dasharray = progress > 0 ? `${progress} 100` : '0 100';
+  const dashoffset = progress > 0 ? `${-(100 - progress)}` : '0';
+
   return (
-    <div className={`relative flex items-center gap-2 px-3 py-2 rounded-lg border overflow-hidden transition-colors ${focused ? 'border-blue-500 bg-muted/50' : 'border-red-900/60 bg-zinc-900'}`}>
-      <span className="text-xs text-muted-foreground w-4 text-right relative z-[2]">{idx + 1}</span>
-      <div className="flex-1 min-w-0 relative z-[2]" style={!focused ? { WebkitMaskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)', maskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)' } : undefined}>
-        <input
-          type="text" value={keyObj.key || ''} readOnly placeholder="sk-..."
-          onFocus={onFocus} onBlur={onBlur}
-          className={`w-full bg-transparent border-none text-sm font-mono outline-none ${focused ? 'text-foreground' : 'text-red-300 line-through decoration-red-500/40'}`}
-        />
-      </div>
-      {!focused && (
-        <>
-          <span className="flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded text-red-400 bg-red-500/10 relative z-[2]">
-            {formatCountdown(remainSec)}
-          </span>
-          <button onClick={onRecover} className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 cursor-pointer flex-shrink-0 relative z-[2]">恢复</button>
-        </>
+    <div ref={wrapperRef} className="relative rounded-lg" style={{ isolation: 'isolate' }}>
+      {/* SVG 边框进度 */}
+      {!focused && pathD && (
+        <svg
+          className="absolute inset-0 w-full h-full pointer-events-none z-[1]"
+          viewBox={svgViewBox}
+          style={{ overflow: 'visible' }}
+        >
+          <path
+            d={pathD}
+            pathLength={100}
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={2}
+            strokeLinecap="round"
+            className="text-red-500"
+            style={{ strokeDasharray: dasharray, strokeDashoffset: dashoffset, transition: 'stroke-dasharray 1s linear, stroke-dashoffset 1s linear' }}
+          />
+        </svg>
       )}
-      <div className="actions flex items-center gap-1 flex-shrink-0 relative z-[2]">
-        <button onClick={onToggle} className="text-muted-foreground" title="禁用"><ToggleRight className="w-5 h-5" /></button>
-        <button onClick={onTest} disabled={!keyObj.key.trim()} className="text-blue-600 dark:text-blue-400 disabled:opacity-50"><Play className="w-4 h-4" /></button>
-        <button onClick={onDelete} className="text-red-500 hover:text-red-400 ml-1"><Trash2 className="w-4 h-4" /></button>
+      {/* 内容 */}
+      <div className={`relative flex items-center gap-2 px-3 py-2 rounded-lg border-2 transition-colors ${focused ? 'border-blue-500 bg-muted/50' : 'border-border bg-background dark:bg-card'}`}>
+        <span className="text-xs text-muted-foreground w-4 text-right relative z-[2]">{idx + 1}</span>
+        <div className="flex-1 min-w-0 relative z-[2]">
+          <input
+            type="text" value={keyObj.key || ''} readOnly placeholder="sk-..."
+            onFocus={onFocus} onBlur={onBlur}
+            className={`w-full bg-transparent border-none text-sm font-mono outline-none ${focused ? 'text-foreground' : 'text-red-400 dark:text-red-300 line-through decoration-red-500/40'}`}
+          />
+          {/* 倒计时叠加 */}
+          {!focused && (
+            <span className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-[11px] font-semibold font-mono text-red-500 bg-background/85 dark:bg-card/85 rounded px-2 py-0.5 pointer-events-none z-[3]">
+              {formatCountdown(remainSec)}
+            </span>
+          )}
+        </div>
+        {!focused && (
+          <button onClick={onRecover} className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 cursor-pointer flex-shrink-0 relative z-[2]">恢复</button>
+        )}
+        <div className="actions flex items-center gap-1 flex-shrink-0 relative z-[2]">
+          <button onClick={onToggle} className="text-muted-foreground" title="禁用"><ToggleRight className="w-5 h-5" /></button>
+          <button onClick={onTest} disabled={!keyObj.key.trim()} className="text-blue-600 dark:text-blue-400 disabled:opacity-50"><Play className="w-4 h-4" /></button>
+          <button onClick={onDelete} className="text-red-500 hover:text-red-400 ml-1"><Trash2 className="w-4 h-4" /></button>
+        </div>
       </div>
     </div>
   );
@@ -173,6 +252,9 @@ export default function Channels() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [originalIndex, setOriginalIndex] = useState<number | null>(null);
   const [formData, setFormData] = useState<ProviderFormData | null>(null);
+
+  // 子渠道编辑模式：parentIdx = 主渠道在 providers 里的 index，subIdx = sub_channels 里的 index
+  const [editingSubChannel, setEditingSubChannel] = useState<{ parentIdx: number; subIdx: number } | null>(null);
 
   const [groupInput, setGroupInput] = useState('');
   const [modelInput, setModelInput] = useState('');
@@ -319,6 +401,15 @@ export default function Channels() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // ── 定期轮询 Key 禁用状态（每 15 秒），确保页面打开期间能及时反映后端变化 ──
+  useEffect(() => {
+    const pollTimer = setInterval(() => {
+      refreshKeyStatus();
+    }, 15000);
+    return () => clearInterval(pollTimer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // ── 打开编辑面板时自动查询余额 ──
   useEffect(() => {
     if (isModalOpen && formData?.preferences?.balance && formData.base_url && formData.api_keys.some(k => k.key.trim() && !k.disabled)) {
@@ -388,6 +479,33 @@ export default function Channels() {
         ? provider.preferences
         : {};
 
+      // 解析子渠道
+      const rawSubChannels = Array.isArray(provider.sub_channels) ? provider.sub_channels : [];
+      const subChannels: SubChannelFormData[] = rawSubChannels.map((sub: any) => {
+        const subRawModels = Array.isArray(sub.model) ? sub.model : Array.isArray(sub.models) ? sub.models : [];
+        const subModels: string[] = [];
+        const subMappings: ModelMapping[] = [];
+        subRawModels.forEach((m: any) => {
+          if (typeof m === 'string') subModels.push(m);
+          else if (typeof m === 'object' && m !== null) {
+            Object.entries(m).forEach(([upstream, alias]) => {
+              subMappings.push({ from: alias as string, to: upstream });
+            });
+          }
+        });
+        return {
+          engine: sub.engine || '',
+          models: subModels,
+          mappings: subMappings,
+          preferences: sub.preferences && typeof sub.preferences === 'object' ? sub.preferences : {},
+          enabled: sub.enabled,
+          remark: sub.remark || '',
+          base_url: sub.base_url || '',
+          model_prefix: sub.model_prefix || '',
+          _collapsed: true,
+        };
+      });
+
       setFormData({
         provider: provider.provider || provider.name || '',
         remark: provider.remark || '',
@@ -409,6 +527,7 @@ export default function Channels() {
           system_prompt: basePreferences.system_prompt || '',
           enabled_plugins: Array.isArray(basePreferences.enabled_plugins) ? basePreferences.enabled_plugins : [],
         },
+        sub_channels: subChannels,
       });
     } else {
       setHeaderEntries([]);
@@ -425,7 +544,8 @@ export default function Channels() {
         groups: ['default'],
         models: [],
         mappings: [],
-        preferences: { weight: 10, cooldown_period: 3, api_key_schedule_algorithm: 'round_robin', tools: true, enabled_plugins: [] }
+        preferences: { weight: 10, api_key_schedule_algorithm: 'round_robin', tools: true, enabled_plugins: [], key_rules: [{ match: { status: [401, 403] }, duration: -1 }, { match: 'default', duration: 3 }] },
+        sub_channels: [],
       });
     }
     setIsModalOpen(true);
@@ -757,6 +877,85 @@ export default function Channels() {
     alert('已复制渠道配置，请修改后保存');
   };
 
+  // ── 子渠道操作 ──
+  const handleToggleSubChannel = async (parentIdx: number, subIdx: number) => {
+    const parent = providers[parentIdx];
+    const subs = [...(parent.sub_channels || [])];
+    subs[subIdx] = { ...subs[subIdx], enabled: subs[subIdx].enabled === false ? true : false };
+    const newProviders = [...providers];
+    newProviders[parentIdx] = { ...parent, sub_channels: subs };
+    try {
+      const res = await apiFetch('/v1/api_config/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ providers: newProviders }),
+      });
+      if (res.ok) setProviders(newProviders);
+      else alert('操作失败');
+    } catch { alert('网络错误'); }
+  };
+
+  const handleDeleteSubChannel = async (parentIdx: number, subIdx: number) => {
+    const parent = providers[parentIdx];
+    const sub = (parent.sub_channels || [])[subIdx];
+    const name = sub?.engine || `子渠道 ${subIdx + 1}`;
+    if (!confirm(`确定要删除子渠道 "${name}" 吗？`)) return;
+    const subs = (parent.sub_channels || []).filter((_: any, i: number) => i !== subIdx);
+    const newProviders = [...providers];
+    newProviders[parentIdx] = { ...parent, sub_channels: subs.length > 0 ? subs : undefined };
+    try {
+      const res = await apiFetch('/v1/api_config/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ providers: newProviders }),
+      });
+      if (res.ok) { setProviders(newProviders); }
+      else alert('删除失败');
+    } catch { alert('网络错误'); }
+  };
+
+  const openSubChannelEdit = (parentIdx: number, subIdx: number) => {
+    const parent = providers[parentIdx];
+    const sub = (parent.sub_channels || [])[subIdx];
+    if (!sub) return;
+    // 构造一个虚拟 provider 给 openModal，合并主渠道的 key 等
+    setEditingSubChannel({ parentIdx, subIdx });
+    openModal({
+      provider: `${parent.provider}:${sub.engine || 'sub'}`,
+      engine: sub.engine || '',
+      base_url: sub.base_url || parent.base_url || '',
+      api: parent.api,
+      model: sub.model || sub.models || [],
+      model_prefix: sub.model_prefix || parent.model_prefix || '',
+      enabled: sub.enabled !== false,
+      remark: sub.remark || '',
+      groups: parent.groups || ['default'],
+      preferences: {
+        ...(parent.preferences || {}),
+        ...(sub.preferences || {}),
+      },
+      sub_channels: [], // 子渠道不能再分子渠道
+    }, null);
+  };
+
+  // 构建子渠道的虚拟 provider 对象（用于测试等场景）
+  const buildSubChannelProvider = (parentIdx: number, subIdx: number): any | null => {
+    const parent = providers[parentIdx];
+    const sub = (parent.sub_channels || [])[subIdx];
+    if (!sub) return null;
+    return {
+      provider: `${parent.provider}:${sub.engine || 'sub'}`,
+      engine: sub.engine || '',
+      base_url: sub.base_url || parent.base_url || '',
+      api: parent.api,
+      model: sub.model || sub.models || [],
+      model_prefix: sub.model_prefix || parent.model_prefix || '',
+      enabled: sub.enabled !== false,
+      groups: parent.groups || ['default'],
+      preferences: { ...(parent.preferences || {}), ...(sub.preferences || {}) },
+    };
+  };
+
   // 排序函数
   const sortByWeight = (list: any[]) => {
     return [...list].sort((a, b) => {
@@ -842,6 +1041,12 @@ export default function Channels() {
         post_body_parameter_overrides: overridesObj,
         status_code_overrides: statusCodeOverridesObj,
       },
+      sub_channels: formData.sub_channels
+        .filter(sub => sub.engine)
+        .map(sub => ({
+          engine: sub.engine,
+          model: sub.models.length > 0 ? sub.models : undefined,
+        })) || undefined,
     };
   };
 
@@ -934,6 +1139,26 @@ export default function Channels() {
       cleanedModelPrice = validEntries.length > 0 ? Object.fromEntries(validEntries) : undefined;
     }
 
+    // 序列化子渠道
+    const serializedSubChannels = formData.sub_channels
+      .filter(sub => sub.engine) // 过滤掉空的
+      .map(sub => {
+        const subModels: any[] = [...sub.models];
+        sub.mappings.forEach(m => {
+          if (m.from && m.to) subModels.push({ [m.to]: m.from });
+        });
+        const subObj: any = {
+          engine: sub.engine,
+          model: subModels.length > 0 ? subModels : undefined,
+        };
+        if (sub.base_url) subObj.base_url = sub.base_url;
+        if (sub.model_prefix) subObj.model_prefix = sub.model_prefix;
+        if (sub.remark) subObj.remark = sub.remark;
+        if (sub.enabled === false) subObj.enabled = false;
+        if (Object.keys(sub.preferences).length > 0) subObj.preferences = sub.preferences;
+        return subObj;
+      });
+
     const targetProvider: any = {
       provider: formData.provider,
       remark: formData.remark || undefined,
@@ -951,11 +1176,52 @@ export default function Channels() {
         post_body_parameter_overrides: overridesObj,
         status_code_overrides: statusCodeOverridesObj,
       },
+      sub_channels: serializedSubChannels.length > 0 ? serializedSubChannels : undefined,
     };
 
-    const newProviders = [...providers];
-    if (originalIndex !== null) newProviders[originalIndex] = targetProvider;
-    else newProviders.push(targetProvider);
+    let newProviders: any[];
+
+    if (editingSubChannel) {
+      // 子渠道模式：保存回 parent.sub_channels
+      const { parentIdx, subIdx } = editingSubChannel;
+      const parent = providers[parentIdx];
+      const parentPrefs = parent.preferences || {};
+
+      // 计算子渠道 diff preferences（只保存和主渠道不同的部分）
+      const subPrefs: Record<string, any> = {};
+      const mergedPrefs = {
+        ...formData.preferences,
+        model_price: cleanedModelPrice,
+        headers: headersObj,
+        post_body_parameter_overrides: overridesObj,
+        status_code_overrides: statusCodeOverridesObj,
+      };
+      for (const [k, v] of Object.entries(mergedPrefs)) {
+        if (JSON.stringify(v) !== JSON.stringify(parentPrefs[k])) {
+          subPrefs[k] = v;
+        }
+      }
+
+      const subObj: any = {
+        engine: formData.engine,
+        model: finalModels.length > 0 ? finalModels : undefined,
+        enabled: formData.enabled,
+      };
+      if (formData.base_url && formData.base_url !== (parent.base_url || '')) subObj.base_url = formData.base_url;
+      if (formData.model_prefix && formData.model_prefix !== (parent.model_prefix || '')) subObj.model_prefix = formData.model_prefix;
+      if (formData.remark) subObj.remark = formData.remark;
+      if (Object.keys(subPrefs).length > 0) subObj.preferences = subPrefs;
+
+      const subs = [...(parent.sub_channels || [])];
+      subs[subIdx] = subObj;
+      newProviders = [...providers];
+      newProviders[parentIdx] = { ...parent, sub_channels: subs };
+    } else {
+      // 主渠道模式
+      newProviders = [...providers];
+      if (originalIndex !== null) newProviders[originalIndex] = targetProvider;
+      else newProviders.push(targetProvider);
+    }
 
     try {
       const res = await apiFetch('/v1/api_config/update', {
@@ -965,9 +1231,9 @@ export default function Channels() {
       });
 
       if (res.ok) {
-        // 保存后重新排序
         setProviders(sortByWeight(newProviders));
         setIsModalOpen(false);
+        setEditingSubChannel(null);
       } else {
         alert("保存失败");
       }
@@ -1024,7 +1290,7 @@ export default function Channels() {
             />
           </div>
           <div className="flex items-center gap-0.5 flex-shrink-0">
-            <button onClick={() => { setAnalyticsProvider(p.provider); setAnalyticsOpen(true); }} className="p-1.5 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-500/10 rounded-md transition-colors" title="分析">
+            <button onClick={() => { setAnalyticsProvider(getProviderAnalyticsName(p)); setAnalyticsOpen(true); }} className="p-1.5 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-500/10 rounded-md transition-colors" title="分析">
               <BarChart3 className="w-4 h-4" />
             </button>
             <button onClick={() => openTestDialog(p)} className="p-1.5 text-blue-600 dark:text-blue-400 hover:bg-blue-500/10 rounded-md transition-colors" title="测试">
@@ -1044,6 +1310,43 @@ export default function Channels() {
             </button>
           </div>
         </div>
+
+        {/* 子渠道列表 */}
+        {(p.sub_channels || []).length > 0 && (
+          <div className="mt-3 pt-3 border-t border-border space-y-2">
+            <div className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider">子渠道</div>
+            {(p.sub_channels || []).map((sub: any, subIdx: number) => {
+              const subEnabled = sub.enabled !== false;
+              const subModels = Array.isArray(sub.model) ? sub.model : Array.isArray(sub.models) ? sub.models : [];
+              return (
+                <div key={subIdx} className={`flex items-center justify-between bg-muted/30 rounded-lg px-3 py-2 ${!subEnabled && 'opacity-50'}`}>
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="text-muted-foreground text-xs">└</span>
+                    <div className="min-w-0">
+                      <div className="text-xs font-medium text-foreground truncate">{sub.engine || '?'}</div>
+                      <div className="text-[10px] text-muted-foreground">{subModels.length} 模型</div>
+                    </div>
+                    {!subEnabled && <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/10 text-red-500 flex-shrink-0">禁用</span>}
+                  </div>
+                  <div className="flex items-center gap-0.5 flex-shrink-0">
+                    <button onClick={() => { const sp = buildSubChannelProvider(idx, subIdx); if (sp) openTestDialog(sp); }} className="p-1 text-blue-600 dark:text-blue-400 hover:bg-blue-500/10 rounded-md transition-colors" title="测试子渠道">
+                      <Play className="w-3.5 h-3.5" />
+                    </button>
+                    <button onClick={() => handleToggleSubChannel(idx, subIdx)} className={`p-1 rounded-md transition-colors ${subEnabled ? 'text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500/10' : 'text-muted-foreground hover:bg-muted'}`} title={subEnabled ? '禁用' : '启用'}>
+                      <Power className="w-3.5 h-3.5" />
+                    </button>
+                    <button onClick={() => openSubChannelEdit(idx, subIdx)} className="p-1 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md transition-colors" title="编辑子渠道">
+                      <Edit className="w-3.5 h-3.5" />
+                    </button>
+                    <button onClick={() => handleDeleteSubChannel(idx, subIdx)} className="p-1 text-red-600 dark:text-red-500 hover:bg-red-500/10 rounded-md transition-colors" title="删除子渠道">
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     );
   };
@@ -1087,6 +1390,17 @@ export default function Channels() {
     });
     return Array.from(set).sort();
   }, [providers]);
+
+  // ── 工具函数：拼接主渠道+子渠道名（逗号分隔，用于统计聚合） ──
+  const getProviderAnalyticsName = (p: any): string => {
+    const names = [p.provider];
+    const subs = p.sub_channels || [];
+    subs.forEach((sub: any, i: number) => {
+      const subEngine = sub.engine || '';
+      if (subEngine) names.push(`${p.provider}:${subEngine}`);
+    });
+    return names.join(',');
+  };
 
   // ── 筛选后的渠道列表（保留原始 index 用于操作） ──
   const filteredProviders = useMemo(() => {
@@ -1268,7 +1582,7 @@ export default function Channels() {
                 // 模型名匹配高亮
                 const matchedModels = getMatchedModels(p);
 
-                return (
+                return (<>
                   <tr key={idx} className={`transition-colors ${isEnabled ? 'hover:bg-muted/50' : 'bg-muted/30 opacity-60'}`}>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2">
@@ -1339,7 +1653,7 @@ export default function Channels() {
                     </td>
                     <td className="px-4 py-3 text-right">
                       <div className="flex items-center justify-end gap-1">
-                        <button onClick={() => { setAnalyticsProvider(p.provider); setAnalyticsOpen(true); }} className="p-1.5 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-500/10 rounded-md transition-colors" title="分析">
+                        <button onClick={() => { setAnalyticsProvider(getProviderAnalyticsName(p)); setAnalyticsOpen(true); }} className="p-1.5 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-500/10 rounded-md transition-colors" title="分析">
                           <BarChart3 className="w-4 h-4" />
                         </button>
                         <button onClick={() => openTestDialog(p)} className="p-1.5 text-blue-600 dark:text-blue-400 hover:bg-blue-500/10 rounded-md transition-colors" title="测试">
@@ -1360,6 +1674,60 @@ export default function Channels() {
                       </div>
                     </td>
                   </tr>
+                  {/* 子渠道二级行 */}
+                  {(p.sub_channels || []).map((sub: any, subIdx: number) => {
+                    const subEnabled = sub.enabled !== false;
+                    const subModels = Array.isArray(sub.model) ? sub.model : Array.isArray(sub.models) ? sub.models : [];
+                    const subModelCount = subModels.filter((m: any) => typeof m === 'string').length;
+                    const subPlugins = sub.preferences?.enabled_plugins || [];
+                    return (
+                      <tr key={`${idx}-sub-${subIdx}`} className={`transition-colors bg-muted/20 ${!subEnabled && 'opacity-50'}`}>
+                        <td className="px-4 py-2 pl-10" colSpan={1}>
+                          <div className="flex items-center gap-2">
+                            <span className="text-muted-foreground text-xs">└</span>
+                            <span className="text-xs font-medium text-foreground">{sub.engine || '?'}</span>
+                            <span className="text-[10px] text-muted-foreground">({subModelCount} 模型)</span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-2">
+                          <span className="text-xs text-muted-foreground font-mono">{sub.engine || '-'}</span>
+                        </td>
+                        <td className="px-4 py-2 text-center">
+                          <span className="text-xs text-muted-foreground">共享</span>
+                        </td>
+                        <td className="px-4 py-2">
+                          {subPlugins.length > 0 ? (
+                            <span className="bg-primary/10 text-primary px-1.5 py-0.5 rounded text-[10px]">{subPlugins.length}</span>
+                          ) : <span className="text-[10px] text-muted-foreground">继承</span>}
+                        </td>
+                        <td className="px-4 py-2 text-center">
+                          <span className={`inline-flex items-center justify-center w-5 h-5 rounded-full ${subEnabled ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-500' : 'bg-red-500/10 text-red-600 dark:text-red-500'}`}>
+                            {subEnabled ? <CheckCircle2 className="w-3.5 h-3.5" /> : <X className="w-3.5 h-3.5" />}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2 text-center">
+                          <span className="text-xs text-muted-foreground">{sub.preferences?.weight ?? '—'}</span>
+                        </td>
+                        <td className="px-4 py-2 text-right">
+                          <div className="flex items-center justify-end gap-1">
+                            <button onClick={() => { const sp = buildSubChannelProvider(idx, subIdx); if (sp) openTestDialog(sp); }} className="p-1 text-blue-600 dark:text-blue-400 hover:bg-blue-500/10 rounded-md transition-colors" title="测试子渠道">
+                              <Play className="w-3.5 h-3.5" />
+                            </button>
+                            <button onClick={() => handleToggleSubChannel(idx, subIdx)} className={`p-1 rounded-md transition-colors ${subEnabled ? 'text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500/10' : 'text-muted-foreground hover:bg-muted'}`} title={subEnabled ? '禁用' : '启用'}>
+                              <Power className="w-3.5 h-3.5" />
+                            </button>
+                            <button onClick={() => openSubChannelEdit(idx, subIdx)} className="p-1 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md transition-colors" title="编辑子渠道">
+                              <Edit className="w-3.5 h-3.5" />
+                            </button>
+                            <button onClick={() => handleDeleteSubChannel(idx, subIdx)} className="p-1 text-red-600 dark:text-red-500 hover:bg-red-500/10 rounded-md transition-colors" title="删除子渠道">
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </>
                 );
               })}
             </tbody>
@@ -1368,14 +1736,14 @@ export default function Channels() {
       </div>
 
       {/* Editor Side Sheet - Responsive */}
-      <Dialog.Root open={isModalOpen} onOpenChange={setIsModalOpen}>
+      <Dialog.Root open={isModalOpen} onOpenChange={(open) => { setIsModalOpen(open); if (!open) setEditingSubChannel(null); }}>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40 animate-in fade-in duration-200" />
           <Dialog.Content className="fixed right-0 top-0 h-full w-full sm:w-[560px] bg-background border-l border-border shadow-2xl z-50 flex flex-col animate-in slide-in-from-right duration-300">
             <div className="p-4 sm:p-5 border-b border-border flex justify-between items-center bg-muted/30 flex-shrink-0">
               <Dialog.Title className="text-lg sm:text-xl font-bold text-foreground flex items-center gap-2">
                 <Server className="w-5 h-5 text-primary" />
-                {originalIndex !== null ? `编辑: ${formData?.provider}` : '新增渠道'}
+                {editingSubChannel ? `编辑子渠道: ${formData?.engine || ''}` : originalIndex !== null ? `编辑: ${formData?.provider}` : '新增渠道'}
               </Dialog.Title>
               <Dialog.Close className="text-muted-foreground hover:text-foreground"><X className="w-5 h-5" /></Dialog.Close>
             </div>
@@ -1429,7 +1797,7 @@ export default function Channels() {
                         <Switch.Thumb className="block w-5 h-5 bg-white rounded-full shadow-md transition-transform translate-x-0.5 data-[state=checked]:translate-x-[22px]" />
                       </Switch.Root>
                     </div>
-                    <div>
+                    {!editingSubChannel && <div>
                       <label className="text-sm font-medium text-foreground mb-1.5 block">分组 (Groups)</label>
                       <div className="flex flex-wrap gap-2 mb-2 p-2 bg-muted/50 border border-border rounded-lg min-h-[40px]">
                         {formData.groups.map(g => (
@@ -1440,12 +1808,12 @@ export default function Channels() {
                         ))}
                       </div>
                       <input type="text" value={groupInput} onChange={e => setGroupInput(e.target.value)} onKeyDown={handleGroupInputKeyDown} placeholder="输入分组名并按回车..." className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm outline-none text-foreground" />
-                    </div>
+                    </div>}
                   </div>
                 </section>
 
-                {/* 2. API Keys */}
-                <section>
+                {/* 2. API Keys (子渠道模式隐藏) */}
+                {!editingSubChannel && <section>
                   <div className="flex items-center justify-between text-sm font-semibold text-foreground mb-2 border-b border-border pb-2">
                     <span className="flex items-center gap-2">
                       <Settings2 className="w-4 h-4 text-emerald-500" /> API Keys
@@ -1510,6 +1878,7 @@ export default function Channels() {
                             idx={idx}
                             keyObj={keyObj}
                             remainSec={remainSec}
+                            totalDuration={countdown?.duration ?? rtEntry?.duration ?? remainSec}
                             focused={isFocused}
                             onFocus={() => setFocusedKeyIdx(idx)}
                             onBlur={() => setFocusedKeyIdx(null)}
@@ -1549,7 +1918,7 @@ export default function Channels() {
                           {!isFocused && balLabel && balColor && (
                             <span className={`flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] ${TAG_CLASSES[balColor]}`}>{balLabel}</span>
                           )}
-                          {!isFocused && isPermanent && <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-700/50 text-zinc-400 flex-shrink-0 relative z-[2]">永久禁用</span>}
+                          {!isFocused && isPermanent && <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/15 text-red-500 dark:text-red-400 font-medium flex-shrink-0 relative z-[2]">永久禁用</span>}
                           {!isFocused && isPermanent && (
                             <button onClick={async () => { await apiFetch('/v1/channels/key_status/re_enable', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ provider: providerName, key: keyObj.key }) }); refreshKeyStatus(); }} className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 cursor-pointer flex-shrink-0 relative z-[2]">恢复</button>
                           )}
@@ -1565,7 +1934,7 @@ export default function Channels() {
                     })}
                     {formData.api_keys.length === 0 && <div className="text-center p-4 text-sm text-muted-foreground italic">暂无密钥</div>}
                   </div>
-                </section>
+                </section>}
 
                 {/* 3. 模型配置 */}
                 <section>
@@ -1634,108 +2003,496 @@ export default function Channels() {
                   </div>
                 </section>
 
-                {/* 5. 路由与限流 */}
-                <section>
+                {/* 4.5 子渠道 (子渠道模式隐藏) */}
+                {!editingSubChannel && <section>
+                  <div className="flex items-center justify-between text-sm font-semibold text-foreground mb-4 border-b border-border pb-2">
+                    <span className="flex items-center gap-2">
+                      <Server className="w-4 h-4 text-cyan-500" /> 子渠道
+                      {formData.sub_channels.length > 0 && (
+                        <span className="text-xs font-normal font-mono px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-600 dark:text-cyan-400">{formData.sub_channels.length}</span>
+                      )}
+                    </span>
+                    <button
+                      onClick={() => updateFormData('sub_channels', [...formData.sub_channels, { engine: '', models: [], mappings: [], preferences: {}, _collapsed: false }])}
+                      className="text-xs text-primary hover:text-primary/80 flex items-center gap-1"
+                    >
+                      <Plus className="w-3 h-3" /> 添加子渠道
+                    </button>
+                  </div>
+                  <p className="text-xs text-muted-foreground mb-3">子渠道继承主渠道的 API Key、Base URL 等配置，可单独指定引擎和模型。适用于同一 Key 支持多种 API 格式的场景。</p>
+                  <div className="space-y-3">
+                    {formData.sub_channels.length === 0 ? (
+                      <div className="text-sm text-muted-foreground italic p-4 text-center border border-dashed border-border rounded-lg">暂无子渠道</div>
+                    ) : (
+                      formData.sub_channels.map((sub, subIdx) => (
+                        <div key={subIdx} className="border border-border rounded-lg overflow-hidden">
+                          {/* 子渠道头部 */}
+                          <div
+                            className="flex items-center justify-between px-3 py-2 bg-muted/50 cursor-pointer hover:bg-muted/70 transition-colors"
+                            onClick={() => {
+                              const next = [...formData.sub_channels];
+                              next[subIdx] = { ...next[subIdx], _collapsed: !next[subIdx]._collapsed };
+                              updateFormData('sub_channels', next);
+                            }}
+                          >
+                            <div className="flex items-center gap-2 text-sm">
+                              <span className="text-muted-foreground">{sub._collapsed ? '▶' : '▼'}</span>
+                              <span className="font-medium text-foreground">{sub.engine || '未选择引擎'}</span>
+                              <span className="text-xs text-muted-foreground">({sub.models.length} 模型)</span>
+                              {sub.enabled === false && <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/10 text-red-500">已禁用</span>}
+                            </div>
+                            <div className="flex items-center gap-1">
+                              {originalIndex !== null && (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setIsModalOpen(false);
+                                    setTimeout(() => openSubChannelEdit(originalIndex, subIdx), 150);
+                                  }}
+                                  className="text-primary hover:text-primary/80 p-1"
+                                  title="完整编辑"
+                                >
+                                  <Edit className="w-4 h-4" />
+                                </button>
+                              )}
+                              <button
+                                onClick={(e) => { e.stopPropagation(); updateFormData('sub_channels', formData.sub_channels.filter((_, i) => i !== subIdx)); }}
+                                className="text-red-500 hover:text-red-400 p-1"
+                                title="删除子渠道"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* 子渠道展开内容 */}
+                          {!sub._collapsed && (
+                            <div className="p-3 space-y-3 border-t border-border">
+                              {/* 引擎选择 */}
+                              <div>
+                                <label className="text-xs font-medium text-foreground mb-1 block">引擎 (Engine)</label>
+                                <select
+                                  value={sub.engine}
+                                  onChange={e => {
+                                    const next = [...formData.sub_channels];
+                                    next[subIdx] = { ...next[subIdx], engine: e.target.value };
+                                    updateFormData('sub_channels', next);
+                                  }}
+                                  className="w-full bg-background border border-border px-3 py-1.5 rounded-lg text-xs text-foreground"
+                                >
+                                  <option value="">选择引擎</option>
+                                  {channelTypes.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}
+                                </select>
+                              </div>
+
+                              {/* 模型列表 */}
+                              <div>
+                                <div className="flex items-center justify-between mb-1">
+                                  <label className="text-xs font-medium text-foreground">模型列表 ({sub.models.length})</label>
+                                  <button
+                                    onClick={async () => {
+                                      const firstKey = formData.api_keys.find(k => k.key.trim() && !k.disabled);
+                                      const baseUrl = sub.base_url || formData.base_url;
+                                      if (!baseUrl || !firstKey) { alert('需要 Base URL 和至少一个启用的 API Key'); return; }
+                                      try {
+                                        const res = await apiFetch('/v1/channels/fetch_models', {
+                                          method: 'POST',
+                                          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                                          body: JSON.stringify({ engine: sub.engine, base_url: baseUrl, api_key: firstKey.key, preferences: sub.preferences }),
+                                        });
+                                        if (!res.ok) { const err = await res.json().catch(() => ({})); alert(`获取失败: ${err.detail || err.error || res.status}`); return; }
+                                        const data = (await res.json()) as any;
+                                        const rawModels: unknown[] = Array.isArray(data) ? data : Array.isArray(data?.models) ? data.models : Array.isArray(data?.data) ? data.data.map((m: any) => m?.id) : [];
+                                        const models = rawModels.map(m => String(m)).filter(Boolean);
+                                        if (models.length === 0) { alert('未获取到任何模型'); return; }
+                                        const next = [...formData.sub_channels];
+                                        next[subIdx] = { ...next[subIdx], models: Array.from(new Set([...sub.models, ...models])) };
+                                        updateFormData('sub_channels', next);
+                                      } catch (err: any) { alert(`获取失败: ${err?.message || '网络错误'}`); }
+                                    }}
+                                    disabled={!sub.engine}
+                                    className="text-[10px] bg-primary/10 text-primary px-1.5 py-0.5 rounded flex items-center gap-1 disabled:opacity-50"
+                                  >
+                                    <RefreshCw className="w-3 h-3" /> 获取
+                                  </button>
+                                </div>
+                                <div className="bg-muted/50 border border-border rounded-lg p-2">
+                                  <div className="flex flex-wrap gap-1.5 mb-2 max-h-[100px] overflow-y-auto">
+                                    {sub.models.map((model, mIdx) => (
+                                      <span key={mIdx} className="bg-background border border-border text-foreground text-xs font-mono px-1.5 py-0.5 rounded flex items-center gap-1">
+                                        {model}
+                                        <button onClick={() => {
+                                          const next = [...formData.sub_channels];
+                                          next[subIdx] = { ...next[subIdx], models: sub.models.filter((_, i) => i !== mIdx) };
+                                          updateFormData('sub_channels', next);
+                                        }} className="text-muted-foreground hover:text-red-500"><X className="w-3 h-3" /></button>
+                                      </span>
+                                    ))}
+                                  </div>
+                                  <input
+                                    type="text"
+                                    placeholder="输入模型名并按回车..."
+                                    className="w-full bg-transparent border-t border-border pt-1.5 px-1 text-xs font-mono outline-none text-foreground"
+                                    onKeyDown={(e: KeyboardEvent<HTMLInputElement>) => {
+                                      if (e.key === 'Enter') {
+                                        e.preventDefault();
+                                        const val = (e.target as HTMLInputElement).value.trim();
+                                        if (val && !sub.models.includes(val)) {
+                                          const next = [...formData.sub_channels];
+                                          next[subIdx] = { ...next[subIdx], models: [...sub.models, val] };
+                                          updateFormData('sub_channels', next);
+                                          (e.target as HTMLInputElement).value = '';
+                                        }
+                                      }
+                                    }}
+                                  />
+                                </div>
+                              </div>
+
+                              {/* 模型重定向 */}
+                              <div>
+                                <div className="flex items-center justify-between mb-1">
+                                  <label className="text-xs font-medium text-foreground">模型重定向</label>
+                                  <button onClick={() => {
+                                    const next = [...formData.sub_channels];
+                                    next[subIdx] = { ...next[subIdx], mappings: [...sub.mappings, { from: '', to: '' }] };
+                                    updateFormData('sub_channels', next);
+                                  }} className="text-[10px] border border-border text-foreground px-1.5 py-0.5 rounded">+ 映射</button>
+                                </div>
+                                {sub.mappings.length > 0 && (
+                                  <div className="space-y-1.5">
+                                    {sub.mappings.map((m, mIdx) => (
+                                      <div key={mIdx} className="flex items-center gap-1.5">
+                                        <input value={m.from} onChange={e => {
+                                          const next = [...formData.sub_channels];
+                                          const newMappings = [...sub.mappings];
+                                          newMappings[mIdx] = { ...newMappings[mIdx], from: e.target.value };
+                                          next[subIdx] = { ...next[subIdx], mappings: newMappings };
+                                          updateFormData('sub_channels', next);
+                                        }} placeholder="Alias" className="flex-1 bg-background border border-border px-2 py-1 rounded text-xs font-mono text-foreground" />
+                                        <ArrowRight className="w-3 h-3 text-muted-foreground flex-shrink-0" />
+                                        <input value={m.to} onChange={e => {
+                                          const next = [...formData.sub_channels];
+                                          const newMappings = [...sub.mappings];
+                                          newMappings[mIdx] = { ...newMappings[mIdx], to: e.target.value };
+                                          next[subIdx] = { ...next[subIdx], mappings: newMappings };
+                                          updateFormData('sub_channels', next);
+                                        }} placeholder="Upstream" className="flex-1 bg-background border border-border px-2 py-1 rounded text-xs font-mono text-foreground" />
+                                        <button onClick={() => {
+                                          const next = [...formData.sub_channels];
+                                          next[subIdx] = { ...next[subIdx], mappings: sub.mappings.filter((_, i) => i !== mIdx) };
+                                          updateFormData('sub_channels', next);
+                                        }} className="text-red-500 p-0.5"><X className="w-3 h-3" /></button>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+
+                              {/* 覆盖配置 */}
+                              <div className="grid grid-cols-2 gap-2">
+                                <div>
+                                  <label className="text-xs font-medium text-foreground mb-1 block">Base URL 覆盖</label>
+                                  <input
+                                    type="text" value={sub.base_url || ''}
+                                    onChange={e => {
+                                      const next = [...formData.sub_channels];
+                                      next[subIdx] = { ...next[subIdx], base_url: e.target.value };
+                                      updateFormData('sub_channels', next);
+                                    }}
+                                    placeholder={`留空继承: ${formData.base_url || '(未设置)'}`}
+                                    className="w-full bg-background border border-border px-2 py-1.5 rounded text-xs font-mono text-foreground"
+                                  />
+                                </div>
+                                <div>
+                                  <label className="text-xs font-medium text-foreground mb-1 block">模型前缀覆盖</label>
+                                  <input
+                                    type="text" value={sub.model_prefix || ''}
+                                    onChange={e => {
+                                      const next = [...formData.sub_channels];
+                                      next[subIdx] = { ...next[subIdx], model_prefix: e.target.value };
+                                      updateFormData('sub_channels', next);
+                                    }}
+                                    placeholder={`留空继承: ${formData.model_prefix || '(无)'}`}
+                                    className="w-full bg-background border border-border px-2 py-1.5 rounded text-xs font-mono text-foreground"
+                                  />
+                                </div>
+                              </div>
+
+                              {/* 插件配置 */}
+                              <div>
+                                <div className="flex items-center justify-between mb-1">
+                                  <label className="text-xs font-medium text-foreground flex items-center gap-1">
+                                    <Puzzle className="w-3 h-3 text-emerald-500" /> 插件
+                                    <span className="text-[10px] text-muted-foreground font-normal">(留空继承主渠道)</span>
+                                  </label>
+                                </div>
+                                <div className="bg-muted/50 border border-border rounded-lg p-2">
+                                  <div className="flex flex-wrap gap-1.5 mb-1.5">
+                                    {(sub.preferences.enabled_plugins as string[] || []).length === 0 ? (
+                                      <span className="text-[10px] text-muted-foreground italic">继承主渠道 ({(formData.preferences.enabled_plugins || []).length} 个插件)</span>
+                                    ) : (
+                                      (sub.preferences.enabled_plugins as string[]).map((p: string, pIdx: number) => (
+                                        <span key={pIdx} className="bg-emerald-500/10 border border-emerald-500/20 text-emerald-600 dark:text-emerald-500 px-1.5 py-0.5 rounded text-[10px] font-mono flex items-center gap-1">
+                                          {p}
+                                          <button onClick={() => {
+                                            const next = [...formData.sub_channels];
+                                            const plugins = [...(sub.preferences.enabled_plugins || [])];
+                                            plugins.splice(pIdx, 1);
+                                            next[subIdx] = { ...next[subIdx], preferences: { ...sub.preferences, enabled_plugins: plugins.length > 0 ? plugins : undefined } };
+                                            updateFormData('sub_channels', next);
+                                          }} className="text-emerald-500 hover:text-red-500"><X className="w-2.5 h-2.5" /></button>
+                                        </span>
+                                      ))
+                                    )}
+                                  </div>
+                                  <input
+                                    type="text"
+                                    placeholder="输入插件名按回车 (如 oai_tools)"
+                                    className="w-full bg-transparent border-t border-border pt-1 px-1 text-[10px] font-mono outline-none text-foreground"
+                                    onKeyDown={(e: KeyboardEvent<HTMLInputElement>) => {
+                                      if (e.key === 'Enter') {
+                                        e.preventDefault();
+                                        const val = (e.target as HTMLInputElement).value.trim();
+                                        if (val) {
+                                          const next = [...formData.sub_channels];
+                                          const plugins = [...(sub.preferences.enabled_plugins || []), val];
+                                          next[subIdx] = { ...next[subIdx], preferences: { ...sub.preferences, enabled_plugins: plugins } };
+                                          updateFormData('sub_channels', next);
+                                          (e.target as HTMLInputElement).value = '';
+                                        }
+                                      }
+                                    }}
+                                  />
+                                </div>
+                              </div>
+
+                              {/* 请求体覆写 & 权重 */}
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                <div>
+                                  <label className="text-xs font-medium text-foreground mb-1 block">请求体覆写 (JSON)</label>
+                                  <textarea
+                                    value={sub.preferences.post_body_parameter_overrides ? JSON.stringify(sub.preferences.post_body_parameter_overrides, null, 2) : ''}
+                                    onChange={e => {
+                                      const next = [...formData.sub_channels];
+                                      let val: any = undefined;
+                                      try { if (e.target.value.trim()) val = JSON.parse(e.target.value); } catch { val = e.target.value; }
+                                      next[subIdx] = { ...next[subIdx], preferences: { ...sub.preferences, post_body_parameter_overrides: val || undefined } };
+                                      updateFormData('sub_channels', next);
+                                    }}
+                                    rows={2}
+                                    placeholder={`留空继承主渠道`}
+                                    className="w-full bg-background border border-border px-2 py-1.5 rounded text-[10px] font-mono text-foreground outline-none"
+                                  />
+                                </div>
+                                <div>
+                                  <label className="text-xs font-medium text-foreground mb-1 block">权重</label>
+                                  <input
+                                    type="number"
+                                    value={sub.preferences.weight ?? ''}
+                                    onChange={e => {
+                                      const next = [...formData.sub_channels];
+                                      next[subIdx] = { ...next[subIdx], preferences: { ...sub.preferences, weight: e.target.value ? Number(e.target.value) : undefined } };
+                                      updateFormData('sub_channels', next);
+                                    }}
+                                    placeholder={`继承: ${formData.preferences.weight ?? 10}`}
+                                    className="w-full bg-background border border-border px-2 py-1.5 rounded text-xs font-mono text-foreground"
+                                  />
+                                </div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </section>}
+
+                {/* 5. 路由与限流 (子渠道模式隐藏) */}
+                {!editingSubChannel && <section>
                   <div className="flex items-center gap-2 text-sm font-semibold text-foreground mb-4 border-b border-border pb-2">
                     <Network className="w-4 h-4 text-yellow-500" /> 路由与限流
                   </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div>
-                      <label className="text-sm font-medium text-foreground mb-1.5 block">渠道权重 (Weight)</label>
-                      <input type="number" value={formData.preferences.weight || ''} onChange={e => updatePreference('weight', Number(e.target.value))} className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground" />
+                  <div className="space-y-4">
+                    {/* 权重 + 调度策略 并排 */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <label className="text-sm font-medium text-foreground mb-1.5 block">渠道权重 (Weight)</label>
+                        <input type="number" value={formData.preferences.weight || ''} onChange={e => updatePreference('weight', Number(e.target.value))} className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground" />
+                      </div>
+                      <div>
+                        <label className="text-sm font-medium text-foreground mb-1.5 block">Key 调度策略</label>
+                        <select value={formData.preferences.api_key_schedule_algorithm} onChange={e => updatePreference('api_key_schedule_algorithm', e.target.value)} className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground">
+                          {SCHEDULE_ALGORITHMS.map(a => <option key={a.value} value={a.value}>{a.label}</option>)}
+                        </select>
+                      </div>
                     </div>
-                    <div>
-                      <label className="text-sm font-medium text-foreground mb-1.5 block">错误冷却 (秒)</label>
-                      <input type="number" value={formData.preferences.cooldown_period || ''} onChange={e => updatePreference('cooldown_period', Number(e.target.value))} className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground" />
-                    </div>
-                    <div className="col-span-1 sm:col-span-2">
-                      <label className="text-sm font-medium text-foreground mb-1.5 block">Key 调度策略</label>
-                      <select value={formData.preferences.api_key_schedule_algorithm} onChange={e => updatePreference('api_key_schedule_algorithm', e.target.value)} className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground">
-                        {SCHEDULE_ALGORITHMS.map(a => <option key={a.value} value={a.value}>{a.label}</option>)}
-                      </select>
-                    </div>
-                    <div className="col-span-1 sm:col-span-2">
-                      <label className="text-sm font-medium text-foreground mb-1.5 block">错误码映射 (JSON)</label>
-                      <textarea
-                        value={statusCodeOverridesJson}
-                        onChange={e => setStatusCodeOverridesJson(e.target.value)}
-                        onBlur={() => formatJsonOnBlur(statusCodeOverridesJson, setStatusCodeOverridesJson, '错误码映射')}
-                        rows={2}
-                        placeholder='{"529": 429, "520": 502}'
-                        className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm font-mono focus:border-primary outline-none text-foreground"
-                      />
-                      <p className="text-xs text-muted-foreground mt-1">将上游非标准状态码映射为标准码以触发正确的重试策略。例如 529→429 使其按限流退避处理。</p>
-                    </div>
-                    {/* 自动禁用配置 */}
-                    <div className="col-span-1 sm:col-span-2 border-t border-border pt-4">
+
+                    {/* Key 错误处理规则 */}
+                    <div className="border-t border-border pt-4">
                       <div className="flex items-center justify-between mb-3">
                         <label className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                          <Power className="w-3.5 h-3.5 text-red-500" /> Key 自动禁用
+                          <Power className="w-3.5 h-3.5 text-red-500" /> Key 错误处理规则
                         </label>
-                        <Switch.Root
-                          checked={!!formData.preferences.auto_disable_key}
-                          onCheckedChange={val => {
-                            if (val) {
-                              updatePreference('auto_disable_key', { status_codes: [401, 403], keywords: [], duration: 0 });
-                            } else {
-                              // eslint-disable-next-line @typescript-eslint/no-unused-vars
-                              const { auto_disable_key: _, ...rest } = formData.preferences;
-                              updateFormData('preferences', rest);
-                            }
-                          }}
-                          className="w-9 h-5 bg-muted rounded-full relative data-[state=checked]:bg-red-500 transition-colors"
-                        >
-                          <Switch.Thumb className="block w-4 h-4 bg-white rounded-full shadow-md transition-transform translate-x-0.5 data-[state=checked]:translate-x-[18px]" />
-                        </Switch.Root>
-                      </div>
-                      <p className="text-xs text-muted-foreground mb-3">当 Key 请求返回指定错误码或响应包含指定关键词时，自动将其禁用一段时间或永久禁用。运行时状态不持久化，重启后重置。</p>
-                      {formData.preferences.auto_disable_key && (
-                        <div className="space-y-3 pl-1">
-                          <div>
-                            <label className="text-xs font-medium text-muted-foreground mb-1 block">触发状态码</label>
-                            <input
-                              type="text"
-                              value={(formData.preferences.auto_disable_key.status_codes || []).join(', ')}
-                              onChange={e => {
-                                const codes = e.target.value.split(/[,，\s]+/).map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-                                updatePreference('auto_disable_key', { ...formData.preferences.auto_disable_key, status_codes: codes });
-                              }}
-                              placeholder="401, 403"
-                              className="w-full bg-background border border-border px-3 py-1.5 rounded-lg text-xs font-mono focus:border-primary outline-none text-foreground"
-                            />
-                          </div>
-                          <div>
-                            <label className="text-xs font-medium text-muted-foreground mb-1 block">触发关键词（响应体包含，逗号分隔）</label>
-                            <input
-                              type="text"
-                              value={(formData.preferences.auto_disable_key.keywords || []).join(', ')}
-                              onChange={e => {
-                                const kws = e.target.value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
-                                updatePreference('auto_disable_key', { ...formData.preferences.auto_disable_key, keywords: kws });
-                              }}
-                              placeholder="insufficient_quota, billing"
-                              className="w-full bg-background border border-border px-3 py-1.5 rounded-lg text-xs font-mono focus:border-primary outline-none text-foreground"
-                            />
-                          </div>
-                          <div>
-                            <label className="text-xs font-medium text-muted-foreground mb-1 block">禁用时长（秒，0 = 永久）</label>
-                            <input
-                              type="number"
-                              value={formData.preferences.auto_disable_key.duration ?? 0}
-                              onChange={e => {
-                                updatePreference('auto_disable_key', { ...formData.preferences.auto_disable_key, duration: Math.max(0, parseInt(e.target.value) || 0) });
-                              }}
-                              min={0}
-                              placeholder="0"
-                              className="w-full bg-background border border-border px-3 py-1.5 rounded-lg text-xs font-mono focus:border-primary outline-none text-foreground"
-                            />
-                            <p className="text-xs text-muted-foreground mt-1">设为 0 表示永久禁用（需手动恢复）。设为正数则为冷却秒数，到期后自动恢复。</p>
-                          </div>
+                        <div className="flex gap-1.5">
+                          {[{ label: '标准', rules: [
+                            { match: { status: [429] }, duration: 30 },
+                            { match: { status: [401, 403] }, duration: -1 },
+                            { match: 'default', duration: 60 },
+                          ]}, { label: '激进', rules: [
+                            { match: { status: [429] }, duration: 10 },
+                            { match: { status: [401, 403, 500] }, duration: -1 },
+                            { match: 'default', duration: 30 },
+                          ]}, { label: '宽松', rules: [
+                            { match: { status: [429] }, duration: 60 },
+                            { match: { status: [401, 403] }, duration: -1 },
+                          ]}].map(tpl => (
+                            <button
+                              key={tpl.label}
+                              type="button"
+                              onClick={() => updatePreference('key_rules', tpl.rules)}
+                              className="text-[10px] font-medium px-2 py-1 rounded bg-muted hover:bg-muted/80 text-muted-foreground hover:text-foreground transition-colors"
+                            >
+                              {tpl.label}
+                            </button>
+                          ))}
                         </div>
-                      )}
+                      </div>
+                      <p className="text-xs text-muted-foreground mb-3">
+                        按顺序匹配，第一个命中的规则生效。duration: -1 = 永久禁用，0 = 仅映射不处理 Key，&gt;0 = 冷却秒数。
+                      </p>
+
+                      {/* 规则列表 */}
+                      <div className="space-y-2">
+                        {(formData.preferences.key_rules || []).map((rule: any, idx: number) => {
+                          const rules = formData.preferences.key_rules || [];
+                          const updateRule = (patch: any) => {
+                            const next = [...rules];
+                            next[idx] = { ...next[idx], ...patch };
+                            updatePreference('key_rules', next);
+                          };
+                          const removeRule = () => {
+                            updatePreference('key_rules', rules.filter((_: any, i: number) => i !== idx));
+                          };
+                          const matchType = rule.match === 'default' ? 'default' : rule.match?.status ? 'status' : rule.match?.keyword ? 'keyword' : 'status';
+                          const matchValue = matchType === 'status'
+                            ? (rule.match?.status || []).join(', ')
+                            : matchType === 'keyword'
+                            ? (Array.isArray(rule.match?.keyword) ? rule.match.keyword.join(', ') : rule.match?.keyword || '')
+                            : '';
+
+                          return (
+                            <div key={idx} className="flex items-center gap-2 bg-muted/30 border border-border rounded-lg px-3 py-2">
+                              {/* 匹配类型 */}
+                              <select
+                                value={matchType}
+                                onChange={e => {
+                                  const t = e.target.value;
+                                  if (t === 'default') updateRule({ match: 'default' });
+                                  else if (t === 'status') updateRule({ match: { status: [429] } });
+                                  else if (t === 'keyword') updateRule({ match: { keyword: [''] } });
+                                }}
+                                className="bg-background border border-border rounded px-2 py-1 text-xs text-foreground w-20 flex-shrink-0"
+                              >
+                                <option value="status">状态码</option>
+                                <option value="keyword">关键词</option>
+                                <option value="default">默认</option>
+                              </select>
+
+                              {/* 匹配值 */}
+                              {matchType !== 'default' && (
+                                <input
+                                  type="text"
+                                  value={matchValue}
+                                  onChange={e => {
+                                    const val = e.target.value;
+                                    if (matchType === 'status') {
+                                      const codes = val.split(/[,\s]+/).map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+                                      updateRule({ match: { status: codes } });
+                                    } else {
+                                      const kws = val.split(/[,]/).map(s => s.trim()).filter(Boolean);
+                                      updateRule({ match: { keyword: kws.length > 0 ? kws : [''] } });
+                                    }
+                                  }}
+                                  placeholder={matchType === 'status' ? '429, 500' : 'quota, billing'}
+                                  className="flex-1 min-w-0 bg-background border border-border rounded px-2 py-1 text-xs font-mono text-foreground"
+                                />
+                              )}
+                              {matchType === 'default' && <div className="flex-1 text-xs text-muted-foreground italic">兜底规则</div>}
+
+                              {/* 箭头 */}
+                              <span className="text-muted-foreground text-xs flex-shrink-0">→</span>
+
+                              {/* Duration */}
+                              <select
+                                value={rule.duration === -1 ? '-1' : rule.duration > 0 ? 'custom' : '0'}
+                                onChange={e => {
+                                  const v = e.target.value;
+                                  if (v === '-1') updateRule({ duration: -1 });
+                                  else if (v === '0') updateRule({ duration: 0 });
+                                  else updateRule({ duration: rule.duration > 0 ? rule.duration : 60 });
+                                }}
+                                className="bg-background border border-border rounded px-2 py-1 text-xs text-foreground w-24 flex-shrink-0"
+                              >
+                                <option value="-1">永久禁用</option>
+                                <option value="custom">冷却</option>
+                                <option value="0">仅映射</option>
+                              </select>
+
+                              {rule.duration > 0 && (
+                                <div className="flex items-center gap-1 flex-shrink-0">
+                                  <input
+                                    type="number"
+                                    value={rule.duration}
+                                    onChange={e => updateRule({ duration: Math.max(1, parseInt(e.target.value) || 1) })}
+                                    min={1}
+                                    className="w-16 bg-background border border-border rounded px-2 py-1 text-xs font-mono text-foreground"
+                                  />
+                                  <span className="text-xs text-muted-foreground">秒</span>
+                                </div>
+                              )}
+
+                              {/* Remap (可选) */}
+                              {matchType === 'status' && (
+                                <div className="flex items-center gap-1 flex-shrink-0">
+                                  <span className="text-[10px] text-muted-foreground">映射</span>
+                                  <input
+                                    type="number"
+                                    value={rule.remap || ''}
+                                    onChange={e => {
+                                      const v = parseInt(e.target.value);
+                                      if (!isNaN(v) && v >= 100 && v <= 599) updateRule({ remap: v });
+                                      else { const { remap: _, ...rest } = rules[idx]; const next = [...rules]; next[idx] = rest; updatePreference('key_rules', next); }
+                                    }}
+                                    placeholder="-"
+                                    className="w-14 bg-background border border-border rounded px-1.5 py-1 text-xs font-mono text-foreground"
+                                  />
+                                </div>
+                              )}
+
+                              {/* 删除 */}
+                              <button onClick={removeRule} className="text-red-500 hover:text-red-400 flex-shrink-0 p-0.5">
+                                <X className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      {/* 添加规则 */}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const rules = formData.preferences.key_rules || [];
+                          updatePreference('key_rules', [...rules, { match: { status: [429] }, duration: 30 }]);
+                        }}
+                        className="text-xs text-primary hover:text-primary/80 flex items-center gap-1 mt-2"
+                      >
+                        <Plus className="w-3 h-3" /> 添加规则
+                      </button>
                     </div>
                   </div>
-                </section>
+                </section>}
 
                 {/* 6. 高级设置 */}
                 <section>
@@ -2064,6 +2821,33 @@ export default function Channels() {
                 <CheckCircle2 className="w-4 h-4" /> 保存配置
               </button>
             </div>
+
+            {/* Plugin Tab Button — 编辑面板左边缘凸出 */}
+            {formData && !showPluginSheet && (
+              <button
+                onClick={() => setShowPluginSheet(true)}
+                className="absolute hidden sm:flex flex-col items-center gap-1.5 py-4 w-8 bg-muted border border-border border-r-0 rounded-l-lg cursor-pointer transition-all hover:bg-emerald-500/10 hover:w-9"
+                style={{ left: 0, top: '25%', transform: 'translate(-100%, -50%)', writingMode: 'vertical-rl', textOrientation: 'mixed' }}
+              >
+                <Puzzle className="w-4 h-4 text-emerald-500" style={{ writingMode: 'horizontal-tb' }} />
+                <span className="text-xs font-semibold text-emerald-500 tracking-wider">插件</span>
+                <span className="text-[10px] font-medium bg-emerald-500 text-white rounded-full px-1.5 min-w-[18px] text-center" style={{ writingMode: 'horizontal-tb' }}>
+                  {formData.preferences.enabled_plugins?.length || 0}
+                </span>
+              </button>
+            )}
+
+            {/* Plugin Sheet — 从左向右滑入覆盖编辑面板 */}
+            {formData && (
+              <InterceptorSheet
+                open={showPluginSheet}
+                onOpenChange={setShowPluginSheet}
+                allPlugins={allPlugins}
+                enabledPlugins={formData.preferences.enabled_plugins || []}
+                providerPreferences={formData.preferences || {}}
+                onUpdate={handlePluginSheetUpdate}
+              />
+            )}
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
@@ -2144,17 +2928,6 @@ export default function Channels() {
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
-
-      {formData && (
-        <InterceptorSheet
-          open={showPluginSheet}
-          onOpenChange={setShowPluginSheet}
-          allPlugins={allPlugins}
-          enabledPlugins={formData.preferences.enabled_plugins || []}
-          providerPreferences={formData.preferences || {}}
-          onUpdate={handlePluginSheetUpdate}
-        />
-      )}
 
       {formData && (
         <ApiKeyTestDialog

@@ -22,6 +22,7 @@ from ..utils import (
     get_model_dict,
     get_base64_image,
     generate_sse_response,
+    generate_chunked_image_md,
     end_of_line,
 )
 from ..response import check_response
@@ -207,7 +208,13 @@ async def patch_passthrough_responses_payload(
         if final_inst:
             payload["instructions"] = final_inst
 
-    # 3) 清理 Responses API 常见不支持字段（透传也做兜底，避免上游严格校验报错）
+    # 3) max_tokens / max_completion_tokens → max_output_tokens（Responses API 专用字段名）
+    for k in ("max_tokens", "max_completion_tokens"):
+        v = payload.pop(k, None)
+        if v is not None and "max_output_tokens" not in payload:
+            payload["max_output_tokens"] = v
+
+    # 4) 清理 Responses API 常见不支持字段（透传也做兜底，避免上游严格校验报错）
     for k in (
         "temperature", "top_p",
         "presence_penalty", "frequency_penalty",
@@ -216,7 +223,7 @@ async def patch_passthrough_responses_payload(
     ):
         payload.pop(k, None)
 
-    # 4) 兼容性：部分上游/网关要求 Responses API 显式设置 store=false，否则会报错
+    # 5) 兼容性：部分上游/网关要求 Responses API 显式设置 store=false，否则会报错
     payload["store"] = False
 
     return payload
@@ -486,6 +493,8 @@ async def get_responses_payload(request, engine, provider, api_key=None):
     payload.pop("logprobs", None)
     payload.pop("top_logprobs", None)
     payload.pop("stream_options", None)
+    payload.pop("max_tokens", None)
+    payload.pop("max_completion_tokens", None)
 
     # 覆盖配置
     # 兼容性：部分上游/网关要求 Responses API 显式设置 store=false，否则会报错
@@ -533,7 +542,8 @@ async def convert_responses_to_chat_completions(response: dict, model: str) -> d
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
 
-    content = ""
+    content_text = ""
+    content_images = []  # 收集图片 items
     reasoning_content = ""
     tool_calls = []
 
@@ -555,7 +565,7 @@ async def convert_responses_to_chat_completions(response: dict, model: str) -> d
             for c in item_content:
                 c_type = c.get("type", "")
                 if c_type == "output_text":
-                    content += c.get("text", "")
+                    content_text += c.get("text", "")
                 elif c_type == "tool_use":
                     tool_calls.append({
                         "id": c.get("id", f"call_{random_str[:24]}"),
@@ -565,6 +575,25 @@ async def convert_responses_to_chat_completions(response: dict, model: str) -> d
                             "arguments": c.get("arguments", "{}")
                         }
                     })
+
+        elif item_type == "image_generation_call":
+            # gpt-image-2 等模型的生图结果：结构化 image_url item
+            result = item.get("result", "")
+            if result and result.strip():
+                content_images.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{result}"}
+                })
+
+    # 构建 content：有图片时用结构化 list，纯文本时保持 string
+    if content_images:
+        content_items = []
+        if content_text:
+            content_items.append({"type": "text", "text": content_text})
+        content_items.extend(content_images)
+        content = content_items
+    else:
+        content = content_text
 
     # 构建 Chat Completions 响应
     message = {
@@ -710,14 +739,11 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                             yield sse_string
                             has_sent_content = True
 
-                    # output text done -> finish_reason
-                    # 只有当已发送内容时才发送 stop，避免空响应
+                    # output text done
+                    # 注意：不在此处发送 stop，统一由 response.completed 发送
+                    # 避免 text + image 混合响应时提前终止流（image 在 output_item.done 中处理）
                     elif event_type == "response.output_text.done":
-                        if has_sent_content:
-                            sse_string = await generate_sse_response(
-                                timestamp, model, stop="stop"
-                            )
-                            yield sse_string
+                        pass
 
                     # function call arguments delta
                     elif event_type == "response.function_call_arguments.delta":
@@ -738,6 +764,29 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                             timestamp, model, tools_id=call_id, function_call_name=name
                         )
                         yield sse_string
+
+                    # image generation call completed -> inline markdown image
+                    elif event_type == "response.output_item.done":
+                        item = data.get("item", {})
+                        if item.get("type") == "image_generation_call":
+                            result = item.get("result", "")
+                            if result and result.strip():
+                                if not has_sent_role:
+                                    sse_string = await generate_sse_response(timestamp, model, role="assistant")
+                                    yield sse_string
+                                    has_sent_role = True
+
+                                mark_content_start()
+                                # 发结构化 image content item，方言出口各自转换
+                                image_content_item = [{
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{result}"}
+                                }]
+                                sse_string = await generate_sse_response(
+                                    timestamp, model, content=image_content_item
+                                )
+                                yield sse_string
+                                has_sent_content = True
 
                     # response completed -> 提取 usage，同时确保发送 stop
                     elif event_type == "response.completed":

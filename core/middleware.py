@@ -26,6 +26,7 @@ from starlette.types import ASGIApp, Receive, Send, Scope, Message
 
 from core.log_config import logger
 from core.models import ModerationRequest, UnifiedRequest
+from core.metrics import on_request_start, on_request_end
 from core.stats import update_stats
 from core.utils import truncate_for_logging
 from core.error_response import openai_error_response
@@ -203,6 +204,10 @@ class StatsMiddleware:
         start_time = time()
         headers = scope.get("headers", [])
 
+        # ── 运行时指标：标记请求开始 ──
+        _metrics_model: Optional[str] = None
+        _metrics_tracked = False
+
         # 方言端点跳过中间件认证，但仍需初始化基础上下文
         token = None
         api_index = None
@@ -367,6 +372,11 @@ class StatsMiddleware:
                     model = request_model.model
                     current_info["model"] = model
 
+                    # ── 运行时指标：带模型名开始追踪 ──
+                    _metrics_model = model
+                    on_request_start(model=_metrics_model)
+                    _metrics_tracked = True
+
 
                     moderated_content = None
                     if request_model.request_type == "chat":
@@ -441,6 +451,14 @@ class StatsMiddleware:
             response = openai_error_response(f"Internal server error: {str(e)}", 500)
             await response(scope, receive_wrapper, send)
         finally:
+            # ── 运行时指标：标记请求结束 ──
+            if not _metrics_tracked:
+                # 未进入 UnifiedRequest 解析的请求也要追踪
+                on_request_start(model=None)
+                _metrics_tracked = True
+            is_success = response_started and 200 <= response_status < 500
+            on_request_end(model=_metrics_model, success=is_success)
+
             request_info.reset(current_request_info)
 
     async def _moderate_content(

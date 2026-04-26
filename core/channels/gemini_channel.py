@@ -30,6 +30,16 @@ from urllib.parse import urlparse
 
 
 # ============================================================
+# Gemini 工具函数
+# ============================================================
+
+def _is_image_model(model_name: str) -> bool:
+    """判断模型是否为图片生成模型（基于模型名约定）"""
+    name = model_name.lower()
+    return "-image" in name or "image-generation" in name
+
+
+# ============================================================
 # Gemini 格式化函数
 # ============================================================
 
@@ -268,7 +278,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
     if system_prompt.strip():
         systemInstruction = {"parts": [{"text": system_prompt}]}
 
-    if any(off_model in original_model for off_model in gemini_max_token_65k_models) or original_model.endswith("-image-generation"):
+    if any(off_model in original_model for off_model in gemini_max_token_65k_models) or _is_image_model(original_model):
         safety_settings = "OFF"
     else:
         safety_settings = "BLOCK_NONE"
@@ -413,7 +423,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
 
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
-            if field == "tools" and ("gemini-2.0-flash-thinking" in original_model or "gemini-2.5-flash-image" in original_model or "gemini-3-pro-image" in original_model):
+            if field == "tools" and ("gemini-2.0-flash-thinking" in original_model or _is_image_model(original_model)):
                 continue
             if field == "tools":
                 # 处理每个工具的 function 定义
@@ -457,9 +467,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
                         "tool_config": tool_config
                     })
             elif field == "temperature":
-                if "gemini-2.5-flash-image" in original_model:
-                    value = 1
-                if "gemini-3-pro-image" in original_model:
+                if _is_image_model(original_model):
                     value = 1
                 generation_config["temperature"] = value
             elif field == "max_tokens" or field == "max_completion_tokens":
@@ -486,7 +494,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
     if "maxOutputTokens" not in generation_config:
         payload["generationConfig"]["maxOutputTokens"] = 32768
 
-        if ("-image" in original_model):
+        if _is_image_model(original_model):
             payload["generationConfig"]["responseModalities"] = [
                 "Text",
                 "Image",
@@ -527,7 +535,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
             # 合并到 generationConfig 中（extra_body.google.thinking_config -> generationConfig.thinkingConfig）
             _deep_merge(payload["generationConfig"], converted_config)
 
-    if "gemini-2.5" in original_model and "gemini-2.5-flash-image" not in original_model:
+    if "gemini-2.5" in original_model and not _is_image_model(original_model):
         # 从请求模型名中检测思考预算设置
         m = re.match(r".*-think-(-?\d+)", request.model)
         if m:
@@ -759,7 +767,7 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
         has_function_call = function_call_name is not None
         has_image = image_base64 is not None
         
-        is_image_model = "-image" in model.lower() or "image-generation" in model.lower()
+        is_image_model = _is_image_model(model)
         
         # 图像模型必须有图片
         if is_image_model and not has_image:
@@ -786,16 +794,22 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
             role = "assistant"
 
         # 检查是否需要处理图像
-        # 无论是否是专门的绘图模型，只要 Gemini 返回了图片（比如普通大模型使用 Python 代码执行工具画了图表），
-        # 我们都统一将其转换为 Markdown 图片追加到文本内容中，确保在标准聊天客户端中可见，
-        # 并防止被 utils.py 错误地转换为只包含 b64_json 的图片生成 API 格式。
+        # 无论是否是专门的绘图模型，只要 Gemini 返回了图片，
+        # 都将其转换为结构化 content list，让方言出口层决定最终格式。
         if image_base64:
             try:
                 from ..log_config import logger
                 logger.info(f"[Gemini] Processing image for non-stream response, model={model}")
                 
-                # 非流式路径也不再走图床，统一直接返回 inline base64
-                content = (content or "") + f"\n\n![image](data:image/png;base64,{image_base64})"
+                # 构建结构化 content list
+                content_items = []
+                if content:
+                    content_items.append({"type": "text", "text": content})
+                content_items.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_base64}"}
+                })
+                content = content_items
                 image_base64 = None  # 清除，防止 generate_no_stream_response 返回图像 API 格式
 
             except Exception as e:
@@ -894,7 +908,7 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
                 yield sse_string
 
             if image_base64:
-                if "-image" not in model.lower() and "image-generation" not in model.lower():
+                if not _is_image_model(model):
                     pass # Ignored base64 from non-image model in streaming mode, usually duplicate or not supported by standard SSE
                 else:
                     image_size_mb = len(image_base64) * 3 / 4 / (1024 * 1024)
@@ -904,12 +918,17 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
                     mark_content_start()
                     yield ": streaming inline image\n\n"
 
-                    logger.debug("[Gemini] Returning inline base64 image via chunked stream")
-                    # 使用统一的 chunked helper 处理大图 MD 输出，避免构造巨大字符串并出让控制权
-                    async for sse_string in generate_chunked_image_md(
-                        image_base64, timestamp, model, thought_signature
-                    ):
-                        yield sse_string
+                    logger.debug("[Gemini] Returning inline base64 image via structured content item")
+                    # 直接发结构化 image content item，方言出口各自转换
+                    image_content_item = [{
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_base64}"}
+                    }]
+                    sse_string = await generate_sse_response(
+                        timestamp, model, content=image_content_item,
+                        thought_signature=thought_signature
+                    )
+                    yield sse_string
 
 
 
@@ -947,7 +966,7 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
 
         # 检查图像生成模型是否实际返回了图片
         # 对于 image 模型，如果只有思维链但没有图片，视为生成失败
-        is_image_model = "-image" in model.lower() or "image-generation" in model.lower()
+        is_image_model = _is_image_model(model)
         
         if is_image_model and not has_image:
             # 图像生成模型但没有生成图片
