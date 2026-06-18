@@ -1,7 +1,11 @@
+import gc
 import os
 import json
 import asyncio
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib  # Python < 3.11 fallback
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -16,6 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from core.log_config import logger
 from routes import api_router
+from routes.oauth import router as oauth_router
 from core.env import env_bool
 from core.log_config import apply_backend_log_preferences
 from core.watchdog import EventLoopBlockWatchdog as LightWatchdog
@@ -30,7 +35,7 @@ from core.handler import (
     set_debug_mode as set_handler_debug_mode,
 )
 from core.middleware import StatsMiddleware, request_info, get_api_key
-from core.error_response import openai_error_response
+from core.error_response import create_error_response, openai_error_response
 
 from utils import safe_get, load_config
 
@@ -43,6 +48,10 @@ from core.stats import (
 from core.plugins import get_plugin_manager
 
 DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 600))
+# 修改原因：SSE 流式响应在上游长时间思考/检索/排队时需要应用层心跳，不能依赖 TCP/Nginx keepalive。
+# 修改方式：为 keepalive_interval 提供可环境变量覆盖的合理默认值，配置文件仍可按全局/渠道/模型覆盖。
+# 目的：默认每 15 秒向下游发送 SSE 注释帧，避免客户端或中间代理因空闲无字节而断开。
+DEFAULT_KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", 15))
 # DEBUG 环境变量支持 true/false/1/0/yes/no
 is_debug = env_bool("DEBUG", False)
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
@@ -58,17 +67,20 @@ logger.info("VERSION: %s", VERSION)
 
 def init_preference(all_config, preference_key, default_timeout=DEFAULT_TIMEOUT):
     # 存储超时配置
-    preference_dict = {}
+    # 修改原因：旧逻辑在 preferences 为空或未声明某项偏好时，会让 global 默认值变成空 dict，
+    # 后续调用方若传入兜底值就可能覆盖启动期 default_timeout（keepalive 因此默认落到 99999 并被禁用）。
+    # 修改方式：先写入 default_timeout，再叠加配置文件中的全局/模型级覆盖。
+    # 目的：让 model_timeout、keepalive_interval 等偏好都稳定遵守启动期默认值，同时保留现有覆盖语义。
+    preference_dict = {"default": default_timeout}
     preferences = safe_get(all_config, "preferences", default={})
     providers = safe_get(all_config, "providers", default=[])
     if preferences:
         if isinstance(preferences.get(preference_key), int):
             preference_dict["default"] = preferences.get(preference_key)
         else:
-            for model_name, timeout_value in preferences.get(preference_key, {"default": default_timeout}).items():
+            preference_settings = preferences.get(preference_key, {}) or {}
+            for model_name, timeout_value in preference_settings.items():
                 preference_dict[model_name] = timeout_value
-            if "default" not in preferences.get(preference_key, {}):
-                preference_dict["default"] = default_timeout
 
     result = defaultdict(lambda: defaultdict(lambda: default_timeout))
     for provider in providers:
@@ -81,6 +93,156 @@ def init_preference(all_config, preference_key, default_timeout=DEFAULT_TIMEOUT)
     # print("result", json.dumps(result, indent=4))
 
     return result
+
+# ---- 数据库压缩闸门 ----
+_db_ready = asyncio.Event()
+_db_ready.set()  # 初始状态：放行
+_last_compact_date = None  # 每天最多压缩一次
+
+
+async def _maybe_compact_db(app):
+    """凌晨低峰期自动执行 VACUUM INTO 压缩数据库。"""
+    global _last_compact_date
+    import os
+
+    try:
+        prefs = {}
+        if hasattr(app, 'state') and hasattr(app.state, 'config'):
+            prefs = (app.state.config or {}).get('preferences', {})
+
+        tz_name = str(prefs.get('log_retention_timezone') or '').strip()
+        if tz_name:
+            try:
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo(tz_name)
+            except Exception:
+                tz = datetime.now().astimezone().tzinfo
+        else:
+            tz = datetime.now().astimezone().tzinfo
+        now_local = datetime.now(tz)
+        current_hour = now_local.hour
+        today = now_local.date()
+
+        # 每天最多跑一次
+        if _last_compact_date == today:
+            return
+
+        compact_start = int(prefs.get('db_compact_hour_start', 3))
+        compact_end = int(prefs.get('db_compact_hour_end', 5))
+        compact_threshold_mb = int(prefs.get('db_compact_threshold_mb', 1024))
+
+        # 时间窗口检查（支持跨午夜）
+        if compact_start <= compact_end:
+            in_window = compact_start <= current_hour < compact_end
+        else:
+            in_window = current_hour >= compact_start or current_hour < compact_end
+
+        if not in_window:
+            return
+
+        # 文件大小检查
+        db_path = os.path.join(os.environ.get('DATA_DIR', 'data'), 'stats.db')
+        if not os.path.exists(db_path):
+            return
+        db_size_mb = os.path.getsize(db_path) / (1024 * 1024)
+        if db_size_mb <= compact_threshold_mb:
+            return
+
+        compact_path = db_path + '.compact'
+        old_path = db_path + '.old'
+
+        logger.info(f'[db_compact] 触发压缩: {db_size_mb:.0f}MB > {compact_threshold_mb}MB, '
+                    f'时间 {now_local.strftime("%H:%M")} (窗口 {compact_start}:00-{compact_end}:00)')
+
+        # Step 1: 关闭闸门，挂起新请求
+        _db_ready.clear()
+        logger.info('[db_compact] 已挂起新请求')
+
+        # Step 2: 等待 stats buffer 消费完
+        try:
+            from core.stats import _stats_buffer
+            for _ in range(100):  # 最多等 10 秒
+                if len(_stats_buffer) == 0:
+                    break
+                await asyncio.sleep(0.1)
+        except ImportError:
+            pass
+
+        # Step 3: VACUUM INTO
+        import sqlite3
+        def do_vacuum_into():
+            if os.path.exists(compact_path):
+                os.remove(compact_path)
+            conn = sqlite3.connect(db_path)
+            conn.execute(f"VACUUM INTO '{compact_path}'")
+            conn.close()
+
+        await asyncio.to_thread(do_vacuum_into)
+        compact_size_mb = os.path.getsize(compact_path) / (1024 * 1024)
+        logger.info(f'[db_compact] VACUUM INTO 完成: {db_size_mb:.0f}MB -> {compact_size_mb:.0f}MB')
+
+        # Step 4: 关闭数据库连接
+        try:
+            from db import close_db
+            await close_db()
+        except ImportError:
+            pass
+
+        # Step 5: 替换文件
+        def do_replace():
+            for suffix in ['', '-wal', '-shm']:
+                src = db_path + suffix
+                dst = old_path + suffix
+                if os.path.exists(src):
+                    os.rename(src, dst)
+            os.rename(compact_path, db_path)
+
+        await asyncio.to_thread(do_replace)
+
+        # Step 6: 重新打开数据库连接
+        try:
+            from db import init_db
+            await init_db()
+        except ImportError:
+            pass
+
+        # Step 7: 清理旧文件
+        def do_cleanup_old():
+            for suffix in ['', '-wal', '-shm']:
+                f = old_path + suffix
+                if os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
+
+        await asyncio.to_thread(do_cleanup_old)
+
+        _last_compact_date = today
+        logger.info(f'[db_compact] 压缩完成，节省 {db_size_mb - compact_size_mb:.0f}MB')
+
+    except Exception as e:
+        logger.error(f'[db_compact] 压缩失败: {e}')
+        # 尝试恢复
+        try:
+            db_path = os.path.join(os.environ.get('DATA_DIR', 'data'), 'stats.db')
+            old_path = db_path + '.old'
+            compact_path = db_path + '.compact'
+            if os.path.exists(old_path) and not os.path.exists(db_path):
+                os.rename(old_path, db_path)
+                for suffix in ['-wal', '-shm']:
+                    if os.path.exists(old_path + suffix):
+                        os.rename(old_path + suffix, db_path + suffix)
+                logger.info('[db_compact] 已恢复旧数据库')
+            if os.path.exists(compact_path):
+                os.remove(compact_path)
+        except Exception as re:
+            logger.error(f'[db_compact] 恢复也失败了: {re}')
+    finally:
+        # 无论成功失败都打开闸门
+        _db_ready.set()
+        logger.info('[db_compact] 已恢复接受请求')
+
 
 async def cleanup_expired_raw_data():
     """
@@ -110,10 +272,13 @@ async def cleanup_expired_raw_data():
                 if (DB_TYPE or "sqlite").lower() == "d1":
                     result = await db.execute(
                         "UPDATE request_stats "
-                        "SET request_headers = NULL, request_body = NULL, upstream_request_headers = NULL, upstream_request_body = NULL, upstream_response_body = NULL, response_body = NULL, retry_path = NULL "
+                        # 修改原因：新增 upstream_response_headers 后，过期原始数据清理需要同步覆盖该列。
+                        # 修改方式：在 D1 清理 SQL 的 SET 和非空判断中加入 upstream_response_headers。
+                        # 目的：避免响应头超过保留期后仍留在 request_stats。
+                        "SET request_headers = NULL, request_body = NULL, upstream_request_headers = NULL, upstream_request_body = NULL, upstream_response_headers = NULL, upstream_response_body = NULL, response_body = NULL, retry_path = NULL "
                         "WHERE raw_data_expires_at IS NOT NULL "
                         "AND raw_data_expires_at < ? "
-                        "AND (request_headers IS NOT NULL OR request_body IS NOT NULL OR upstream_request_headers IS NOT NULL OR upstream_request_body IS NOT NULL OR upstream_response_body IS NOT NULL OR response_body IS NOT NULL OR retry_path IS NOT NULL)",
+                        "AND (request_headers IS NOT NULL OR request_body IS NOT NULL OR upstream_request_headers IS NOT NULL OR upstream_request_body IS NOT NULL OR upstream_response_headers IS NOT NULL OR upstream_response_body IS NOT NULL OR response_body IS NOT NULL OR retry_path IS NOT NULL)",
                         [now],
                     )
                     rowcount = int((result.get("meta") or {}).get("changes") or 0)
@@ -132,6 +297,10 @@ async def cleanup_expired_raw_data():
                         (RequestStat.request_body.isnot(None)) |
                         (RequestStat.upstream_request_headers.isnot(None)) |
                         (RequestStat.upstream_request_body.isnot(None)) |
+                        # 修改原因：SQLAlchemy 分支的过期清理条件也必须包含新增响应头字段。
+                        # 修改方式：在非空条件中追加 RequestStat.upstream_response_headers。
+                        # 目的：只有响应头未清理的旧记录也能被匹配并清空。
+                        (RequestStat.upstream_response_headers.isnot(None)) |
                         (RequestStat.upstream_response_body.isnot(None)) |
                         (RequestStat.response_body.isnot(None)) |
                         (RequestStat.retry_path.isnot(None))
@@ -141,6 +310,10 @@ async def cleanup_expired_raw_data():
                         request_body=None,
                         upstream_request_headers=None,
                         upstream_request_body=None,
+                        # 修改原因：清理动作匹配后需要实际清空新增响应头字段。
+                        # 修改方式：在 update().values 中把 upstream_response_headers 设为 None。
+                        # 目的：保证 SQLAlchemy 数据库类型与 D1 的清理结果一致。
+                        upstream_response_headers=None,
                         upstream_response_body=None,
                         response_body=None,
                         retry_path=None,
@@ -151,6 +324,32 @@ async def cleanup_expired_raw_data():
 
                 if result.rowcount > 0:
                     logger.info(f"Cleaned up expired raw data from {result.rowcount} log entries")
+                    # SQLite DELETE/UPDATE 不释放磁盘空间，需要回收 freelist。
+                    # auto_vacuum=INCREMENTAL 模式下用 incremental_vacuum 逐步回收，
+                    # 不需要独占锁，不阻塞 WAL checkpoint，不会导致 database locked。
+                    # full VACUUM 需要独占锁 + checkpoint WAL，2G+ 库会卡住十几秒并导致 WAL 膨胀。
+                    if (DB_TYPE or "sqlite").lower() == "sqlite":
+                        try:
+                            import aiosqlite
+                            db_path = None
+                            try:
+                                from db import DATABASE_URL
+                                if DATABASE_URL and DATABASE_URL.startswith("sqlite"):
+                                    db_path = DATABASE_URL.split("///")[-1]
+                            except Exception:
+                                pass
+                            if not db_path:
+                                db_path = "data/stats.db"
+                            async with aiosqlite.connect(db_path) as vacuum_conn:
+                                # 每次回收最多 2000 页（约 8MB），轻量不阻塞
+                                await vacuum_conn.execute("PRAGMA incremental_vacuum(2000)")
+                                logger.info("SQLite incremental_vacuum completed after raw data cleanup")
+                        except Exception as ve:
+                            logger.warning(f"SQLite incremental_vacuum failed (non-critical): {ve}")
+
+                # ---- 数据库自动压缩 (VACUUM INTO) ----
+                if (DB_TYPE or "sqlite").lower() == "sqlite":
+                    await _maybe_compact_db(app)
                     
         except asyncio.CancelledError:
             logger.info("Raw data cleanup task cancelled")
@@ -336,8 +535,34 @@ async def cleanup_expired_logs(app):
             next_sleep_seconds = 60
 
 
+def _register_oauth_providers_from_registry(oauth_manager) -> None:
+    """从渠道注册表统一注册 OAuth provider。"""
+    # 修改原因：OAuth provider 注册不能继续写在 main.py 的固定渠道清单里，否则内置渠道和插件渠道会走两套路径。
+    # 修改方式：遍历 registry 中所有 ChannelDefinition，发现 oauth_provider 后按 channel_id 注册到 OAuthManager。
+    # 目的：让 register_channel 成为 OAuth provider 声明的唯一入口，并支持插件在加载后自动加入 OAuthManager。
+    from core.channels.registry import get_all_channels
+
+    for channel_id, channel_def in get_all_channels().items():
+        oauth_provider = channel_def.oauth_provider
+        if oauth_provider is None:
+            continue
+        bind_oauth_manager = getattr(oauth_provider, "set_oauth_manager", None)
+        if callable(bind_oauth_manager):
+            # 修改原因：Codex 的被动额度采集仍需要共享 OAuthManager 执行 update_quota，旧硬编码入口移除后必须保留这个绑定点。
+            # 修改方式：provider 若声明 set_oauth_manager 钩子，就在通用扫描注册前注入当前 OAuthManager。
+            # 目的：保留渠道内部必要副作用，同时不把具体渠道名称重新写回 main.py。
+            bind_oauth_manager(oauth_manager)
+        oauth_manager.register_provider(channel_id, oauth_provider)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # gen2 GC 调优：降低触发频率但不完全禁用
+    # 默认 (700,10,10) 导致 gen2 频繁触发 stop-the-world 20~30s
+    # 改为 (700,50,50)：gen2 触发频率降 5 倍，减少卡顿但仍能回收循环引用
+    gc.set_threshold(700, 50, 50)
+    logger.info(f"[GC] Tuned thresholds={gc.get_threshold()}")
+
     # 启动时的代码
     # 设置各模块的调试模式
     set_routing_debug_mode(is_debug)
@@ -424,7 +649,7 @@ async def lifespan(app: FastAPI):
                     app.state.admin_api_key = [app.state.api_keys_db[0].get("api")]
 
         app.state.provider_timeouts = init_preference(app.state.config, "model_timeout", DEFAULT_TIMEOUT)
-        app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", 99999)
+        app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", DEFAULT_KEEPALIVE_INTERVAL)
         # 初始化 models_list（用于存储从其他 API Key 引用的模型列表）
         app.state.models_list = {}
         # pprint(dict(app.state.provider_timeouts))
@@ -460,6 +685,22 @@ async def lifespan(app: FastAPI):
         app.state.client_manager = ClientManager(pool_size=300, max_keepalive_connections=100)
         await app.state.client_manager.init(default_config)
 
+    if app and not hasattr(app.state, 'oauth_manager'):
+        # 修改原因：handler 解析 OAuth key_id 时需要访问共享的凭据管理器。
+        # 修改方式：在 lifespan 启动期创建 OAuthManager 并加载 data/oauth_state.json。
+        # 目的：让请求路径只做内存查找和必要刷新，不在每次请求重复读取文件。
+        from core.oauth.manager import OAuthManager
+        app.state.oauth_manager = OAuthManager()
+        # 修改原因：OAuthManager.init 会把旧扁平 oauth_state.json 按 api.yaml 中的 provider name 自动迁移。
+        # 修改方式：先注入 app.state.config getter，再执行 init，让迁移阶段能读取当前 providers 配置。
+        # 目的：启动迁移可以把旧凭据放入正确渠道，而不是全部落入 _unmapped。
+        app.state.oauth_manager.set_config_ref(lambda: app.state.config or {})
+        await app.state.oauth_manager.init()
+        # 修改原因：OAuth provider 注册已迁移到 ChannelDefinition.oauth_provider，main.py 不应再知道具体渠道模块。
+        # 修改方式：启动时扫描 registry 中所有声明了 oauth_provider 的渠道，并统一注册到 OAuthManager。
+        # 目的：消除 Codex、Claude Code、Gemini CLI 等渠道硬编码，让内置渠道和插件渠道共享注册路径。
+        _register_oauth_providers_from_registry(app.state.oauth_manager)
+
 
     if app and not hasattr(app.state, "channel_manager"):
         if app.state.config and 'preferences' in app.state.config:
@@ -486,6 +727,11 @@ async def lifespan(app: FastAPI):
             for group in load_result.values()
         )
         logger.info("Plugin system initialized: %d/%d plugins enabled", enabled, total)
+        if hasattr(app.state, "oauth_manager"):
+            # 修改原因：外置插件渠道通常在 plugin_manager.load_all() 时才调用 register_channel，早于此处的 OAuth 扫描看不到它们。
+            # 修改方式：插件加载完成后再次扫描 registry；重复注册内置 provider 只会覆盖为同一个声明实例。
+            # 目的：让插件 OAuth 渠道和内置 OAuth 渠道真正走同一条 registry 自动注册路径。
+            _register_oauth_providers_from_registry(app.state.oauth_manager)
     except Exception as e:
         logger.error("Failed to initialize plugin system: %s", e)
 
@@ -525,9 +771,98 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.debug(f"Failed to restore auto-disabled keys: {e}")
 
+    # 启动一次性初始化 + 统一每日维护循环
+    try:
+        from core.default_prices import fetch_prices
+        await fetch_prices()
+    except Exception as e:
+        logger.debug(f"Failed to fetch default prices: {e}")
+    try:
+        from routes.stats import warm_provider_activity
+        asyncio.get_running_loop().create_task(warm_provider_activity())
+    except Exception as e:
+        logger.debug(f"Failed to schedule provider activity warm: {e}")
+
+    async def daily_maintenance():
+        """统一每日维护：价格库刷新 + 活跃度刷新"""
+        while True:
+            await asyncio.sleep(86400)
+            try:
+                from core.default_prices import fetch_prices
+                await fetch_prices(force=True)
+                logger.info("[daily_maintenance] Prices refreshed")
+            except Exception as e:
+                logger.warning(f"[daily_maintenance] Price refresh failed: {e}")
+            try:
+                from routes.stats import warm_provider_activity
+                await warm_provider_activity()
+                logger.info("[daily_maintenance] Provider activity refreshed")
+            except Exception as e:
+                logger.warning(f"[daily_maintenance] Activity refresh failed: {e}")
+
+    asyncio.get_running_loop().create_task(daily_maintenance())
+
+    # 定期 malloc_trim：强制 glibc 归还 free 了但没还给 OS 的内存
+    # Python 大字符串（请求/响应体）释放后 pymalloc 标记为可用但 RSS 不降，
+    # malloc_trim(0) 让 glibc 把空闲页还给 OS，降低 RSS
+    try:
+        import ctypes
+        _libc = ctypes.CDLL("libc.so.6")
+        _has_malloc_trim = hasattr(_libc, 'malloc_trim')
+    except Exception:
+        _libc = None
+        _has_malloc_trim = False
+
+    async def memory_maintenance():
+        """每 5 分钟 malloc_trim + 凌晨 4 点 gen2 GC"""
+        tick = 0
+        while True:
+            await asyncio.sleep(300)  # 5 分钟
+            tick += 1
+
+            # malloc_trim 每轮都做
+            if _has_malloc_trim:
+                try:
+                    _libc.malloc_trim(0)
+                    if tick % 12 == 1:  # 每小时日志一次
+                        logger.info("[memory_maintenance] malloc_trim(0) executed")
+                except Exception as e:
+                    logger.warning(f"[memory_maintenance] malloc_trim failed: {e}")
+
+            # 凌晨 4 点做一次 gen2 GC
+            now = datetime.now(timezone(timedelta(hours=8)))  # CST
+            if now.hour == 4 and now.minute < 5:
+                try:
+                    before = gc.get_count()
+                    collected = gc.collect()
+                    after = gc.get_count()
+                    logger.info(f"[memory_maintenance] gen2 collect done: freed {collected} objects, counts {before} -> {after}")
+                    if _has_malloc_trim:
+                        _libc.malloc_trim(0)
+                except Exception as e:
+                    logger.warning(f"[memory_maintenance] gc.collect() failed: {e}")
+
+    asyncio.get_running_loop().create_task(memory_maintenance())
+
+    # 启动完成，删除热重载标记文件（通知 monitor 服务已恢复）
+    _reload_marker = os.path.join(os.path.dirname(__file__), 'data', '.reloading')
+    try:
+        os.remove(_reload_marker)
+    except FileNotFoundError:
+        pass
+
     app.state.startup_completed = True
     yield
     # 关闭时的代码
+    # 写热重载标记文件（通知 monitor 跳过检查）
+    try:
+        os.makedirs(os.path.dirname(_reload_marker), exist_ok=True)
+        with open(_reload_marker, 'w') as f:
+            f.write(str(os.getpid()))
+        logger.info("[lifespan] Wrote .reloading marker for health monitor")
+    except Exception:
+        pass
+
     # 取消清理任务
     if cleanup_task:
         cleanup_task.cancel()
@@ -573,6 +908,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan, debug=is_debug)
 app.include_router(api_router)
+app.include_router(oauth_router)
 
 
 def generate_markdown_docs():
@@ -620,6 +956,15 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     if exc.status_code == 404:
         token = await get_api_key(request)
         logger.error(f"404 Error: {exc.detail} api_key: {token}")
+    if isinstance(exc.detail, dict) and exc.detail.get("type") == "ip_blocked":
+        # 修改原因：IP 黑名单命中需要返回需求指定的 error.type，而默认 403 会变成 permission_denied_error。
+        # 修改方式：当依赖鉴权抛出的 detail 带有 type=ip_blocked 时，显式传入 error_type。
+        # 目的：让中间件路径和 FastAPI Depends 路径都返回 {"error":{"message":"Access denied","type":"ip_blocked"}}。
+        return create_error_response(
+            message=str(exc.detail.get("message") or "Access denied"),
+            status_code=exc.status_code,
+            error_type="ip_blocked",
+        )
     return openai_error_response(message=str(exc.detail), status_code=exc.status_code)
 
 
@@ -677,6 +1022,9 @@ model_handler: Optional[ModelRequestHandler] = None
 # SPA 前端路由 fallback - 所有未匹配的前端路由都返回 index.html
 from fastapi.responses import FileResponse
 
+# 修改原因：Key Analytics 是前端独立路由，直接刷新页面时也应返回 SPA index.html。
+# 修改方式：把 /key-analytics 加入服务端 fallback 白名单。
+# 目的：避免浏览器刷新新增页面时落到静态文件 404。
 SPA_ROUTES = ["/channels", "/playground", "/admin", "/settings", "/logs", "/login"]
 
 # 缓存控制头：index.html 不缓存，静态资源（带 hash）长期缓存

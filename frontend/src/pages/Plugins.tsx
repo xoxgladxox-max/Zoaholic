@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { apiFetch } from '../lib/api';
+import { toastSuccess, toastError, toastWarning, fmtErr } from '../components/Toast';
 import {
   Puzzle,
   Upload,
@@ -91,7 +92,7 @@ export default function Plugins() {
         setPlugins(Array.isArray(data?.plugins) ? data.plugins : []);
       } else {
         const err = await listRes.json().catch(() => ({}));
-        alert(`加载插件列表失败: ${err.detail || listRes.status}`);
+        toastError(err, "加载插件列表失败");
       }
 
       if (statusRes.ok) {
@@ -100,7 +101,7 @@ export default function Plugins() {
       }
     } catch (e) {
       console.error(e);
-      alert('加载插件信息失败（网络错误）');
+      toastError('加载插件信息失败（网络错误）');
     } finally {
       setLoading(false);
     }
@@ -148,15 +149,15 @@ export default function Plugins() {
 
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        alert(data?.detail || `操作失败: HTTP ${res.status}`);
+        toastSuccess(data?.detail || `操作失败: HTTP ${res.status}`);
         return;
       }
 
-      if (successMessage) alert(successMessage);
+      if (successMessage) toastSuccess(successMessage);
       if (refreshAfter) await fetchAll();
     } catch (e) {
       console.error(e);
-      alert('操作失败（网络错误）');
+      toastSuccess('操作失败（网络错误）');
     }
   };
 
@@ -179,15 +180,15 @@ export default function Plugins() {
 
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        alert(data?.detail || `上传失败: HTTP ${res.status}`);
+        toastSuccess(data?.detail || `上传失败: HTTP ${res.status}`);
         return;
       }
 
-      alert(data?.message || '插件上传成功');
+      toastSuccess(data?.message || '插件上传成功');
       await fetchAll();
     } catch (e) {
       console.error(e);
-      alert('上传失败（网络错误）');
+      toastSuccess('上传失败（网络错误）');
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = '';

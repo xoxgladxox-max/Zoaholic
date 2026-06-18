@@ -237,7 +237,10 @@ def _configure_root_logging():
     # Use QueueHandler + QueueListener so that logger.xxx() calls never
     # block the event loop on stream.write() — the actual I/O happens in
     # a dedicated background thread managed by QueueListener.
-    log_queue = queue.Queue(-1)  # unbounded
+    # 修改原因：无限日志队列在高并发或下游写入阻塞时可能持续占用内存。
+    # 修改方式：把日志队列上限固定为 10000，超过容量时沿用 QueueHandler 的既有错误处理路径。
+    # 目的：限制日志积压造成的内存增长，同时保持现有异步日志架构不变。
+    log_queue = queue.Queue(10000)
     queue_handler = logging.handlers.QueueHandler(log_queue)
 
     logging.basicConfig(

@@ -13,7 +13,7 @@ from ..utils import (
     safe_get,
     get_model_dict,
     get_base64_image,
-    get_tools_mode,
+    is_tools_disabled,
     generate_sse_response,
     generate_no_stream_response,
     end_of_line,
@@ -22,6 +22,7 @@ from ..response import check_response
 from ..json_utils import json_loads, json_dumps_text
 from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
 from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
 from ..file_utils import extract_base64_data
 
 
@@ -196,6 +197,7 @@ async def get_claude_payload(request, engine, provider, api_key=None):
     messages = []
     system_prompt = None
     tool_id = None
+    is_deepseek = "deepseek" in original_model.lower()
     for msg in request.messages:
         tool_call_id = None
         tool_calls = None
@@ -221,38 +223,71 @@ async def get_claude_payload(request, engine, provider, api_key=None):
                         else:
                             b64_data = data_uri
                     if b64_data:
-                        content.append({
-                            "type": "document" if not mime_type.startswith("image/") else "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": mime_type,
-                                "data": b64_data,
-                            }
-                        })
+                        if mime_type.startswith("image/"):
+                            content.append({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": mime_type,
+                                    "data": b64_data,
+                                }
+                            })
+                        elif mime_type == "application/pdf":
+                            content.append({
+                                "type": "document",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": mime_type,
+                                    "data": b64_data,
+                                }
+                            })
+                        else:
+                            # 文本类文件：解码 base64 转为内联文本
+                            import base64 as _b64
+                            try:
+                                decoded_text = _b64.b64decode(b64_data).decode("utf-8")
+                                fname = getattr(item.file, "filename", "") or ""
+                                if fname:
+                                    decoded_text = f"📄 {fname}\n```\n{decoded_text}\n```"
+                                content.append({"type": "text", "text": decoded_text})
+                            except Exception:
+                                # 解码失败，尝试原样发 document（可能报错）
+                                content.append({
+                                    "type": "document",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": mime_type,
+                                        "data": b64_data,
+                                    }
+                                })
         else:
             content = msg.content
             tool_calls = msg.tool_calls
             tool_id = tool_calls[0].id if tool_calls else None or tool_id
             tool_call_id = msg.tool_call_id
 
+        # DeepSeek Claude 端点豁免：回传 reasoning_content 为 thinking block（不带 signature）
+        thinking_blocks = []
+        if is_deepseek and msg.role == "assistant":
+            reasoning = getattr(msg, "reasoning_content", None) or (msg.model_extra or {}).get("reasoning_content")
+            if reasoning and isinstance(reasoning, str) and reasoning.strip():
+                thinking_blocks.append({"type": "thinking", "thinking": reasoning})
+
         if tool_calls:
-            tools_mode = get_tools_mode(provider)
             tool_calls_list = []
-            # 根据 tools_mode 决定处理多少个工具调用
-            calls_to_process = tool_calls if tools_mode == "parallel" else tool_calls[:1]
-            for tool_call in calls_to_process:
+            for tool_call in tool_calls:
                 tool_calls_list.append({
                     "type": "tool_use",
                     "id": tool_call.id,
                     "name": tool_call.function.name,
                     "input": json_loads(tool_call.function.arguments),
                 })
-            messages.append({"role": msg.role, "content": tool_calls_list})
+            messages.append({"role": msg.role, "content": thinking_blocks + tool_calls_list})
         elif tool_call_id:
             messages.append({"role": "user", "content": [{
                 "type": "tool_result",
-                "tool_use_id": tool_id,
-                "content": content
+                "tool_use_id": tool_call_id,
+                "content": [{"type": "text", "text": content}] if isinstance(content, str) else content
             }]})
         elif msg.role == "function":
             messages.append({"role": "assistant", "content": [{
@@ -264,9 +299,21 @@ async def get_claude_payload(request, engine, provider, api_key=None):
             messages.append({"role": "user", "content": [{
                 "type": "tool_result",
                 "tool_use_id": "toolu_017r5miPMV6PGSNKmhvHPic4",
-                "content": msg.content
+                "content": [{"type": "text", "text": msg.content}] if isinstance(msg.content, str) else msg.content
             }]})
         elif msg.role != "system":
+            # content 是 list 时，清洗裸字符串元素为 dict
+            if isinstance(content, list):
+                content = [
+                    item if isinstance(item, dict) else {"type": "text", "text": str(item)}
+                    for item in content
+                ]
+            if thinking_blocks:
+                if isinstance(content, str):
+                    content = [{"type": "text", "text": content}] if content else []
+                elif not isinstance(content, list):
+                    content = []
+                content = thinking_blocks + content
             messages.append({"role": msg.role, "content": content})
         elif msg.role == "system":
             if system_prompt is None:
@@ -337,8 +384,10 @@ async def get_claude_payload(request, engine, provider, api_key=None):
         if field not in miss_fields and value is not None:
             payload[field] = value
 
-    tools_mode = get_tools_mode(provider)
-    if request.tools and tools_mode != "none":
+    # 修改原因：provider.tools=False 仍需要禁用工具声明。
+    # 修改方式：仅在工具未禁用时转换 request.tools。
+    # 目的：保留禁用工具能力，同时移除无意义的工具模式变量。
+    if request.tools and not is_tools_disabled(provider):
         tools = payload.get("tools", [])  # 保留已有的工具（如插件添加的）
         for tool in request.tools:
             # 检查是否已经是 Claude 服务器端工具格式（如 web_search_20250305）
@@ -383,25 +432,12 @@ async def get_claude_payload(request, engine, provider, api_key=None):
                 elif raw_tool_choice == "required":
                     payload["tool_choice"] = {"type": "any"}
 
-    if tools_mode == "none":
+    # 修改原因：禁用工具时，payload 中不能残留任何工具声明或工具选择字段。
+    # 修改方式：用统一的禁用判断清理字段。
+    # 目的：延续 provider.tools=False 的禁用语义。
+    if is_tools_disabled(provider):
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
-
-    if "think" in request.model.lower():
-        payload["thinking"] = {
-            "budget_tokens": 4096,
-            "type": "enabled"
-        }
-        payload["temperature"] = 1
-        payload.pop("top_p", None)
-        payload.pop("top_k", None)
-        if request.model.split("-")[-1].isdigit():
-            think_tokens = int(request.model.split("-")[-1])
-            if think_tokens < max_tokens:
-                payload["thinking"] = {
-                    "budget_tokens": think_tokens,
-                    "type": "enabled"
-                }
 
     if request.thinking:
         thinking_config = {}
@@ -436,9 +472,10 @@ async def fetch_claude_response(client, url, headers, payload, model, timeout):
     # 跳过服务器端工具（server_tool_use, web_search_tool_result）
     content_list = response_json.get("content", [])
     text_parts = []
-    function_call_name = None
-    function_call_content = None
-    tools_id = None
+    # 修改原因：Claude 非流式 content 可能包含多个 tool_use，旧实现只保留最后一个工具调用。
+    # 修改方式：按 content 顺序收集 tool_calls_list，并为每个工具调用写入独立 index。
+    # 目的：让并行工具调用在转换成 Chat Completions 非流式响应时不会被丢失或合并。
+    tool_calls_list = []
 
     thinking_parts = []
 
@@ -459,36 +496,66 @@ async def fetch_claude_response(client, url, headers, payload, model, timeout):
 
         # 客户端工具调用
         if item_type == "tool_use":
-            function_call_name = item.get("name")
-            function_call_content = item.get("input")
-            tools_id = item.get("id")
+            tool_calls_list.append({
+                "index": len(tool_calls_list),
+                "id": item.get("id"),
+                "type": "function",
+                "function": {
+                    "name": item.get("name", ""),
+                    "arguments": json_dumps_text(item.get("input"), ensure_ascii=False),
+                },
+            })
 
     content = "".join(text_parts) if text_parts else None
     reasoning_content = "".join(thinking_parts) if thinking_parts else None
 
+    usage = safe_get(response_json, "usage", default={}) or {}
+    cache_usage = extract_cache_usage(usage)
+    # Claude 的 input_tokens 不包含缓存创建和读取 token；prompt_tokens 需要按计量口径补齐。
     prompt_tokens = (
-        (safe_get(response_json, "usage", "input_tokens") or 0)
-        + (safe_get(response_json, "usage", "cache_creation_input_tokens") or 0)
-        + (safe_get(response_json, "usage", "cache_read_input_tokens") or 0)
+        (usage.get("input_tokens") or 0)
+        + cache_usage["cache_creation_tokens"]
+        + cache_usage["cached_tokens"]
     ) or None
-    output_tokens = safe_get(response_json, "usage", "output_tokens")
+    output_tokens = usage.get("output_tokens")
     total_tokens = (prompt_tokens or 0) + (output_tokens or 0)
 
     merge_usage(
         prompt_tokens=prompt_tokens,
         completion_tokens=output_tokens,
         total_tokens=total_tokens,
+        **cache_usage,
     )
-    if content or reasoning_content or function_call_name:
+    if content or reasoning_content or tool_calls_list:
         mark_content_start()
+
+    # 如果非流式直接触发拒绝，因为没有半路断联问题，直接 400 报错拦截最为安全，100% 杜绝 Agent 误读
+    if response_json.get("stop_reason") == "refusal":
+        stop_details = response_json.get("stop_details") or {}
+        refusal_reason = (
+            stop_details.get("explanation")
+            or stop_details.get("type")
+            or stop_details.get("category")
+            or "This request triggered Claude safeguards and was refused."
+        )
+        yield {
+            "error": f"This request triggered Claude safeguards and was refused: {refusal_reason}",
+            "status_code": 400,
+            "details": f"Claude Refusal ({stop_details.get('category', 'unknown')})"
+        }
+        return
 
     role = safe_get(response_json, "role")
 
     yield await generate_no_stream_response(
-        timestamp, model, content=content, tools_id=tools_id,
-        function_call_name=function_call_name, function_call_content=function_call_content,
+        timestamp, model, content=content,
         role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens,
-        completion_tokens=output_tokens, reasoning_content=reasoning_content, return_dict=True
+        completion_tokens=output_tokens, reasoning_content=reasoning_content,
+        # Claude 非流式缓存字段已统一提取；传给出口函数后才能继续给下游方言使用。
+        cached_tokens=cache_usage["cached_tokens"],
+        cache_creation_tokens=cache_usage["cache_creation_tokens"],
+        return_dict=True,
+        tool_calls_list=tool_calls_list or None,
     )
 
 
@@ -503,27 +570,103 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
             return
         mark_adapter_metrics_managed()
         input_tokens = 0
+        # Claude 流式缓存字段出现在 message_start 的 usage 中，先暂存，等 output_tokens 到达时一起写入。
+        cached_tokens = 0
+        cache_creation_tokens = 0
         # 跟踪当前 content_block 类型，用于区分服务器端工具和客户端工具
         current_block_type = None
         current_block_id = None
+        # 修改原因：Claude 流式 tool_use 按顺序出现，但旧转换把所有工具调用 chunk 都写成 index=0。
+        # 修改方式：用 tc_index 分配新工具调用索引，用 current_tc_index 绑定后续 input_json_delta 参数片段。
+        # 目的：确保并行工具调用的参数在 OpenAI 兼容流中保持独立。
+        tc_index = 0
+        current_tc_index = None
         async for line in aiter_decoded_lines(response.aiter_bytes()):
 
                 if line.startswith("data:") and (line := line.lstrip("data: ")):
                     resp: dict = json_loads(line)
 
-                    if not input_tokens:
+                    # 流内错误事件检测（overloaded、429、赛博安全等）
+                    event_type_early = resp.get("type", "")
+                    if event_type_early == "error" or (event_type_early not in (
+                        "message_start", "message_delta", "message_stop",
+                        "content_block_start", "content_block_delta", "content_block_stop",
+                        "ping",
+                    ) and "error" in resp):
+                        err_obj = resp.get("error", {})
+                        if isinstance(err_obj, dict):
+                            err_msg = err_obj.get("message", str(resp))
+                            err_type = err_obj.get("type", "upstream_error")
+                        else:
+                            err_msg = str(err_obj or resp)
+                            err_type = "upstream_error"
+                        oai_err = json_dumps_text({
+                            "error": {
+                                "message": err_msg,
+                                "type": err_type,
+                                "param": None,
+                                "code": err_type,
+                            }
+                        }, ensure_ascii=False)
+                        yield f"data: {oai_err}" + end_of_line
+                        logger.warning(f"[claude_stream] Upstream error event: {err_type}: {err_msg[:200]}")
+                        break
+
+                    if not input_tokens and not cached_tokens and not cache_creation_tokens:
                         msg_usage = safe_get(resp, "message", "usage", default={})
                         if msg_usage:
+                            _cache_usage = extract_cache_usage(msg_usage)
+                            cached_tokens = _cache_usage["cached_tokens"]
+                            cache_creation_tokens = _cache_usage["cache_creation_tokens"]
                             input_tokens = (
                                 (msg_usage.get("input_tokens") or 0)
-                                + (msg_usage.get("cache_creation_input_tokens") or 0)
-                                + (msg_usage.get("cache_read_input_tokens") or 0)
+                                + cache_creation_tokens
+                                + cached_tokens
                             )
+                    # 处理 message_delta 中的拒绝回答（Refusal）信号
+                    # 必须在 usage 处理和 break 之前检查，否则 refusal 会被跳过
+                    delta_for_refusal = safe_get(resp, "delta", default={})
+                    if delta_for_refusal.get("stop_reason") == "refusal":
+                        stop_details = delta_for_refusal.get("stop_details", {})
+                        refusal_reason = (
+                            stop_details.get("explanation")
+                            or stop_details.get("type")
+                            or stop_details.get("category")
+                            or "This request triggered Claude safeguards and was refused."
+                        )
+                        mark_content_start()
+                        sse_content_filter = await generate_sse_response(
+                            timestamp, model, content=f"\n[Safeguards Refusal] {refusal_reason}\n", stop="content_filter"
+                        )
+                        yield sse_content_filter
+                        err_payload = {
+                            "error": {
+                                "message": f"This request triggered Claude safeguards and was refused: {refusal_reason}",
+                                "type": "invalid_request_error",
+                                "param": None,
+                                "code": "content_filter"
+                            }
+                        }
+                        yield f"data: {json_dumps_text(err_payload, ensure_ascii=False)}\n\n"
+                        # refusal 后仍然需要写 usage 再 break
+
                     output_tokens = safe_get(resp, "usage", "output_tokens", default=0)
                     if output_tokens:
                         total_tokens = input_tokens + output_tokens
-                        merge_usage(prompt_tokens=input_tokens, completion_tokens=output_tokens, total_tokens=total_tokens)
-                        sse_string = await generate_sse_response(timestamp, model, None, None, None, None, None, total_tokens, input_tokens, output_tokens)
+                        merge_usage(
+                            prompt_tokens=input_tokens,
+                            completion_tokens=output_tokens,
+                            total_tokens=total_tokens,
+                            cached_tokens=cached_tokens,
+                            cache_creation_tokens=cache_creation_tokens,
+                        )
+                        sse_string = await generate_sse_response(
+                            timestamp, model, None, None, None, None, None,
+                            total_tokens, input_tokens, output_tokens,
+                            # 流式 Claude 的缓存字段在 message_start 中采集，最终 usage chunk 需要一起输出。
+                            cached_tokens=cached_tokens,
+                            cache_creation_tokens=cache_creation_tokens,
+                        )
                         yield sse_string
                         break
 
@@ -547,8 +690,13 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                             function_call_name = content_block.get("name", "")
                             tools_id = content_block.get("id", "")
                             if tools_id and function_call_name:
+                                current_tc_index = tc_index
+                                tc_index += 1
                                 mark_content_start()
-                                sse_string = await generate_sse_response(timestamp, model, None, tools_id, function_call_name, None)
+                                sse_string = await generate_sse_response(
+                                    timestamp, model, None, tools_id, function_call_name, None,
+                                    tool_call_index=current_tc_index,
+                                )
                                 yield sse_string
                             continue
 
@@ -566,7 +714,10 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                             partial_json = delta.get("partial_json", "")
                             if partial_json:
                                 mark_content_start()
-                                sse_string = await generate_sse_response(timestamp, model, None, None, None, partial_json)
+                                sse_string = await generate_sse_response(
+                                    timestamp, model, None, None, None, partial_json,
+                                    tool_call_index=current_tc_index or 0,
+                                )
                                 yield sse_string
                             continue
 
@@ -578,6 +729,15 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                             continue
 
                     if current_block_type == "web_search_tool_result":
+                        continue
+
+                    if event_type == "content_block_stop":
+                        # 修改原因：Claude 后续 content_block_start 可能开启新的工具调用，旧状态不能继续套用。
+                        # 修改方式：在块结束事件里清空当前块类型和当前工具 index。
+                        # 目的：避免服务器端工具或文本块之后的参数片段误用前一个工具调用 index。
+                        current_block_type = None
+                        current_block_id = None
+                        current_tc_index = None
                         continue
 
                     # 正常文本输出
@@ -594,8 +754,13 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                     block_type = safe_get(resp, "content_block", "type", default="")
                     # 只处理客户端工具（tool_use），跳过服务器端工具（server_tool_use）
                     if tools_id and function_call_name and block_type == "tool_use":
+                        current_tc_index = tc_index
+                        tc_index += 1
                         mark_content_start()
-                        sse_string = await generate_sse_response(timestamp, model, None, tools_id, function_call_name, None)
+                        sse_string = await generate_sse_response(
+                            timestamp, model, None, tools_id, function_call_name, None,
+                            tool_call_index=current_tc_index,
+                        )
                         yield sse_string
 
                     # thinking 内容
@@ -609,7 +774,10 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                     function_call_content = safe_get(resp, "delta", "partial_json", default="")
                     if function_call_content and current_block_type != "server_tool_use":
                         mark_content_start()
-                        sse_string = await generate_sse_response(timestamp, model, None, None, None, function_call_content)
+                        sse_string = await generate_sse_response(
+                            timestamp, model, None, None, None, function_call_content,
+                            tool_call_index=current_tc_index or 0,
+                        )
                         yield sse_string
 
     yield "data: [DONE]" + end_of_line
@@ -669,4 +837,5 @@ def register():
         response_adapter=fetch_claude_response,
         stream_adapter=fetch_claude_response_stream,
         models_adapter=fetch_claude_models,
+        source="builtin",
     )

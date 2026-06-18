@@ -10,7 +10,7 @@ import {
   Send, Settings2, Trash2, RefreshCw, Copy, ChevronDown, ChevronRight,
   Brain, MessageSquare, Zap, MoreVertical, Edit3, CheckCheck, Loader2,
   Sparkles, Blocks, Thermometer, X, CheckCircle2, AlertCircle,
-  SlidersHorizontal, Paperclip, Image as ImageIcon, FileText, Eye
+  SlidersHorizontal, Paperclip, Image as ImageIcon, FileText, Eye, Key
 } from 'lucide-react';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
@@ -36,12 +36,23 @@ interface ExternalClient {
   link: string;
 }
 
+interface PlaygroundKeyOption {
+  index: number;
+  name: string | null;
+  masked_key: string;
+  api: string;
+}
+
 export default function Playground() {
   const { token } = useAuthStore();
 
   const [models, setModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState('');
   const [loadingModels, setLoadingModels] = useState(false);
+
+  const [playgroundKeys, setPlaygroundKeys] = useState<PlaygroundKeyOption[]>([]);
+  const [selectedPlaygroundKey, setSelectedPlaygroundKey] = useState('');
+  const [loadingPlaygroundKeys, setLoadingPlaygroundKeys] = useState(false);
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState('');
@@ -82,13 +93,21 @@ export default function Playground() {
   };
 
   useEffect(() => {
-    fetchModels();
+    if (!token) return;
+    // 修改原因：Key 下拉现在读取全局用户 api_keys，不再随模型变化刷新。
+    // 修改方式：登录 token 可用后只拉取偏好和 Key 列表，模型列表交给独立 effect 按当前身份刷新。
+    // 目的：避免模型切换影响用户身份选择，同时保留管理员 token 拉取 Key 列表的安全边界。
     fetchPreferences();
-  }, []);
+    fetchPlaygroundKeys();
+  }, [token]);
 
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  useEffect(() => {
+    fetchModels();
+  }, [token, selectedPlaygroundKey]);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -117,22 +136,85 @@ export default function Playground() {
     if (!token) return;
     setLoadingModels(true);
     try {
-      const res = await apiFetch('/v1/models', {
-        headers: { Authorization: `Bearer ${token}` }
+      // 修改原因：Playground 的 Key 下拉现在代表全局用户 api_key，模型列表也要按所选用户权限返回。
+      // 修改方式：复用 Authorization 构造函数，用所选 api 替换原始登录 token，不再发送额外的 Key header。
+      // 目的：让模型刷新和聊天请求始终模拟同一个用户身份。
+      const selectedApi = getSelectedPlaygroundApi();
+      const res = await fetch('/v1/models', {
+        headers: { Authorization: `Bearer ${selectedApi || token}` }
       });
       if (res.ok) {
         const data = await res.json();
         const modelIds = data.data.map((m: any) => m.id || m.name || m);
         setModels(modelIds);
-        if (modelIds.length > 0 && !selectedModel) {
-          setSelectedModel(modelIds[0]);
-        }
+        setSelectedModel(prev => {
+          if (modelIds.length === 0) return '';
+          return prev && modelIds.includes(prev) ? prev : modelIds[0];
+        });
       }
     } catch (err) {
       console.error('Failed to fetch models');
     } finally {
       setLoadingModels(false);
     }
+  };
+
+  const getSelectedPlaygroundApi = () => {
+    return playgroundKeys.find(item => String(item.index) === selectedPlaygroundKey)?.api || '';
+  };
+
+  const buildPlaygroundAuthHeaders = () => {
+    // 修改原因：选择具体 Key 后，Playground 要以该全局用户身份请求 chat 和 models。
+    // 修改方式：从已加载的 Key 选项中取完整 api 值，替换 Authorization Bearer token；未选择时继续使用原始登录 token。
+    // 目的：让后端按普通用户鉴权路径处理请求，不再依赖额外的 Playground 专用请求头。
+    const selectedApi = getSelectedPlaygroundApi();
+    return { Authorization: `Bearer ${selectedApi || token}` };
+  };
+
+  const fetchPlaygroundKeys = async () => {
+    if (!token) {
+      setPlaygroundKeys([]);
+      setSelectedPlaygroundKey('');
+      return;
+    }
+    setLoadingPlaygroundKeys(true);
+    try {
+      const res = await apiFetch('/v1/playground/keys', {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!res.ok) {
+        setPlaygroundKeys([]);
+        setSelectedPlaygroundKey('');
+        return;
+      }
+      const data = await res.json();
+      const keys = Array.isArray(data.keys) ? data.keys : [];
+      // 修改原因：Key 列表现在来自全局 api_keys，只需要在刷新后校验当前索引是否仍存在。
+      // 修改方式：按后端返回的 index 保留有效选择，失效时回到“自动”。
+      // 目的：避免向请求头写入已经不存在的用户 api_key。
+      setPlaygroundKeys(keys);
+      setSelectedPlaygroundKey(prev => keys.some((item: PlaygroundKeyOption) => String(item.index) === prev) ? prev : '');
+    } catch (err) {
+      console.error('Failed to fetch playground keys');
+      setPlaygroundKeys([]);
+      setSelectedPlaygroundKey('');
+    } finally {
+      setLoadingPlaygroundKeys(false);
+    }
+  };
+
+  const getPlaygroundKeyLabel = (keyOption: PlaygroundKeyOption) => {
+    // 修改原因：Key 选项现在表示用户身份，前端只需要展示用户名称和脱敏后的全局 api_key。
+    // 修改方式：有 name 时显示 name (masked_key)，无 name 时只显示 masked_key。
+    // 目的：让下拉框含义与 api.yaml 的 api_keys 数组保持一致。
+    return keyOption.name ? `${keyOption.name} (${keyOption.masked_key})` : keyOption.masked_key;
+  };
+
+  const buildPlaygroundRequestHeaders = () => {
+    return {
+      'Content-Type': 'application/json',
+      ...buildPlaygroundAuthHeaders()
+    };
   };
 
   const serializeMessage = (message: ChatMessage) => {
@@ -310,11 +392,12 @@ export default function Playground() {
     };
 
     try {
-      const res = await apiFetch('/v1/chat/completions', {
+      const chatApi = getSelectedPlaygroundApi();
+      const res = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          Authorization: `Bearer ${chatApi || token}`
         },
         body: JSON.stringify({
           model: selectedModel,
@@ -527,6 +610,28 @@ export default function Playground() {
           placeholder="你是一个有帮助的 AI 助手..."
           className="w-full bg-muted/60 border border-border focus:border-primary/60 p-2.5 rounded-lg text-[13px] text-foreground h-20 resize-none outline-none transition-colors placeholder:text-muted-foreground/60"
         />
+      </div>
+
+      {/* Key Selection */}
+      <div>
+        <div className="flex items-center justify-between mb-1.5">
+          <label className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-1">
+            <Key className="w-3 h-3" /> Key
+          </label>
+          {loadingPlaygroundKeys && <Loader2 className="w-3 h-3 text-muted-foreground animate-spin" />}
+        </div>
+        <select
+          value={selectedPlaygroundKey}
+          onChange={e => setSelectedPlaygroundKey(e.target.value)}
+          className="w-full bg-muted/60 border border-border focus:border-primary/60 px-2.5 py-2 rounded-lg text-[13px] text-foreground outline-none transition-colors"
+        >
+          <option value="">自动</option>
+          {playgroundKeys.map(keyOption => (
+            <option key={keyOption.index} value={String(keyOption.index)}>
+              {getPlaygroundKeyLabel(keyOption)}
+            </option>
+          ))}
+        </select>
       </div>
 
       {/* Model Selection */}

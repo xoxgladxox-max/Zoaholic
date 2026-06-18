@@ -376,6 +376,9 @@ class RequestStat(Base):
     prompt_tokens = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)
     total_tokens = Column(Integer, default=0)
+    # Prompt Caching 统计字段：用于保存上游返回的缓存命中和缓存创建 token，默认 0 便于旧日志按无缓存处理。
+    cached_tokens = Column(Integer, default=0, server_default="0")
+    cache_creation_tokens = Column(Integer, default=0, server_default="0")
     prompt_price = Column(Float, default=0.0)
     completion_price = Column(Float, default=0.0)
     timestamp = Column(DateTime(timezone=True), server_default=_SERVER_NOW, index=True)
@@ -391,6 +394,10 @@ class RequestStat(Base):
     request_body = Column(_BODY_TEXT, nullable=True)  # 用户请求体
     upstream_request_headers = Column(Text, nullable=True)  # 发送到上游的请求头JSON格式
     upstream_request_body = Column(_BODY_TEXT, nullable=True)  # 发送到上游的请求体
+    # 修改原因：后端需要持久化上游返回的响应头，便于日志详情排查上游行为。
+    # 修改方式：新增 JSON 字符串列，与 upstream_request_headers 保持 Text 类型一致。
+    # 目的：让通用 SQLAlchemy 迁移和 RequestStat 写入都能识别 upstream_response_headers。
+    upstream_response_headers = Column(Text, nullable=True)  # 上游返回的响应头JSON格式
     upstream_response_body = Column(_BODY_TEXT, nullable=True)  # 上游返回的原始响应体
     response_body = Column(_BODY_TEXT, nullable=True)  # 返回给用户的响应体
     raw_data_expires_at = Column(DateTime(timezone=True), nullable=True)  # 原始数据过期时间
@@ -576,6 +583,38 @@ if not DISABLE_DATABASE:
 
     if db_engine is not None:
         _legacy_async_session = sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+
+
+async def close_db():
+    """关闭数据库引擎连接（用于 db compact 替换文件前）。"""
+    global db_engine, _legacy_async_session
+    if db_engine is not None:
+        await db_engine.dispose()
+        logger.info("Database engine disposed")
+
+
+async def init_db():
+    """重新初始化数据库引擎（用于 db compact 替换文件后）。"""
+    global db_engine, _legacy_async_session
+    if DISABLE_DATABASE or DB_TYPE != "sqlite":
+        return
+    db_path = os.getenv("DB_PATH", "./data/stats.db")
+    is_debug = env_bool("DEBUG", False)
+    db_engine = create_async_engine("sqlite+aiosqlite:///" + db_path, echo=is_debug)
+
+    @event.listens_for(db_engine.sync_engine, "connect")
+    def set_sqlite_pragma_on_reconnect(dbapi_connection, connection_record):
+        cursor = None
+        try:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("PRAGMA busy_timeout = 30000;")
+        finally:
+            if cursor:
+                cursor.close()
+
+    _legacy_async_session = sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+    logger.info("Database engine re-initialized")
 
 
 @asynccontextmanager

@@ -1,6 +1,11 @@
-import { Fragment, ReactNode, useMemo, useState, useEffect, useRef } from 'react';
+import { Children, isValidElement, type ReactNode, useMemo, useState } from 'react';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
+import type { Components } from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
+import rehypeRaw from 'rehype-raw';
 import { Check, Copy } from 'lucide-react';
-import katex from 'katex';
 import 'katex/dist/katex.min.css';
 
 interface MarkdownRendererProps {
@@ -10,32 +15,6 @@ interface MarkdownRendererProps {
 }
 
 type MarkdownTone = NonNullable<MarkdownRendererProps['tone']>;
-
-type MarkdownBlock =
-  | { type: 'heading'; level: number; content: string }
-  | { type: 'paragraph'; content: string }
-  | { type: 'unordered-list'; items: ListItem[] }
-  | { type: 'ordered-list'; items: ListItem[] }
-  | { type: 'code'; language?: string; content: string }
-  | { type: 'blockquote'; content: string }
-  | { type: 'table'; headers: string[]; rows: string[][] }
-  | { type: 'math-block'; content: string }
-  | { type: 'hr' };
-
-interface ListItem {
-  text: string;
-  checked?: boolean;
-}
-
-const BLOCK_START_PATTERNS = [
-  /^```/,
-  /^#{1,6}(?:\s+|$)/,
-  /^>\s?/,
-  /^(\s*)[-+*]\s+/,
-  /^\d+\.\s+/,
-  /^ {0,3}([-*_])(?:\s*\1){2,}\s*$/,
-  /^\$\$\s*$/
-];
 
 const TONE_STYLES: Record<MarkdownTone, Record<string, string>> = {
   default: {
@@ -80,331 +59,6 @@ const TONE_STYLES: Record<MarkdownTone, Record<string, string>> = {
   }
 };
 
-const normalizeMarkdown = (content: string) => content.replace(/\r\n?/g, '\n');
-
-const isBlockBoundary = (line: string) => BLOCK_START_PATTERNS.some(pattern => pattern.test(line));
-
-const isTableSeparator = (line?: string) => Boolean(line && /^\s*\|?(\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/.test(line));
-
-const isTableStart = (line?: string, nextLine?: string) => Boolean(line && nextLine && line.includes('|') && isTableSeparator(nextLine));
-
-const splitTableLine = (line: string) => {
-  let normalized = line.trim();
-  if (normalized.startsWith('|')) normalized = normalized.slice(1);
-  if (normalized.endsWith('|')) normalized = normalized.slice(0, -1);
-  return normalized.split('|').map(cell => cell.trim());
-};
-
-function renderKatex(latex: string, displayMode: boolean): string {
-  try {
-    return katex.renderToString(latex, {
-      displayMode,
-      throwOnError: false,
-      output: 'html',
-    });
-  } catch {
-    return `<code>${latex}</code>`;
-  }
-}
-
-function KatexSpan({ latex, displayMode, tone }: { latex: string; displayMode: boolean; tone: MarkdownTone }) {
-  const ref = useRef<HTMLSpanElement>(null);
-  useEffect(() => {
-    if (ref.current) {
-      ref.current.innerHTML = renderKatex(latex, displayMode);
-    }
-  }, [latex, displayMode]);
-
-  return (
-    <span
-      ref={ref}
-      className={`${displayMode ? 'block my-3 overflow-x-auto text-center' : 'inline-block align-middle'} ${
-        tone === 'inverse' ? '[&_.katex]:text-primary-foreground/90' : ''
-      }`}
-    />
-  );
-}
-
-interface FootnoteDefinition {
-  id: string;
-  content: string;
-}
-
-function extractFootnotes(content: string): { cleanedContent: string; footnotes: FootnoteDefinition[] } {
-  const footnotes: FootnoteDefinition[] = [];
-  const lines = content.split('\n');
-  const cleanedLines: string[] = [];
-  const footnotePattern = /^\[\^(\w+)\]:\s*(.+)$/;
-
-  for (const line of lines) {
-    const match = line.match(footnotePattern);
-    if (match) {
-      footnotes.push({ id: match[1], content: match[2] });
-    } else {
-      cleanedLines.push(line);
-    }
-  }
-
-  return { cleanedContent: cleanedLines.join('\n'), footnotes };
-}
-
-function renderInline(text: string, keyPrefix: string, tone: MarkdownTone): ReactNode[] {
-  const tokens: ReactNode[] = [];
-  const styles = TONE_STYLES[tone];
-
-  const pattern = /!\[([^\]]*)\]\(([^\s)]+)\)|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|`([^`]+)`|(?<!\$)\$(?!\$)([^$\n]+?)\$(?!\$)|\*\*([^*]+)\*\*|__([^_]+)__|~~([^~]+)~~|\*([^*\n]+)\*|_([^_\n]+)_|\[\^(\w+)\]/g;
-  let cursor = 0;
-  let match: RegExpExecArray | null;
-
-  while ((match = pattern.exec(text)) !== null) {
-    if (match.index > cursor) {
-      const raw = text.slice(cursor, match.index);
-      tokens.push(renderTextNode(raw, tone, `${keyPrefix}-text-${cursor}`));
-    }
-
-    const [matched] = match;
-    if (match[1] !== undefined && match[2]) {
-      // Image: ![alt](url) — supports data: URIs and https://
-      tokens.push(
-        <img
-          key={`${keyPrefix}-img-${match.index}`}
-          src={match[2]}
-          alt={match[1] || 'image'}
-          className="max-w-full rounded-lg my-1 max-h-[512px] object-contain"
-          loading="lazy"
-        />
-      );
-    } else if (match[3] && match[4]) {
-      tokens.push(
-        <a
-          key={`${keyPrefix}-link-${match.index}`}
-          href={match[4]}
-          target="_blank"
-          rel="noreferrer"
-          className={`font-medium underline decoration-1 underline-offset-[3px] transition-colors break-all ${styles.link}`}
-        >
-          {renderInline(match[3], `${keyPrefix}-link-text-${match.index}`, tone)}
-        </a>
-      );
-    } else if (match[5]) {
-      tokens.push(
-        <code
-          key={`${keyPrefix}-code-${match.index}`}
-          className={styles.inlineCode}
-        >
-          {match[5]}
-        </code>
-      );
-    } else if (match[6]) {
-      tokens.push(
-        <KatexSpan
-          key={`${keyPrefix}-math-${match.index}`}
-          latex={match[6]}
-          displayMode={false}
-          tone={tone}
-        />
-      );
-    } else if (match[7] || match[8]) {
-      const strongText = match[7] || match[8] || '';
-      tokens.push(
-        <strong key={`${keyPrefix}-strong-${match.index}`} className="font-semibold">
-          {renderInline(strongText, `${keyPrefix}-strong-text-${match.index}`, tone)}
-        </strong>
-      );
-    } else if (match[9]) {
-      tokens.push(
-        <del key={`${keyPrefix}-del-${match.index}`} className="opacity-70">
-          {renderInline(match[9], `${keyPrefix}-del-text-${match.index}`, tone)}
-        </del>
-      );
-    } else if (match[10] || match[11]) {
-      const emText = match[10] || match[11] || '';
-      tokens.push(
-        <em key={`${keyPrefix}-em-${match.index}`} className="italic">
-          {renderInline(emText, `${keyPrefix}-em-text-${match.index}`, tone)}
-        </em>
-      );
-    } else if (match[12]) {
-      const fnId = match[12];
-      tokens.push(
-        <sup key={`${keyPrefix}-fnref-${match.index}`}>
-          <a
-            href={`#fn-${fnId}`}
-            id={`fnref-${fnId}`}
-            className={styles.footnoteRef}
-          >
-            [{fnId}]
-          </a>
-        </sup>
-      );
-    } else {
-      tokens.push(renderTextNode(matched, tone, `${keyPrefix}-raw-${match.index}`));
-    }
-
-    cursor = match.index + matched.length;
-  }
-
-  if (cursor < text.length) {
-    const raw = text.slice(cursor);
-    tokens.push(renderTextNode(raw, tone, `${keyPrefix}-text-end`));
-  }
-
-  if (tokens.length === 1 && typeof tokens[0] === 'string') {
-    return [renderTextNode(tokens[0] as string, tone, `${keyPrefix}-single`)];
-  }
-
-  return tokens;
-}
-
-const renderTextNode = (text: string, tone: MarkdownTone, keyPrefix?: string) => {
-  return <span key={keyPrefix} className={tone === 'inverse' ? 'text-primary-foreground/95' : 'text-foreground/90'}>{text}</span>;
-};
-
-
-function parseBlocks(content: string): MarkdownBlock[] {
-  const lines = normalizeMarkdown(content).split('\n');
-  const blocks: MarkdownBlock[] = [];
-  let index = 0;
-
-  while (index < lines.length) {
-    const currentLine = lines[index];
-
-    if (!currentLine.trim()) {
-      index += 1;
-      continue;
-    }
-
-    const codeStart = currentLine.match(/^```\s*([^`]*)\s*$/);
-    if (codeStart) {
-      const codeLines: string[] = [];
-      index += 1;
-      while (index < lines.length && !/^```\s*$/.test(lines[index])) {
-        codeLines.push(lines[index]);
-        index += 1;
-      }
-      if (index < lines.length && /^```\s*$/.test(lines[index])) {
-        index += 1;
-      }
-      blocks.push({
-        type: 'code',
-        language: codeStart[1]?.trim() || undefined,
-        content: codeLines.join('\n')
-      });
-      continue;
-    }
-
-    if (/^\$\$\s*$/.test(currentLine)) {
-      const mathLines: string[] = [];
-      index += 1;
-      while (index < lines.length && !/^\$\$\s*$/.test(lines[index])) {
-        mathLines.push(lines[index]);
-        index += 1;
-      }
-      if (index < lines.length && /^\$\$\s*$/.test(lines[index])) {
-        index += 1;
-      }
-      blocks.push({ type: 'math-block', content: mathLines.join('\n') });
-      continue;
-    }
-
-    const heading = currentLine.match(/^(#{1,6})(?:\s+(.*))?$/);
-    if (heading) {
-      blocks.push({ type: 'heading', level: heading[1].length, content: (heading[2] || '').trim() });
-      index += 1;
-      continue;
-    }
-
-    if (/^ {0,3}([-*_])(?:\s*\1){2,}\s*$/.test(currentLine)) {
-      blocks.push({ type: 'hr' });
-      index += 1;
-      continue;
-    }
-
-    if (isTableStart(currentLine, lines[index + 1])) {
-      const headers = splitTableLine(currentLine);
-      const rows: string[][] = [];
-      index += 2;
-      while (index < lines.length && lines[index].trim() && lines[index].includes('|')) {
-        rows.push(splitTableLine(lines[index]));
-        index += 1;
-      }
-      blocks.push({ type: 'table', headers, rows });
-      continue;
-    }
-
-    if (/^>\s?/.test(currentLine)) {
-      const quoteLines: string[] = [];
-      while (index < lines.length && /^>\s?/.test(lines[index])) {
-        quoteLines.push(lines[index].replace(/^>\s?/, ''));
-        index += 1;
-      }
-      blocks.push({ type: 'blockquote', content: quoteLines.join('\n') });
-      continue;
-    }
-
-    if (/^(\s*)[-+*]\s+/.test(currentLine)) {
-      const items: ListItem[] = [];
-      while (index < lines.length) {
-        const listLine = lines[index];
-        const itemMatch = listLine.match(/^(\s*)[-+*]\s+(.*)$/);
-        if (itemMatch) {
-          const itemText = itemMatch[2];
-          const taskMatch = itemText.match(/^\[([ xX])\]\s*(.*)$/);
-          if (taskMatch) {
-            items.push({
-              text: taskMatch[2],
-              checked: taskMatch[1] !== ' '
-            });
-          } else {
-            items.push({ text: itemText });
-          }
-          index += 1;
-          continue;
-        }
-        if (!listLine.trim()) {
-          index += 1;
-          break;
-        }
-        break;
-      }
-      blocks.push({ type: 'unordered-list', items });
-      continue;
-    }
-
-    if (/^\d+\.\s+/.test(currentLine)) {
-      const items: ListItem[] = [];
-      while (index < lines.length) {
-        const listLine = lines[index];
-        const itemMatch = listLine.match(/^\d+\.\s+(.*)$/);
-        if (itemMatch) {
-          items.push({ text: itemMatch[1] });
-          index += 1;
-          continue;
-        }
-        if (!listLine.trim()) {
-          index += 1;
-          break;
-        }
-        break;
-      }
-      blocks.push({ type: 'ordered-list', items });
-      continue;
-    }
-
-    const paragraphLines: string[] = [];
-    while (index < lines.length && lines[index].trim()) {
-      if (paragraphLines.length > 0 && (isBlockBoundary(lines[index]) || isTableStart(lines[index], lines[index + 1]))) {
-        break;
-      }
-      paragraphLines.push(lines[index]);
-      index += 1;
-    }
-    blocks.push({ type: 'paragraph', content: paragraphLines.join('\n') });
-  }
-
-  return blocks;
-}
-
 function headingClassName(level: number) {
   if (level === 1) return 'text-xl leading-tight mt-6 mb-3 first:mt-0';
   if (level === 2) return 'text-lg leading-snug mt-5 mb-2.5 border-b border-border/40 pb-1 first:mt-0';
@@ -447,139 +101,218 @@ function CodeBlock({ code, language, tone }: { code: string; language?: string; 
   );
 }
 
-function FootnoteSection({ footnotes, keyPrefix, tone }: { footnotes: FootnoteDefinition[]; keyPrefix: string; tone: MarkdownTone }) {
-  const styles = TONE_STYLES[tone];
-  if (!footnotes.length) return null;
-
-  return (
-    <section className={styles.footnoteSection}>
-      <ol className="list-decimal pl-5 space-y-0.5">
-        {footnotes.map((fn, idx) => (
-          <li key={`${keyPrefix}-fn-${idx}`} id={`fn-${fn.id}`} className="leading-relaxed">
-            <span>{renderInline(fn.content, `${keyPrefix}-fn-${idx}-content`, tone)}</span>
-            <a href={`#fnref-${fn.id}`} className={styles.footnoteBackref} title="回到引用处">↩</a>
-          </li>
-        ))}
-      </ol>
-    </section>
-  );
+function mergeClassNames(...classNames: Array<string | undefined | false>) {
+  return classNames.filter(Boolean).join(' ');
 }
 
-function renderBlocks(blocks: MarkdownBlock[], keyPrefix: string, tone: MarkdownTone): ReactNode[] {
+function isExternalHref(href?: string) {
+  return Boolean(href && /^https?:\/\//i.test(href));
+}
+
+function isCodeBlockElement(children: ReactNode) {
+  return Children.toArray(children).some(child => isValidElement(child) && child.type === CodeBlock);
+}
+
+function languageFromClassName(className?: string) {
+  return className?.match(/(?:^|\s)language-([^\s]+)/)?.[1];
+}
+
+function codeText(children: ReactNode) {
+  return String(children).replace(/\n$/, '');
+}
+
+function hasDataAttribute(props: Record<string, unknown>, name: string) {
+  return Object.prototype.hasOwnProperty.call(props, name);
+}
+
+function createMarkdownComponents(tone: MarkdownTone): Components {
   const styles = TONE_STYLES[tone];
+  const listMarkerClass = tone === 'inverse' ? 'marker:text-primary-foreground/50' : 'marker:text-muted-foreground/60';
 
-  return blocks.map((block, index) => {
-    const key = `${keyPrefix}-${index}`;
+  // 修改原因：旧实现用正则和 if else 手写解析，无法稳定覆盖锚点、HTML、嵌套列表、GFM 和数学公式。
+  // 修改方式：把语法解析交给 react-markdown、remark-gfm、remark-math、rehype-raw 和 rehype-katex，这里只通过 components 迁移项目现有样式。
+  // 目的：保留原有视觉表现和复制按钮，同时获得标准 markdown 生态的解析能力。
+  return {
+    h1({ node, className, ...props }) {
+      void node;
+      return <h1 className={mergeClassNames(headingClassName(1), styles.heading, className)} {...props} />;
+    },
+    h2({ node, className, ...props }) {
+      void node;
+      return <h2 className={mergeClassNames(headingClassName(2), styles.heading, className)} {...props} />;
+    },
+    h3({ node, className, ...props }) {
+      void node;
+      return <h3 className={mergeClassNames(headingClassName(3), styles.heading, className)} {...props} />;
+    },
+    h4({ node, className, ...props }) {
+      void node;
+      return <h4 className={mergeClassNames(headingClassName(4), styles.heading, className)} {...props} />;
+    },
+    h5({ node, className, ...props }) {
+      void node;
+      return <h5 className={mergeClassNames(headingClassName(5), styles.heading, className)} {...props} />;
+    },
+    h6({ node, className, ...props }) {
+      void node;
+      return <h6 className={mergeClassNames(headingClassName(6), styles.heading, className)} {...props} />;
+    },
+    p({ node, className, ...props }) {
+      void node;
+      return <p className={mergeClassNames('whitespace-pre-wrap break-words text-[14.5px] leading-relaxed my-2.5 first:mt-0 last:mb-0', className)} {...props} />;
+    },
+    a({ node, className, href, target, rel, ...props }) {
+      void node;
+      const rest = props as Record<string, unknown>;
+      const footnoteRef = hasDataAttribute(rest, 'data-footnote-ref');
+      const footnoteBackref = hasDataAttribute(rest, 'data-footnote-backref');
+      const externalHref = isExternalHref(href);
+      const computedTarget = target ?? (externalHref ? '_blank' : undefined);
+      const computedRel = computedTarget === '_blank' ? mergeClassNames(rel, 'noreferrer') : rel;
 
-    switch (block.type) {
-      case 'heading':
-        return (
-          <div key={key} className={`${headingClassName(block.level)} ${styles.heading}`}>
-            {renderInline(block.content, `${key}-heading`, tone)}
-          </div>
-        );
-      case 'paragraph':
-        return (
-          <p key={key} className="whitespace-pre-wrap break-words text-[14.5px] leading-relaxed my-2.5 first:mt-0 last:mb-0">
-            {renderInline(block.content, `${key}-paragraph`, tone)}
-          </p>
-        );
-      case 'unordered-list':
-        return (
-          <ul key={key} className={`list-disc space-y-1.5 pl-6 my-3 text-[14.5px] leading-relaxed ${tone === 'inverse' ? 'marker:text-primary-foreground/50' : 'marker:text-muted-foreground/60'}`}>
-            {block.items.map((item, itemIndex) => {
-              const isTask = item.checked !== undefined;
-              return (
-                <li key={`${key}-item-${itemIndex}`} className={`break-words pl-1 ${isTask ? styles.checkboxItem : ''}`}>
-                  {isTask && (
-                    <input
-                      type="checkbox"
-                      checked={item.checked}
-                      readOnly
-                      className={styles.checkbox}
-                    />
-                  )}
-                  {isTask && item.checked ? (
-                    <span className="line-through opacity-60">{renderInline(item.text, `${key}-item-${itemIndex}`, tone)}</span>
-                  ) : (
-                    renderInline(item.text, `${key}-item-${itemIndex}`, tone)
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-        );
-      case 'ordered-list':
-        return (
-          <ol key={key} className={`list-decimal space-y-1.5 pl-6 my-3 text-[14.5px] leading-relaxed ${tone === 'inverse' ? 'marker:text-primary-foreground/50' : 'marker:text-muted-foreground/60'}`}>
-            {block.items.map((item, itemIndex) => (
-              <li key={`${key}-item-${itemIndex}`} className="break-words pl-1">
-                {renderInline(item.text, `${key}-item-${itemIndex}`, tone)}
-              </li>
-            ))}
-          </ol>
-        );
-      case 'code':
-        return <CodeBlock key={key} code={block.content} language={block.language} tone={tone} />;
-      case 'math-block':
-        return (
-          <div key={key} className="my-3">
-            <KatexSpan latex={block.content} displayMode={true} tone={tone} />
-          </div>
-        );
-      case 'blockquote':
-        return (
-          <div key={key} className={styles.quote}>
-            {renderBlocks(parseBlocks(block.content), `${key}-quote`, tone)}
-          </div>
-        );
-      case 'table':
-        return (
-          <div key={key} className={`overflow-x-auto ${styles.tableWrap}`}>
-            <table className="w-full border-collapse text-left text-[13px]">
-              <thead className={styles.tableHead}>
-                <tr>
-                  {block.headers.map((header, headerIndex) => (
-                    <th key={`${key}-header-${headerIndex}`} className="px-3.5 py-2.5 font-semibold whitespace-nowrap text-[12.5px] uppercase tracking-wider opacity-90">
-                      {renderInline(header, `${key}-header-${headerIndex}`, tone)}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {block.rows.map((row, rowIndex) => (
-                  <tr key={`${key}-row-${rowIndex}`} className={styles.tableRow}>
-                    {row.map((cell, cellIndex) => (
-                      <td key={`${key}-cell-${rowIndex}-${cellIndex}`} className={`px-3.5 py-2 align-top whitespace-pre-wrap ${styles.tableCell}`}>
-                        {renderInline(cell, `${key}-cell-${rowIndex}-${cellIndex}`, tone)}
-                      </td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        );
-      case 'hr':
-        return <hr key={key} className={styles.hr} />;
-      default:
-        return <Fragment key={key} />;
+      return (
+        <a
+          href={href}
+          target={computedTarget}
+          rel={computedRel}
+          className={mergeClassNames(
+            footnoteRef && styles.footnoteRef,
+            footnoteBackref && styles.footnoteBackref,
+            href && !footnoteRef && !footnoteBackref && `font-medium decoration-1 underline-offset-[3px] break-words ${styles.link}`,
+            className
+          )}
+          {...props}
+        />
+      );
+    },
+    code({ node, className, children, ...props }) {
+      void node;
+      const language = languageFromClassName(className);
+      const rawCode = String(children);
+      const isBlock = Boolean(language || rawCode.endsWith('\n'));
+
+      if (isBlock) {
+        return <CodeBlock code={codeText(children)} language={language} tone={tone} />;
+      }
+
+      return <code className={mergeClassNames(styles.inlineCode, className)} {...props}>{children}</code>;
+    },
+    pre({ node, className, children, ...props }) {
+      void node;
+
+      if (isCodeBlockElement(children)) {
+        return <>{children}</>;
+      }
+
+      return <pre className={mergeClassNames('overflow-x-auto p-4 text-[13px] leading-relaxed font-mono whitespace-pre', className)} {...props}>{children}</pre>;
+    },
+    blockquote({ node, className, ...props }) {
+      void node;
+      return <blockquote className={mergeClassNames(styles.quote, className)} {...props} />;
+    },
+    ul({ node, className, ...props }) {
+      void node;
+      return <ul className={mergeClassNames('list-disc space-y-1.5 pl-6 my-3 text-[14.5px] leading-relaxed', listMarkerClass, className)} {...props} />;
+    },
+    ol({ node, className, ...props }) {
+      void node;
+      return <ol className={mergeClassNames('list-decimal space-y-1.5 pl-6 my-3 text-[14.5px] leading-relaxed', listMarkerClass, className)} {...props} />;
+    },
+    li({ node, className, ...props }) {
+      void node;
+      const isTaskListItem = className?.includes('task-list-item');
+      return (
+        <li
+          className={mergeClassNames(
+            'break-words pl-1',
+            isTaskListItem && styles.checkboxItem,
+            isTaskListItem && '[&:has(input:checked)]:line-through [&:has(input:checked)]:opacity-60',
+            className
+          )}
+          {...props}
+        />
+      );
+    },
+    input({ node, className, type, ...props }) {
+      void node;
+      return <input type={type} className={type === 'checkbox' ? mergeClassNames(styles.checkbox, className) : className} readOnly {...props} />;
+    },
+    hr({ node, className, ...props }) {
+      void node;
+      return <hr className={mergeClassNames(styles.hr, className)} {...props} />;
+    },
+    img({ node, className, alt, ...props }) {
+      void node;
+      return <img alt={alt || 'image'} className={mergeClassNames('max-w-full rounded-lg my-1 max-h-[512px] object-contain', className)} loading="lazy" {...props} />;
+    },
+    table({ node, className, ...props }) {
+      void node;
+      return (
+        <div className={mergeClassNames('overflow-x-auto', styles.tableWrap)}>
+          <table className={mergeClassNames('w-full border-collapse text-left text-[13px]', className)} {...props} />
+        </div>
+      );
+    },
+    thead({ node, className, ...props }) {
+      void node;
+      return <thead className={mergeClassNames(styles.tableHead, className)} {...props} />;
+    },
+    tr({ node, className, ...props }) {
+      void node;
+      return <tr className={mergeClassNames(styles.tableRow, className)} {...props} />;
+    },
+    th({ node, className, ...props }) {
+      void node;
+      return <th className={mergeClassNames('px-3.5 py-2.5 font-semibold whitespace-nowrap text-[12.5px] uppercase tracking-wider opacity-90', className)} {...props} />;
+    },
+    td({ node, className, ...props }) {
+      void node;
+      return <td className={mergeClassNames('px-3.5 py-2 align-top whitespace-pre-wrap', styles.tableCell, className)} {...props} />;
+    },
+    strong({ node, className, ...props }) {
+      void node;
+      return <strong className={mergeClassNames('font-semibold', className)} {...props} />;
+    },
+    em({ node, className, ...props }) {
+      void node;
+      return <em className={mergeClassNames('italic', className)} {...props} />;
+    },
+    del({ node, className, ...props }) {
+      void node;
+      return <del className={mergeClassNames('opacity-70', className)} {...props} />;
+    },
+    sup({ node, className, ...props }) {
+      void node;
+      return <sup className={mergeClassNames('align-super', className)} {...props} />;
+    },
+    section({ node, className, ...props }) {
+      void node;
+      const rest = props as Record<string, unknown>;
+      const isFootnoteSection = hasDataAttribute(rest, 'data-footnotes');
+      return <section className={mergeClassNames(isFootnoteSection && styles.footnoteSection, className)} {...props} />;
     }
-  });
+  };
 }
 
 export function MarkdownRenderer({ content, className = '', tone = 'default' }: MarkdownRendererProps) {
   const trimmed = content.trim();
-
-  const { cleanedContent, footnotes } = useMemo(() => extractFootnotes(content), [content]);
-  const blocks = useMemo(() => parseBlocks(cleanedContent), [cleanedContent]);
+  const components = useMemo(() => createMarkdownComponents(tone), [tone]);
 
   if (!trimmed) return null;
 
   return (
-    <div className={`markdown-body break-words text-left text-[14.5px] leading-relaxed ${TONE_STYLES[tone].root} ${className}`.trim()}>
-      {renderBlocks(blocks, 'markdown', tone)}
-      <FootnoteSection footnotes={footnotes} keyPrefix="markdown" tone={tone} />
+    <div className={`markdown-body break-words text-left text-[14.5px] leading-relaxed ${TONE_STYLES[tone].root} ${tone === 'inverse' ? '[&_.katex]:text-primary-foreground/90' : ''} [&_.katex-display]:my-3 [&_.katex-display]:overflow-x-auto ${className}`.trim()}>
+      {/* 修改原因：Markdown 语法解析需要由标准库负责，避免手写 parser 漏掉锚点、HTML、嵌套列表和 GFM 语法。
+          修改方式：ReactMarkdown 负责语法树渲染，remark/rehype 插件负责 GFM、数学公式、KaTeX 和 raw HTML，components 负责主题样式迁移。
+          目的：保持现有组件接口和视觉表现，同时提升 markdown 规范兼容性。 */}
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeRaw, rehypeKatex]}
+        components={components}
+        urlTransform={defaultUrlTransform}
+      >
+        {content}
+      </ReactMarkdown>
     </div>
   );
 }

@@ -15,7 +15,7 @@ from ..utils import (
     safe_get,
     get_model_dict,
     get_base64_image,
-    get_tools_mode,
+    is_tools_disabled,
     generate_sse_response,
     end_of_line,
     generate_chunked_image_md,
@@ -25,6 +25,7 @@ from ..response import check_response
 from ..json_utils import json_loads, json_dumps_text
 from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
 from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
 from ..file_utils import extract_base64_data
 
 
@@ -58,31 +59,11 @@ async def get_openai_passthrough_meta(request, engine, provider, api_key=None):
 
     base_api = BaseAPI(provider.get('base_url'))
     url = base_api.chat_url
-    if "openrouter.ai" in url:
-        headers['HTTP-Referer'] = "https://github.com/HCPTangHY/Zoaholic"
-        headers['X-Title'] = "Zoaholic"
-
+    # 修改原因：OpenRouter 专属请求头已经归属到 OpenRouter 渠道，通用 OpenAI 兼容渠道不应按 URL 猜测。
+    # 修改方式：这里只生成 Content-Type 和 Authorization 这类通用请求头。
+    # 目的：避免通用渠道隐式修改其他渠道的请求头。
     return url, headers, {}
 
-
-def _as_text_from_responses_content(content) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for it in content:
-            if isinstance(it, str):
-                parts.append(it)
-            elif isinstance(it, dict):
-                t = it.get("type")
-                if t in ("input_text", "text", "output_text"):
-                    txt = it.get("text")
-                    if txt:
-                        parts.append(str(txt))
-        return "".join(parts)
-    return str(content)
 
 
 async def patch_passthrough_openai_payload(
@@ -119,37 +100,9 @@ async def patch_passthrough_openai_payload(
         messages.insert(0, {"role": "system", "content": system_prompt_text})
         return payload
 
-    # Responses: input + instructions
-    if isinstance(payload.get("input"), list):
-        extracted_parts = []
-        input_items = payload.get("input")
-        new_input = list(input_items)
-        while new_input:
-            first = new_input[0]
-            if not isinstance(first, dict):
-                break
-            role = first.get("role")
-            if role not in ("system", "developer"):
-                break
-            extracted_parts.append(_as_text_from_responses_content(first.get("content")).strip())
-            new_input.pop(0)
-        if len(new_input) != len(input_items):
-            payload["input"] = new_input
-
-        extracted_text = "\n\n".join([p for p in extracted_parts if p]).strip()
-        old_inst = payload.get("instructions")
-        old_inst_text = old_inst.strip() if isinstance(old_inst, str) else ""
-
-        inst_parts = [system_prompt_text]
-        if extracted_text:
-            inst_parts.append(extracted_text)
-        if old_inst_text:
-            inst_parts.append(old_inst_text)
-        payload["instructions"] = "\n\n".join(inst_parts).strip()
-        # 兼容性：部分上游/网关要求 Responses API 显式设置 store=false，否则会报错
-        payload["store"] = False
-        return payload
-
+    # 修改原因：非 Chat 请求结构由专用渠道负责，OpenAI 兼容渠道不再改写 input/instructions。
+    # 修改方式：这里只处理 messages 数组中的 system_prompt 注入，其他 payload 原样返回。
+    # 目的：避免通用渠道隐藏改写已经由上游或插件决定的请求格式。
     return payload
 
 
@@ -165,12 +118,12 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
  
     # 这里统一根据 base_url 拼出真正的聊天端点：
     # - 如果传入的是 https://api.openai.com/v1 → 自动补 /chat/completions
-    # - 如果传入的是 .../v1/chat/completions 或 .../v1/responses → 原样使用
+    # - 如果传入的是完整聊天端点 → 原样使用
     base_api = BaseAPI(provider['base_url'])
     url = base_api.chat_url
-    if "openrouter.ai" in url:
-        headers['HTTP-Referer'] = "https://github.com/HCPTangHY/Zoaholic"
-        headers['X-Title'] = "Zoaholic"
+    # 修改原因：OpenRouter 专属请求头已迁移到 OpenRouter 渠道，通用 OpenAI 渠道不再按 URL 注入。
+    # 修改方式：这里只保留通用 headers，避免根据 base_url 做渠道猜测。
+    # 目的：让渠道专属行为集中在对应渠道中维护。
 
     messages = []
     for msg in request.messages:
@@ -182,76 +135,70 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
         tool_call_id = None
         if isinstance(msg.content, list):
             content = []
+            # 修改原因：Responses API 的 input_* 转换和模型名判断已经移出通用 OpenAI 兼容渠道。
+            # 修改方式：这里只构造标准 Chat Completions content item，并继续保留已有的图片和文本文件处理。
+            # 目的：让模型能力和特殊格式由上游配置或专用渠道控制，而不是在 core 中硬编码模型名。
             for item in msg.content:
                 if item.type == "text":
-                    text_message = format_text_message(item.text)
-                    if "v1/responses" in url:
-                        text_message["type"] = "input_text"
-                    content.append(text_message)
-                elif item.type == "image_url" and provider.get("image", True) and "o1-mini" not in original_model:
-                    image_message = await format_image_message(item.image_url.url)
-                    if "v1/responses" in url:
-                        image_message = {
-                            "type": "input_image",
-                            "image_url": image_message["image_url"]["url"]
-                        }
-                    content.append(image_message)
+                    content.append(format_text_message(item.text))
+                elif item.type == "image_url" and provider.get("image", True):
+                    content.append(await format_image_message(item.image_url.url))
                 elif item.type == "file":
-                    # 处理 OpenAI Responses 模式下的文件
-                    if "v1/responses" in url:
-                        if getattr(item.file, "url", None) and item.file.url.startswith("data:image/"):
-                            content.append({"type": "input_image", "image_url": item.file.url})
-                        elif getattr(item.file, "data", None) and str(item.file.mime_type).startswith("image/"):
-                            content.append({"type": "input_image", "image_url": f"data:{item.file.mime_type};base64,{item.file.data}"})
-                        else:
-                            file_item = {"type": "input_file"}
-                            if getattr(item.file, "filename", None):
-                                file_item["filename"] = item.file.filename
-                            if getattr(item.file, "file_id", None):
-                                file_item["file_id"] = item.file.file_id
-                            elif getattr(item.file, "url", None):
-                                if item.file.url.startswith("http"):
-                                    file_item["file_url"] = item.file.url
-                                else:
-                                    file_item["file_data"] = item.file.url
-                            elif getattr(item.file, "data", None):
-                                file_item["file_data"] = f"data:{item.file.mime_type or 'application/octet-stream'};base64,{item.file.data}"
-                            content.append(file_item)
-                    # 处理标准 Chat 模式下的文件
+                    item_file = item.file
+                    if item_file is None:
+                        continue
+
+                    mime = getattr(item_file, "mime_type", "") or ""
+                    is_image = False
+                    if mime.startswith("image/"):
+                        is_image = True
+                    elif getattr(item_file, "url", None) and item_file.url.startswith("data:image/"):
+                        is_image = True
+
+                    if is_image and provider.get("image", True):
+                        if getattr(item_file, "data", None):
+                            b64 = f"data:{mime};base64,{item_file.data}"
+                            content.append(await format_image_message(b64))
+                        elif getattr(item_file, "url", None):
+                            content.append(await format_image_message(item_file.url))
                     else:
-                        is_image = False
-                        if item.file is None:
-                            continue
-                        if getattr(item.file, "mime_type", None) and item.file.mime_type.startswith("image/"):
-                            is_image = True
-                        elif getattr(item.file, "url", None) and item.file.url.startswith("data:image/"):
-                            is_image = True
-                        
-                        if is_image and provider.get("image", True) and "o1-mini" not in original_model:
-                            if getattr(item.file, "data", None):
-                                b64 = f"data:{item.file.mime_type};base64,{item.file.data}"
-                                content.append(await format_image_message(b64))
-                            elif getattr(item.file, "url", None):
-                                content.append(await format_image_message(item.file.url))
-                            else:
-                                pass
-                        else:
-                            from fastapi import HTTPException
-                            raise HTTPException(status_code=400, detail="当前渠道仅支持图片输入，不支持非图片文件。如需传输文档，请使用其他支持该能力的渠道。")
+                        # 非图片文件：尝试解码文本类文件为内联文本
+                        is_text = (
+                            mime.startswith("text/")
+                            or mime in (
+                                "application/json", "application/xml", "application/yaml",
+                                "application/x-yaml", "application/javascript",
+                                "application/typescript", "application/sql",
+                                "application/x-python", "application/toml",
+                                "application/csv", "application/ld+json",
+                            )
+                        )
+                        if is_text and getattr(item_file, "data", None):
+                            import base64 as _b64
+                            try:
+                                decoded = _b64.b64decode(item_file.data).decode("utf-8")
+                                fname = getattr(item_file, "filename", "") or ""
+                                if fname:
+                                    decoded = f"📄 {fname}\n```\n{decoded}\n```"
+                                content.append({"type": "text", "text": decoded})
+                            except Exception:
+                                pass  # 解码失败静默跳过
+                        # 其他类型静默跳过
         else:
+            # 修改原因：system 消息内容不应按具体模型名自动追加提示词。
+            # 修改方式：非列表 content 保持请求原文，仅继续转发工具调用元数据。
+            # 目的：避免 core 对模型行为做隐藏改写。
             content = msg.content
-            if msg.role == "system" and "o3-mini" in original_model and not content.startswith("Formatting re-enabled"):
-                content = "Formatting re-enabled. " + content
             tool_calls = msg.tool_calls
             tool_call_id = msg.tool_call_id
 
         if tool_calls:
-            tools_mode = get_tools_mode(provider)
-            if tools_mode != "none":
+            if not is_tools_disabled(provider):
                 tool_calls_list = []
-                # 根据 tools_mode 决定处理多少个工具调用
-                calls_to_process = tool_calls if tools_mode == "parallel" else tool_calls[:1]
-                for tool_call in calls_to_process:
+                # 修改原因：OpenAI 兼容历史中的工具调用必须完整保留。
+                # 修改方式：工具未禁用时直接遍历全部 tool_calls。
+                # 目的：保证后续每个 tool_result 都能匹配到对应 tool_call。
+                for tool_call in tool_calls:
                     tool_calls_list.append({
                         "id": tool_call.id,
                         "type": tool_call.type,
@@ -262,29 +209,21 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
                     })
                 messages.append({"role": msg.role, "tool_calls": tool_calls_list, **extra_fields})
         elif tool_call_id:
-            tools_mode = get_tools_mode(provider)
-            if tools_mode != "none":
+            # 修改原因：禁用工具时不应继续转发 tool_result 历史。
+            # 修改方式：沿用 provider.tools=False 作为唯一禁用判断。
+            # 目的：保留禁用工具逻辑，同时删除工具模式变量。
+            if not is_tools_disabled(provider):
                 messages.append({"role": msg.role, "tool_call_id": tool_call_id, "content": content, **extra_fields})
         else:
             messages.append({"role": msg.role, "content": content, **extra_fields})
 
-    if ("o1-mini" in original_model or "o1-preview" in original_model) and len(messages) > 1 and messages[0]["role"] == "system":
-        system_msg = messages.pop(0)
-        messages[0]["content"] = system_msg["content"] + messages[0]["content"]
-
-    if "v1/responses" in url:
-        payload = {
-            "model": original_model,
-            "input": messages,
-        }
-        # 兼容性：部分上游/网关要求 Responses API 显式设置 store=false，否则会报错
-        # （例如："Store must be set to false"）
-        payload["store"] = False
-    else:
-        payload = {
-            "model": original_model,
-            "messages": messages,
-        }
+    # 修改原因：Responses API 请求结构已由 openai_responses_channel 负责，通用 OpenAI 渠道只生成 Chat payload。
+    # 修改方式：删除按 URL 切换 input/store 的分支，始终使用 messages 字段。
+    # 目的：避免同一渠道同时维护两套协议转换逻辑。
+    payload = {
+        "model": original_model,
+        "messages": messages,
+    }
 
     miss_fields = [
         'model',
@@ -293,13 +232,18 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
 
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
-            if field == "max_tokens" and ("o1" in original_model or "o3" in original_model or "o4" in original_model or "gpt-5" in original_model):
+            # 修改原因：max_tokens 兼容转换应是字段级通用行为，不应依赖具体模型名。
+            # 修改方式：遇到 max_tokens 时统一写入 max_completion_tokens，其余字段保持原样。
+            # 目的：保留兼容能力，同时删除模型名硬编码。
+            if field == "max_tokens":
                 payload["max_completion_tokens"] = value
             else:
                 payload[field] = value
 
-    tools_mode = get_tools_mode(provider)
-    if tools_mode == "none" or "o1-mini" in original_model or "chatgpt-4o-latest" in original_model or "grok" in original_model:
+    # 修改原因：工具字段清理只应服从 provider.tools=False，不再按模型名猜测能力。
+    # 修改方式：删除模型名条件，只保留统一的工具禁用判断。
+    # 目的：让模型能力差异由上游或插件控制。
+    if is_tools_disabled(provider):
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
 
@@ -308,66 +252,9 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
         payload.pop("presence_penalty", None)
         payload.pop("frequency_penalty", None)
 
-    if "grok-3-mini" in original_model:
-        if request.model.endswith("high"):
-            payload["reasoning_effort"] = "high"
-        elif request.model.endswith("low"):
-            payload["reasoning_effort"] = "low"
-
-    if "o1" in original_model or \
-    "o3" in original_model or "o4" in original_model or \
-    "gpt-oss" in original_model or "gpt-5" in original_model:
-        if request.model.endswith("high"):
-            if "v1/responses" in url:
-                payload["reasoning"] = {"effort": "high"}
-            else:
-                payload["reasoning_effort"] = "high"
-        elif request.model.endswith("low"):
-            if "v1/responses" in url:
-                payload["reasoning"] = {"effort": "low"}
-            else:
-                payload["reasoning_effort"] = "low"
-
-        if "temperature" in payload:
-            payload.pop("temperature")
-
-        if "v1/responses" in url:
-            payload.pop("stream_options", None)
-
-    # 代码生成/数学解题  0.0
-    # 数据抽取/分析	     1.0
-    # 通用对话          1.3
-    # 翻译	           1.3
-    # 创意类写作/诗歌创作 1.5
-    if "deepseek-r" in original_model.lower():
-        if "temperature" not in payload:
-            payload["temperature"] = 0.6
-
-    if request.model.endswith("-search") and "gemini" in original_model:
-        if "tools" not in payload:
-            payload["tools"] = [{
-                "type": "function",
-                "function": {
-                    "name": "googleSearch",
-                    "description": "googleSearch"
-                }
-            }]
-        else:
-            if not any(tool["function"]["name"] == "googleSearch" for tool in payload["tools"]):
-                payload["tools"].append({
-                    "type": "function",
-                    "function": {
-      "name": "googleSearch",
-                        "description": "googleSearch"
-                    }
-                })
-
-
-    # 兼容性：部分上游/网关要求 Responses API 显式设置 store=false，否则会报错
-    # （例如："Store must be set to false"）
-    if "v1/responses" in url:
-        payload["store"] = False
-
+    # 修改原因：temperature 删除、默认 temperature 和 Responses 专属字段都不应由通用渠道按模型名或 URL 决定。
+    # 修改方式：删除这些硬编码分支，保留请求、上游和插件已经确定的 payload。
+    # 目的：让 core 不再隐藏改写模型参数。
     return url, headers, payload
 
 
@@ -385,10 +272,12 @@ async def fetch_openai_response(client, url, headers, payload, model, timeout):
     response_json = await asyncio.to_thread(json_loads, response_bytes)
     mark_adapter_metrics_managed()
     usage = safe_get(response_json, "usage", default={}) or {}
+    # 非流式 OpenAI 兼容响应在同一个 usage 对象中携带缓存字段，随普通 token 一起写入 current_info。
     merge_usage(
         prompt_tokens=safe_get(usage, "prompt_tokens", default=0),
         completion_tokens=safe_get(usage, "completion_tokens", default=0),
         total_tokens=safe_get(usage, "total_tokens", default=0),
+        **extract_cache_usage(usage),
     )
 
     # 兼容原 core/response.py 中的特殊逻辑
@@ -428,9 +317,9 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
     timestamp = int(datetime.timestamp(datetime.now()))
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
-    is_thinking = False
-    has_send_thinking = False
-    ark_tag = False
+    # 修改原因：core 不解析供应商私有思维链文本，避免把上游内容拆成 reasoning_content。
+    # 修改方式：删除思维链解析状态变量，后续流式内容按原始 chunk 透传或按已有结构字段处理。
+    # 目的：让思维链处理完全交给上游或插件。
     json_payload = await asyncio.to_thread(json_dumps_text, payload)
     
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
@@ -444,6 +333,9 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
 
         input_tokens = 0
         output_tokens = 0
+        # 流式 usage 的缓存字段可能只在最后一个 chunk 出现，需要跨 chunk 暂存后统一 merge。
+        cached_tokens = 0
+        cache_creation_tokens = 0
         done_received = False
 
         async for line in aiter_decoded_lines(response.aiter_bytes()):
@@ -463,10 +355,16 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
                 if chunk_usage and isinstance(chunk_usage, dict):
                     _in = chunk_usage.get("prompt_tokens") if "prompt_tokens" in chunk_usage else chunk_usage.get("input_tokens", 0)
                     _out = chunk_usage.get("completion_tokens") if "completion_tokens" in chunk_usage else chunk_usage.get("output_tokens", 0)
+                    # OpenAI、Responses API 和 DeepSeek 的缓存字段都在 usage 内，这里统一提取并跨 chunk 保留。
+                    _cache_usage = extract_cache_usage(chunk_usage)
                     if _in:
                         input_tokens = _in
                     if _out:
                         output_tokens = _out
+                    if _cache_usage["cached_tokens"]:
+                        cached_tokens = _cache_usage["cached_tokens"]
+                    if _cache_usage["cache_creation_tokens"]:
+                        cache_creation_tokens = _cache_usage["cache_creation_tokens"]
 
                 # 检查返回的 JSON 是否包含错误信息
                 if 'error' in line:
@@ -475,84 +373,9 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
 
                 line['id'] = f"chatcmpl-{random_str}"
 
-                # v1/responses
-                if line.get("type") == "response.reasoning_summary_text.delta" and line.get("delta"):
-                    mark_content_start()
-                    sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=line.get("delta"))
-                    yield sse_string
-                    continue
-                elif line.get("type") == "response.output_text.delta" and line.get("delta"):
-                    mark_content_start()
-                    sse_string = await generate_sse_response(timestamp, payload["model"], content=line.get("delta"))
-                    yield sse_string
-                    continue
-                elif line.get("type") == "response.output_text.done":
-                    sse_string = await generate_sse_response(timestamp, payload["model"], stop="stop")
-                    yield sse_string
-                    continue
-                elif line.get("type") == "response.completed":
-                    input_tokens = safe_get(line, "response", "usage", "input_tokens", default=0)
-                    output_tokens = safe_get(line, "response", "usage", "output_tokens", default=0)
-                    merge_usage(prompt_tokens=input_tokens, completion_tokens=output_tokens, total_tokens=input_tokens + output_tokens)
-                    continue
-                elif line.get("type", "").startswith("response."):
-                    continue
-
-                # 处理 <think> 标签
-                content = safe_get(line, "choices", 0, "delta", "content", default="")
-                if "<think>" in content:
-                    is_thinking = True
-                    ark_tag = True
-                    content = content.replace("<think>", "")
-                if "</think>" in content:
-                    end_think_reasoning_content = ""
-                    end_think_content = ""
-                    is_thinking = False
-
-                    if content.rstrip('\n').endswith("</think>"):
-                        end_think_reasoning_content = content.replace("</think>", "").rstrip('\n')
-                    elif content.lstrip('\n').startswith("</think>"):
-                        end_think_content = content.replace("</think>", "").lstrip('\n')
-                    else:
-                        end_think_reasoning_content = content.split("</think>")[0]
-                        end_think_content = content.split("</think>")[1]
-
-                    if end_think_reasoning_content:
-                        mark_content_start()
-                        sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=end_think_reasoning_content)
-                        yield sse_string
-                    if end_think_content:
-                        mark_content_start()
-                        sse_string = await generate_sse_response(timestamp, payload["model"], content=end_think_content)
-                        yield sse_string
-                    continue
-                if is_thinking and ark_tag:
-                    if not has_send_thinking:
-                        content = content.replace("\n\n", "")
-                    if content:
-                        mark_content_start()
-                        sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
-                        yield sse_string
-                        has_send_thinking = True
-                    continue
-
-                # 处理 poe thinking 标签
-                if "Thinking..." in content and "\n> " in content:
-                    is_thinking = True
-                    content = content.replace("Thinking...", "").replace("\n> ", "")
-                if is_thinking and "\n\n" in content and not ark_tag:
-                    is_thinking = False
-                if is_thinking and not ark_tag:
-                    content = content.replace("\n> ", "")
-                    if not has_send_thinking:
-                        content = content.replace("\n", "")
-                    if content:
-                        mark_content_start()
-                        sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=content)
-                        yield sse_string
-                        has_send_thinking = True
-                    continue
-
+                # 修改原因：Responses API 流式事件由 openai_responses_channel 处理，通用 OpenAI 渠道不再转换 response.* 事件。
+                # 修改方式：删除 response.* 专用分支以及供应商私有思维链文本解析，继续处理标准 Chat chunk。
+                # 目的：保证通用渠道不隐藏解析或改写上游原始内容。
                 no_stream_content = safe_get(line, "choices", 0, "message", "content", default=None)
                 openrouter_reasoning = safe_get(line, "choices", 0, "delta", "reasoning", default="")
                 # reasoning_details 数组格式回退：部分模型只返回 reasoning_details 而不带 reasoning
@@ -606,7 +429,7 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
                     mark_content_start()
                     sse_string = await generate_sse_response(timestamp, payload["model"], reasoning_content=openrouter_reasoning)
                     yield sse_string
-                elif no_stream_content and has_send_thinking == False:
+                elif no_stream_content:
                     mark_content_start()
                     sse_string = await generate_sse_response(safe_get(line, "created", default=None), safe_get(line, "model", default=None), content=no_stream_content)
                     yield sse_string
@@ -620,8 +443,23 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
                 break
 
     if input_tokens or output_tokens:
-        merge_usage(prompt_tokens=input_tokens, completion_tokens=output_tokens, total_tokens=input_tokens + output_tokens)
-        sse_string = await generate_sse_response(timestamp, payload["model"], None, None, None, None, None, total_tokens=input_tokens + output_tokens, prompt_tokens=input_tokens, completion_tokens=output_tokens)
+        # 结束时再 merge 一次，确保只在末尾出现的缓存字段不会被遗漏。
+        merge_usage(
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+            cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+        )
+        sse_string = await generate_sse_response(
+            timestamp, payload["model"], None, None, None, None, None,
+            total_tokens=input_tokens + output_tokens,
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            # 结束 usage chunk 需要带上前面跨 chunk 暂存的缓存字段，避免只写入统计而不返回给下游。
+            cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+        )
         yield sse_string
 
     yield "data: [DONE]" + end_of_line
@@ -669,4 +507,5 @@ def register():
         response_adapter=fetch_openai_response,
         stream_adapter=fetch_gpt_response_stream,
         models_adapter=fetch_openai_models,
+        source="builtin",
     )

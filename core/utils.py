@@ -1,24 +1,34 @@
-import re
-import io
-import ast
+"""
+通用工具入口模块。
+
+修改原因：core.utils.py 原来同时承载基础工具、API key 池、响应构造和图片处理，文件体积过大。
+修改方式：将 API key 池移入 core.key_pool，将响应构造和图片处理移入 core.response_builders，并在此处重新导出旧名字。
+目的：不改变外部调用方式，继续兼容 from core.utils import ... 的旧导入路径。
+"""
+
 import json
 import httpx
-import base64
-import random
-import string
-
-import asyncio
 import traceback
-from time import time
-from PIL import Image
-from fastapi import HTTPException
-from collections import defaultdict
 from httpx_socks import AsyncProxyTransport
 from urllib.parse import urlparse, urlunparse
 
 from .log_config import logger
-from .json_utils import json_dumps_text, json_loads
-from .file_utils import split_data_uri_prefix_and_data, extract_base64_data, fetch_url_content
+
+# 修改原因：外部代码仍从 core.utils 导入 API key 池相关名字。
+# 修改方式：在 utils 顶部重新导出 core.key_pool 中的同一批对象。
+# 目的：确保 provider_api_circular_list 全局只有 core.key_pool 中的一个实例。
+from core.key_pool import (
+    parse_rate_limit, ThreadSafeCircularList, circular_list_encoder,
+    ApiKeyRateLimitRegistry, provider_api_circular_list,
+    _save_all_auto_disabled, load_auto_disabled_snapshot, restore_auto_disabled,
+)
+from core.response_builders import (
+    end_of_line, generate_sse_response, generate_no_stream_response,
+    generate_chunked_image_md, get_image_format, encode_image,
+    get_image_from_url, get_encode_image, get_base64_image,
+    _convert_webp_base64_to_png, _prepare_image_for_upload,
+    upload_image_to_0x0st, parse_json_safely,
+)
 
 # 本地 API Key 前缀：用于判断 provider 名是否为本地聚合器 Key
 # sk- 是历史前缀，zk- 是新版本前缀，两者都需要兼容
@@ -32,58 +42,6 @@ def is_local_api_key(name: str) -> bool:
     return name.startswith(LOCAL_API_KEY_PREFIXES)
 
 
-async def generate_chunked_image_md(
-    image_data: str,
-    timestamp: int,
-    model: str,
-    thought_signature: str = None,
-    chunk_size: int = 16384,
-    mime_type: str = "image/png",
-):
-    """
-    将较大的图片 data URI 或 base64 转为 Markdown，并分块流式输出 SSE。
-
-    注意：
-    - 不先构造完整 markdown 大字符串，避免高并发时额外内存分配和事件循环阻塞。
-    - image_data 可以是完整 data URI，也可以是纯 base64 字符串。
-    """
-    data_uri_prefix, raw_image_data = split_data_uri_prefix_and_data(image_data, mime_type)
-
-    prefix = "\n\n![image](" + data_uri_prefix
-    suffix = ")"
-
-    first_chunk_capacity = max(1, chunk_size - len(prefix))
-    first_chunk = prefix + raw_image_data[:first_chunk_capacity]
-    sse_string = await generate_sse_response(
-        timestamp,
-        model,
-        content=first_chunk,
-        thought_signature=thought_signature,
-    )
-    yield sse_string
-
-    sent = first_chunk_capacity
-    if sent < len(raw_image_data):
-        await asyncio.sleep(0)
-
-    while sent < len(raw_image_data):
-        chunk_content = raw_image_data[sent:sent + chunk_size]
-        sse_string = await generate_sse_response(
-            timestamp,
-            model,
-            content=chunk_content,
-        )
-        yield sse_string
-        sent += len(chunk_content)
-        if sent < len(raw_image_data):
-            await asyncio.sleep(0)
-
-    sse_string = await generate_sse_response(
-        timestamp,
-        model,
-        content=suffix,
-    )
-    yield sse_string
 
 def get_model_dict(provider):
 
@@ -96,13 +54,19 @@ def get_model_dict(provider):
     - 字典：`{upstream: alias}` 格式，key 是上游模型名，value 是对外展示的别名
       例：`- gemini-2.5-pro: my-alias` → upstream="gemini-2.5-pro", alias="my-alias"
     
-    如果 provider 配置了 model_prefix，会同时生成：
-    - 带前缀的别名 -> 上游模型（用于模型列表展示和带前缀请求匹配）
-    - 不带前缀的别名 -> 上游模型（用于不带前缀请求的路由匹配）
+    如果 provider 配置了 model_prefix，只生成带前缀的对外别名 -> 上游模型。
+    无前缀请求是否能命中带前缀渠道，由 routing.py 的 pool_sharing 显式控制。
+    这样做的目的，是避免未开启 pool_sharing 的旧渠道被无前缀模型名误命中。
     
     Returns:
         dict: {alias: upstream_model} 映射
     """
+    if provider.get("_virtual_route_provider") and isinstance(provider.get("_model_dict_cache"), dict):
+        # 修改原因：虚拟模型临时 provider 会保留原渠道的 model_prefix，但请求链路中有部分代码会调用 get_model_dict。
+        # 修改方式：对带 _virtual_route_provider 标记的临时 provider，优先返回已注入虚拟名映射的运行时缓存副本。
+        # 目的：确保 request.model 为虚拟模型名时，所有渠道实现都能解析到真实上游模型名。
+        return dict(provider["_model_dict_cache"])
+
     model_dict = {}
     prefix = provider.get('model_prefix', '').strip()
     
@@ -112,10 +76,15 @@ def get_model_dict(provider):
         
     for model in provider['model']:
         if isinstance(model, str):
-            # 字符串模型：别名和上游都是自己
-            if prefix:
+            # 字符串模型：别名和上游都是自己。
+            # 修改原因：model_prefix 渠道默认只能暴露带前缀外部名；无前缀共享必须由 pool_sharing 单独开启。
+            # 修改方式：普通模型只写入 prefix+model；通配符 "*" 是路由标记，不加前缀，保持既有透传能力。
+            if model == "*":
+                model_dict[model] = model
+            elif prefix:
                 model_dict[f"{prefix}{model}"] = model  # 带前缀别名 -> 上游
-            model_dict[model] = model  # 原始名 -> 上游（用于路由匹配）
+            else:
+                model_dict[model] = model  # 无前缀渠道：原始名 -> 上游
             
         if isinstance(model, dict):
             # dict 模型格式: {upstream: alias}
@@ -124,9 +93,13 @@ def get_model_dict(provider):
             for upstream, alias in model.items():
                 alias_str = str(alias)
                 upstream_str = str(upstream)
+                # 修改原因：保持 model_dict 的 key 始终为对外模型名，value 始终为上游原始名。
+                # 修改方式：有前缀时只写入带前缀别名；无前缀时写入原别名。
+                # 目的：让 pool_sharing 成为无前缀路由池共享的唯一入口。
                 if prefix:
                     model_dict[f"{prefix}{alias_str}"] = upstream_str  # 带前缀别名 -> 上游
-                model_dict[alias_str] = upstream_str  # 原始别名 -> 上游（用于路由匹配）
+                else:
+                    model_dict[alias_str] = upstream_str  # 无前缀渠道：别名 -> 上游
                 
     return model_dict
 
@@ -215,33 +188,12 @@ class BaseAPI:
             self.chat_url = api_url
             self.embeddings = urlunparse(parsed_url[:2] + (before_v1 + "/v1beta/embeddings",) + ("",) * 3)
 
-def get_tools_mode(provider) -> str:
-    """
-    获取工具调用支持模式
-
-    Args:
-        provider: provider 配置
-
-    Returns:
-        str: 工具模式
-            - "none": 不支持工具调用
-            - "single": 只支持单个工具调用（默认）
-            - "parallel": 支持并行工具调用
-    """
-    tools_config = provider.get("tools")
-
-    if tools_config is False:
-        return "none"
-    elif tools_config == "parallel":
-        return "parallel"
-    elif tools_config is True or tools_config == "single":
-        return "single"
-    elif tools_config is None:
-        # 未配置时默认为 single（向后兼容）
-        return "single"
-    else:
-        # 其他值视为 single
-        return "single"
+def is_tools_disabled(provider) -> bool:
+    """检查 provider 是否禁用了工具调用"""
+    # 修改原因：工具配置现在只保留禁用开关，避免模式判断截断工具调用。
+    # 修改方式：只有 provider.tools 显式为 False 时才返回 True。
+    # 目的：保留禁用工具功能，同时让已经生成的工具调用完整转发。
+    return provider.get("tools") is False
 
 
 def get_engine(provider, endpoint=None, original_model=""):
@@ -280,7 +232,10 @@ def get_engine(provider, endpoint=None, original_model=""):
     if "stream" in safe_get(provider, "preferences", "post_body_parameter_overrides", default={}):
         stream = safe_get(provider, "preferences", "post_body_parameter_overrides", "stream")
 
-    return engine, stream
+    # stream_mode: auto(默认) / force_stream / force_non_stream
+    stream_mode = safe_get(provider, "preferences", "stream_mode", default="auto")
+
+    return engine, stream, stream_mode
 
 def get_proxy(proxy, client_config = {}):
     if proxy:
@@ -294,15 +249,12 @@ def get_proxy(proxy, client_config = {}):
             client_config["transport"] = transport
             # print("proxy", proxy)
         else:
-            client_config["proxies"] = {
-                "http://": proxy,
-                "https://": proxy
-            }
+            client_config["proxy"] = proxy
     return client_config
 
 async def update_initial_model(provider):
     try:
-        engine, stream_mode = get_engine(provider, endpoint=None, original_model="")
+        engine, stream_mode, _ = get_engine(provider, endpoint=None, original_model="")
         # print("engine", engine, provider)
         api_url = provider['base_url']
         api = provider['api']
@@ -474,896 +426,3 @@ def truncate_for_logging(
         serialized = serialized[:max_total_size] + f"... [截断总计 {len(serialized) - max_total_size} 字符]"
 
     return serialized
-
-
-def parse_rate_limit(limit_string):
-    # 定义时间单位到秒的映射
-    time_units = {
-        's': 1, 'sec': 1, 'second': 1,
-        'm': 60, 'min': 60, 'minute': 60,
-        'h': 3600, 'hr': 3600, 'hour': 3600,
-        'd': 86400, 'day': 86400,
-        'mo': 2592000, 'month': 2592000,
-        'y': 31536000, 'year': 31536000,
-        'tpr': -1,
-    }
-
-    # 处理多个限制条件
-    limits = []
-    for limit in limit_string.split(','):
-        limit = limit.strip()
-        # 使用正则表达式匹配数字和单位
-        match = re.match(r'^(\d+)/(\w+)$', limit)
-        if not match:
-            raise ValueError(f"Invalid rate limit format: {limit}")
-
-        count, unit = match.groups()
-        count = int(count)
-
-        # 转换单位到秒
-        if unit not in time_units:
-            raise ValueError(f"Unknown time unit: {unit}")
-
-        seconds = time_units[unit]
-        limits.append((count, seconds))
-
-    return limits
-
-
-# ==================== 运行时自动禁用 Key 持久化 ====================
-import os as _os
-import threading as _threading
-
-_RT_DISABLED_FILE = _os.path.join(
-    _os.getenv("DATA_DIR", "/home/data"), "runtime_disabled_keys.json"
-)
-_rt_save_lock = _threading.Lock()
-
-
-def _save_all_auto_disabled():
-    """将所有渠道的运行时自动禁用状态持久化到 JSON 文件。"""
-    try:
-        snapshot = {}
-        for pname, clist in provider_api_circular_list.items():
-            if clist.auto_disabled_info:
-                entries = {}
-                for k, info in clist.auto_disabled_info.items():
-                    cooling_val = clist.cooling_until.get(k, 0)
-                    entries[k] = {
-                        "cooling_until": None if cooling_val == float('inf') else cooling_val,
-                        "disabled_at": info.get("disabled_at", 0),
-                        "duration": info.get("duration", 0),
-                        "reason": info.get("reason", ""),
-                    }
-                snapshot[pname] = entries
-        with _rt_save_lock:
-            _os.makedirs(_os.path.dirname(_RT_DISABLED_FILE), exist_ok=True)
-            tmp = _RT_DISABLED_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f, ensure_ascii=False)
-            _os.replace(tmp, _RT_DISABLED_FILE)
-    except Exception as e:
-        logger.debug(f"[auto_disable_persist] save failed: {e}")
-
-
-def load_auto_disabled_snapshot() -> dict:
-    """从文件加载运行时自动禁用快照。返回 {provider_name: {key: {...}}}"""
-    try:
-        if _os.path.exists(_RT_DISABLED_FILE):
-            with open(_RT_DISABLED_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return data
-    except Exception as e:
-        logger.debug(f"[auto_disable_persist] load failed: {e}")
-    return {}
-
-
-def restore_auto_disabled():
-    """启动时从持久化文件恢复所有渠道的自动禁用状态。
-
-    应在 provider_api_circular_list 初始化完成后调用。
-    已过期的非永久禁用条目会被跳过。
-    """
-    snapshot = load_auto_disabled_snapshot()
-    if not snapshot:
-        return
-    now = time()
-    restored = 0
-    for pname, entries in snapshot.items():
-        clist = provider_api_circular_list.get(pname)
-        if not clist:
-            continue
-        for k, info in entries.items():
-            if k not in clist.items:
-                continue
-            cooling = info.get("cooling_until")
-            if cooling is None:
-                cooling = float('inf')  # 永久禁用
-            elif cooling <= now:
-                continue  # 已过期，跳过
-            clist.cooling_until[k] = cooling
-            clist.auto_disabled_info[k] = {
-                "disabled_at": info.get("disabled_at", 0),
-                "duration": info.get("duration", 0),
-                "reason": info.get("reason", ""),
-            }
-            restored += 1
-    if restored:
-        logger.info(f"[auto_disable_persist] Restored {restored} disabled key(s) from snapshot")
-
-
-class ThreadSafeCircularList:
-    def __init__(self, items = [], rate_limit={"default": "999999/min"}, schedule_algorithm="round_robin", provider_name=None, disabled_keys=None):
-        self.provider_name = provider_name
-        self.original_items = list(items)
-        self.schedule_algorithm = schedule_algorithm
-        # 存储禁用的 key 集合
-        self.disabled_keys = set(disabled_keys) if disabled_keys else set()
-
-        if schedule_algorithm == "random":
-            self.items = random.sample(items, len(items))
-        elif schedule_algorithm == "round_robin":
-            self.items = items
-        elif schedule_algorithm == "fixed_priority":
-            self.items = items
-        elif schedule_algorithm == "smart_round_robin":
-            self.items = items
-        else:
-            self.items = items
-            logger.warning(f"Unknown schedule algorithm: {schedule_algorithm}, use (round_robin, random, fixed_priority, smart_round_robin) instead")
-            self.schedule_algorithm = "round_robin"
-
-        self.index = 0
-        self.lock = asyncio.Lock()
-        self.requests = defaultdict(lambda: defaultdict(list))
-        self.cooling_until = defaultdict(float)
-        self.rate_limits = {}
-        self.reordering_task = None
-        self.auto_disabled_info = {}  # key -> {"disabled_at": float, "duration": int, "reason": str}
-
-        if isinstance(rate_limit, dict):
-            for rate_limit_model, rate_limit_value in rate_limit.items():
-                self.rate_limits[rate_limit_model] = parse_rate_limit(rate_limit_value)
-        elif isinstance(rate_limit, str):
-            self.rate_limits["default"] = parse_rate_limit(rate_limit)
-        else:
-            logger.error(f"Error ThreadSafeCircularList: Unknown rate_limit type: {type(rate_limit)}, rate_limit: {rate_limit}")
-
-        if self.schedule_algorithm == "smart_round_robin":
-            logger.info(f"Initializing '{self.provider_name}' with 'smart_round_robin' algorithm.")
-            self._trigger_reorder()
-
-    async def reset_items(self, new_items: list):
-        """Safely replaces the current list of items with a new one."""
-        async with self.lock:
-            if self.items != new_items:
-                self.items = new_items
-                self.index = 0
-                logger.info(f"Provider '{self.provider_name}' API key list has been reset and reordered.")
-
-    def _trigger_reorder(self):
-        """Asynchronously triggers the reordering task if not already running."""
-        if self.provider_name and (self.reordering_task is None or self.reordering_task.done()):
-            logger.info(f"Triggering reorder for provider '{self.provider_name}'...")
-            try:
-                loop = asyncio.get_running_loop()
-                self.reordering_task = loop.create_task(self._reorder_keys())
-            except RuntimeError:
-                logger.warning(f"No running event loop to trigger reorder for '{self.provider_name}'.")
-
-    async def _reorder_keys(self):
-        """Performs the actual reordering logic."""
-        from utils import get_sorted_api_keys
-        try:
-            sorted_keys = await get_sorted_api_keys(self.provider_name, self.original_items, group_size=100)
-            if sorted_keys:
-                await self.reset_items(sorted_keys)
-        except Exception as e:
-            logger.error(f"Error during key reordering for provider '{self.provider_name}': {e}")
-
-    async def set_cooling(self, item: str, cooling_time: int = 60):
-        """设置某个 item 进入冷却状态
-
-        Args:
-            item: 需要冷却的 item
-            cooling_time: 冷却时间(秒)，默认60秒
-        """
-        if item is None:
-            return
-        now = time()
-        async with self.lock:
-            self.cooling_until[item] = now + cooling_time
-            # 清空该 item 的请求记录
-            # self.requests[item] = []
-            logger.warning(f"API key {item} 已进入冷却状态，冷却时间 {cooling_time} 秒")
-
-    async def set_auto_disabled(self, item: str, duration: int = 0, reason: str = ""):
-        """自动禁用某个 Key。
-
-        通过设置 cooling_until 实现，复用现有的 is_rate_limited 判断链路。
-        duration=0 表示永久禁用（直到手动恢复或进程重启）。
-        duration>0 表示禁用指定秒数后自动恢复。
-
-        Args:
-            item: API key
-            duration: 禁用时长（秒），0 表示永久
-            reason: 禁用原因（用于日志和 API 展示）
-        """
-        if item is None:
-            return
-        now = time()
-        async with self.lock:
-            if duration > 0:
-                self.cooling_until[item] = now + duration
-            else:
-                self.cooling_until[item] = float('inf')
-            self.auto_disabled_info[item] = {
-                "disabled_at": now,
-                "duration": duration,
-                "reason": reason,
-            }
-        logger.warning(
-            f"[auto_disable] Key {item} disabled for provider {self.provider_name}, "
-            f"duration={'permanent' if duration == 0 else f'{duration}s'}, reason: {reason}"
-        )
-        _save_all_auto_disabled()
-
-    async def clear_auto_disabled(self, item: str):
-        """手动恢复一个被自动禁用的 Key，清除冷却和元数据。"""
-        async with self.lock:
-            self.cooling_until[item] = 0.0
-            self.auto_disabled_info.pop(item, None)
-        _save_all_auto_disabled()
-
-    async def get_auto_disabled_keys(self) -> list:
-        """返回当前被自动禁用的 Key 列表及其剩余时间。
-
-        同时清理已自然过期的记录。
-        """
-        now = time()
-        async with self.lock:
-            expired = [k for k in self.auto_disabled_info if now >= self.cooling_until.get(k, 0)]
-            for k in expired:
-                self.auto_disabled_info.pop(k, None)
-            result = []
-            for item, info in self.auto_disabled_info.items():
-                until = self.cooling_until.get(item, 0)
-                remaining = -1 if until == float('inf') else max(0, int(until - now))
-                result.append({"key": item, "remaining_seconds": remaining, "duration": info.get("duration", 0), "reason": info.get("reason", "")})
-            return result
-
-    def is_key_disabled(self, item: str) -> bool:
-        """检查某个 key 是否被禁用
-        
-        Args:
-            item: API key
-            
-        Returns:
-            bool: 如果 key 被禁用返回 True，否则返回 False
-        """
-        return item in self.disabled_keys
-    
-    def set_key_disabled(self, item: str, disabled: bool = True):
-        """设置某个 key 的禁用状态
-        
-        Args:
-            item: API key
-            disabled: True 表示禁用，False 表示启用
-        """
-        if disabled:
-            self.disabled_keys.add(item)
-        else:
-            self.disabled_keys.discard(item)
-    
-    def update_disabled_keys(self, disabled_keys: set):
-        """更新禁用的 key 集合
-        
-        Args:
-            disabled_keys: 新的禁用 key 集合
-        """
-        self.disabled_keys = set(disabled_keys) if disabled_keys else set()
-
-    async def is_rate_limited(self, item, model: str = None, is_check: bool = False) -> bool:
-        now = time()
-        # 检查是否被禁用
-        if self.is_key_disabled(item):
-            return True
-        # 检查是否在冷却中
-        if now < self.cooling_until[item]:
-            return True
-
-        # 获取适用的速率限制
-
-        if model:
-            model_key = model
-        else:
-            model_key = "default"
-
-        rate_limit = None
-        matched_default = False
-        # 先尝试精确匹配
-        if model and model in self.rate_limits:
-            rate_limit = self.rate_limits[model]
-        else:
-            # 如果没有精确匹配，尝试模糊匹配
-            for limit_model in self.rate_limits:
-                if limit_model != "default" and model and limit_model in model:
-                    rate_limit = self.rate_limits[limit_model]
-                    break
-
-        # 如果都没匹配到，使用默认值
-        if rate_limit is None:
-            rate_limit = self.rate_limits.get("default", [(999999, 60)])  #默认限制
-            matched_default = True
-
-        # 检查所有速率限制条件
-        for limit_count, limit_period in rate_limit:
-            if matched_default:
-                # default 规则：跨所有模型汇总计数，作为该 key 的总量限制
-                recent_requests = sum(
-                    1 for mk_reqs in self.requests[item].values()
-                    for req in mk_reqs if req > now - limit_period
-                )
-            else:
-                # 模型特定规则：仅计算该模型的请求数
-                recent_requests = sum(1 for req in self.requests[item][model_key] if req > now - limit_period)
-            if recent_requests >= limit_count:
-                if not is_check:
-                    logger.warning(f"API key {item}: model: {model_key} has been rate limited ({limit_count}/{limit_period} seconds)")
-                return True
-
-        # 清理太旧的请求记录
-        max_period = max(period for _, period in rate_limit)
-        self.requests[item][model_key] = [req for req in self.requests[item][model_key] if req > now - max_period]
-
-        # 记录新的请求
-        if not is_check:
-            self.requests[item][model_key].append(now)
-
-        return False
-
-
-    async def next(self, model: str = None):
-        async with self.lock:
-            if self.schedule_algorithm == "fixed_priority":
-                self.index = 0
-
-            # 检查是否即将完成一个循环，并据此触发重排序
-            if self.schedule_algorithm == "smart_round_robin" and len(self.items) > 0 and self.index == len(self.items) - 1:
-                self._trigger_reorder()
-
-            start_index = self.index
-            while True:
-                item = self.items[self.index]
-                self.index = (self.index + 1) % len(self.items)
-
-                if not await self.is_rate_limited(item, model):
-                    return item
-
-                # 如果已经检查了所有的 API key 都被限制
-                if self.index == start_index:
-                    logger.warning("All API keys are rate limited!")
-                    raise HTTPException(status_code=429, detail="Too many requests")
-
-    async def is_tpr_exceeded(self, model: str = None, tokens: int = 0) -> bool:
-        """Checks if the request exceeds the TPR (Tokens Per Request) limit."""
-        if not tokens:
-            return False
-
-        async with self.lock:
-            rate_limit = None
-            model_key = model or "default"
-            if model and model_key in self.rate_limits:
-                rate_limit = self.rate_limits[model_key]
-            else:
-                # fuzzy match
-                for limit_model in self.rate_limits:
-                    if limit_model != "default" and model and limit_model in model:
-                        rate_limit = self.rate_limits[limit_model]
-                        break
-            if rate_limit is None:
-                rate_limit = self.rate_limits.get("default", [])
-
-            for limit_count, limit_period in rate_limit:
-                if limit_period == -1:  # TPR limit
-                    if tokens > limit_count:
-                        # logger.warning(f"API provider for model {model_key} exceeds TPR limit ({tokens}/{limit_count}).")
-                        return True
-        return False
-
-    async def is_all_rate_limited(self, model: str = None) -> bool:
-        """检查是否所有的items都被速率限制
-
-        与next方法不同，此方法不会改变任何内部状态（如self.index），
-        仅返回一个布尔值表示是否所有的key都被限制。
-
-        Args:
-            model: 要检查的模型名称，默认为None
-
-        Returns:
-            bool: 如果所有items都被速率限制返回True，否则返回False
-        """
-        if len(self.items) == 0:
-            return False
-
-        async with self.lock:
-            for item in self.items:
-                # 跳过禁用的 key
-                if self.is_key_disabled(item):
-                    continue
-                if not await self.is_rate_limited(item, model, is_check=True):
-                    return False
-
-            # 如果遍历完所有items都被限制，返回True
-            # logger.debug(f"Check result: all items are rate limited!")
-            return True
-    
-    def get_enabled_items_count(self) -> int:
-        """返回启用的项目数量。
-
-        排除配置禁用和运行时自动禁用（未过期）的 Key。
-        对 auto_disabled_info 中已过期的记录不计入禁用。
-
-        Returns:
-            int: 启用的 items 数量
-        """
-        now = time()
-        return len([item for item in self.items
-                    if not self.is_key_disabled(item) and not (
-                        item in self.auto_disabled_info and now < self.cooling_until.get(item, 0)
-                    )])
-
-    async def after_next_current(self):
-        # 返回当前取出的 API，因为已经调用了 next，所以当前API应该是上一个
-        if len(self.items) == 0:
-            return None
-        async with self.lock:
-            item = self.items[(self.index - 1) % len(self.items)]
-            return item
-
-    def get_items_count(self) -> int:
-        """返回列表中的项目数量
-
-        Returns:
-            int: items列表的长度
-        """
-        return len(self.items)
-
-def circular_list_encoder(obj):
-    if isinstance(obj, ThreadSafeCircularList):
-        return obj.to_dict()
-    raise TypeError(f'Object of type {obj.__class__.__name__} is not JSON serializable')
-
-provider_api_circular_list = defaultdict(ThreadSafeCircularList)
-
-
-class ApiKeyRateLimitRegistry(dict):
-    """
-    API Key 限流器注册表
-    
-    按需自动创建限流器，解决动态添加 API key 时没有对应限流器的问题。
-    继承 dict 并重写 __missing__，在访问不存在的 key 时自动创建正确配置的限流器。
-    """
-    
-    def __init__(self, config_getter, api_list_getter):
-        """
-        Args:
-            config_getter: 获取当前配置的函数，返回 app.state.config
-            api_list_getter: 获取当前 API 列表的函数，返回 app.state.api_list
-        """
-        super().__init__()
-        self._config_getter = config_getter
-        self._api_list_getter = api_list_getter
-    
-    def __missing__(self, api_key: str):
-        """
-        当访问不存在的 key 时自动创建限流器
-        """
-        config = self._config_getter()
-        api_list = self._api_list_getter()
-        
-        # 查找 API key 的配置
-        try:
-            api_index = api_list.index(api_key)
-            rate_limit = safe_get(
-                config, 'api_keys', api_index, "preferences", "rate_limit",
-                default={"default": "999999/min"}
-            )
-        except (ValueError, IndexError):
-            # 找不到配置，使用默认限流
-            rate_limit = {"default": "999999/min"}
-        
-        # 创建限流器并缓存
-        limiter = ThreadSafeCircularList(
-            [api_key],
-            rate_limit,
-            "round_robin"
-        )
-        self[api_key] = limiter
-        return limiter
-
-
-# end_of_line = "\n\r\n"
-# end_of_line = "\r\n"
-# end_of_line = "\n\r"
-end_of_line = "\n\n"
-# end_of_line = "\r"
-# end_of_line = "\n"
-
-async def generate_sse_response(
-    timestamp,
-    model,
-    content=None,
-    tools_id=None,
-    function_call_name=None,
-    function_call_content=None,
-    role=None,
-    total_tokens=0,
-    prompt_tokens=0,
-    completion_tokens=0,
-    reasoning_content=None,
-    stop=None,
-    thought_signature=None
-):
-    """
-    生成 OpenAI Chat Completions 格式的 SSE 响应
-    
-    Args:
-        timestamp: 时间戳
-        model: 模型名称
-        content: 文本内容
-        tools_id: 工具调用 ID
-        function_call_name: 函数名称
-        function_call_content: 函数参数内容
-        role: 角色（首个 chunk 发送）
-        total_tokens: 总 token 数（用于 usage chunk）
-        prompt_tokens: 输入 token 数
-        completion_tokens: 输出 token 数
-        reasoning_content: 推理内容
-        stop: 停止原因（如 "stop", "tool_calls"）
-        thought_signature: Gemini 思考签名
-    """
-    random.seed(timestamp)
-    random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
-
-    # 构建 delta 内容（按优先级处理，互斥情况）
-    delta_content = {}
-    finish_reason = None
-    
-    # 优先级 1：显式的停止信号
-    if stop:
-        delta_content = {}
-        finish_reason = stop
-    # 优先级 2：usage chunk（无 choices）
-    elif total_tokens:
-        # usage chunk 会清空 choices，不需要设置 delta
-        pass
-    # 优先级 3：角色声明（首个 chunk）
-    elif role and not content and not function_call_content and not function_call_name:
-        delta_content = {"role": role, "content": ""}
-    # 优先级 4：工具调用开始（有 tools_id 和 function_call_name）
-    elif tools_id and function_call_name:
-        tc = {
-            "index": 0,
-            "id": tools_id,
-            "type": "function",
-            "function": {"name": function_call_name, "arguments": ""}
-        }
-        if thought_signature:
-            tc["extra_content"] = {"google": {"thoughtSignature": thought_signature}}
-        delta_content = {"tool_calls": [tc]}
-    # 优先级 5：工具调用参数流式输出
-    elif function_call_content is not None:
-        # 确保 arguments 是字符串（OpenAI 格式要求）
-        if isinstance(function_call_content, dict):
-            args_str = json.dumps(function_call_content, ensure_ascii=False)
-        else:
-            args_str = str(function_call_content) if function_call_content else ""
-        delta_content = {"tool_calls": [{"index": 0, "function": {"arguments": args_str}}]}
-    # 优先级 6：推理内容
-    elif reasoning_content:
-        delta_content = {"role": "assistant", "content": "", "reasoning_content": reasoning_content}
-        if thought_signature:
-            delta_content["thought_signature"] = thought_signature
-    # 优先级 7：普通文本内容（支持 string 或结构化 list）
-    elif content is not None and content != "":
-        delta_content = {"role": "assistant", "content": content}
-        if thought_signature:
-            delta_content["thought_signature"] = thought_signature
-    # 优先级 8：空 chunk（无内容）→ 结束信号
-    else:
-        delta_content = {}
-        finish_reason = "stop"
-
-    sample_data = {
-        "id": f"chatcmpl-{random_str}",
-        "object": "chat.completion.chunk",
-        "created": timestamp,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "delta": delta_content,
-                "logprobs": None,
-                "finish_reason": finish_reason
-            }
-        ],
-        "usage": None,
-        "system_fingerprint": "fp_d576307f90",
-    }
-    
-    # usage chunk 特殊处理：清空 choices，设置 usage
-    if total_tokens:
-        sample_data["usage"] = {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens
-        }
-        sample_data["choices"] = []
-
-    json_data = json_dumps_text(sample_data, ensure_ascii=False)
-    sse_response = f"data: {json_data}" + end_of_line
-
-    return sse_response
-
-async def generate_no_stream_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0, reasoning_content=None, image_base64=None, thought_signature=None, return_dict: bool = False):
-
-    random.seed(timestamp)
-    random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
-    message = {
-        "role": role,
-        "content": content,
-        "refusal": None
-    }
-    if reasoning_content:
-        message["reasoning_content"] = reasoning_content
-    
-    if thought_signature:
-        message["thought_signature"] = thought_signature
-
-    sample_data = {
-        "id": f"chatcmpl-{random_str}",
-        "object": "chat.completion",
-        "created": timestamp,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": message,
-                "logprobs": None,
-                "finish_reason": "stop"
-            }
-        ],
-        "usage": None,
-        "system_fingerprint": "fp_a7d06e42a7"
-    }
-
-    if function_call_name:
-        if not tools_id:
-            tools_id = f"call_{random_str}"
-
-        arguments_json = json_dumps_text(function_call_content, ensure_ascii=False)
-
-        sample_data = {
-            "id": f"chatcmpl-{random_str}",
-            "object": "chat.completion",
-            "created": timestamp,
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": tools_id,
-                            "type": "function",
-                            "function": {
-                                "name": function_call_name,
-                                "arguments": arguments_json
-                            },
-                            "extra_content": {"google": {"thoughtSignature": thought_signature}} if thought_signature else None
-                        }
-                    ],
-                    "refusal": None
-                    },
-                    "logprobs": None,
-                    "finish_reason": "tool_calls"
-                }
-            ],
-            "usage": None,
-            "service_tier": "default",
-            "system_fingerprint": "fp_4691090a87"
-        }
-
-    if image_base64:
-        sample_data = {
-            "created": timestamp,
-            "data": [{
-                "b64_json": image_base64
-            }],
-        }
-        
-        # Images responses don't have usage, so we just clear it
-        total_tokens = None
-
-    if total_tokens:
-        sample_data["usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}
-
-    if return_dict:
-        return sample_data
-
-    json_data = json_dumps_text(sample_data, ensure_ascii=False)
-    # print("json_data", json.dumps(sample_data, indent=4, ensure_ascii=False))
-
-    return json_data
-
-def get_image_format(file_content: bytes):
-    try:
-        with Image.open(io.BytesIO(file_content)) as img:
-            img_format = (img.format or "").lower()
-        return img_format or None
-    except Exception:
-        return None
-
-def encode_image(file_content: bytes):
-    img_format = get_image_format(file_content)
-    if not img_format:
-        raise ValueError("无法识别的图片格式")
-    base64_encoded = base64.b64encode(file_content).decode('utf-8')
-
-    if img_format == 'png':
-        return f"data:image/png;base64,{base64_encoded}"
-    elif img_format in ['jpg', 'jpeg']:
-        return f"data:image/jpeg;base64,{base64_encoded}"
-    else:
-        raise ValueError(f"不支持的图片格式: {img_format}")
-
-async def get_image_from_url(url):
-    try:
-        content, _ = await fetch_url_content(url)
-        return content
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"获取 URL 时发生错误: {url}: {e}")
-        raise HTTPException(status_code=400, detail=f"无法从 URL 获取内容: {url}")
-
-async def get_encode_image(image_url):
-    file_content = await get_image_from_url(image_url)
-    base64_image = await asyncio.to_thread(encode_image, file_content)
-    return base64_image
-
-
-def _convert_webp_base64_to_png(base64_image: str) -> tuple[str, str]:
-    image_data = base64.b64decode(extract_base64_data(base64_image))
-    with Image.open(io.BytesIO(image_data)) as image:
-        png_buffer = io.BytesIO()
-        image.save(png_buffer, format="PNG")
-    png_base64 = base64.b64encode(png_buffer.getvalue()).decode('utf-8')
-    return f"data:image/png;base64,{png_base64}", "image/png"
-
-
-def _prepare_image_for_upload(base64_image: str, max_size_mb: float) -> dict:
-    base64_data = extract_base64_data(base64_image)
-    image_size_bytes = len(base64_data) * 3 // 4
-    image_size_mb = image_size_bytes / (1024 * 1024)
-    result = {
-        "base64_data": base64_data,
-        "original_size_mb": image_size_mb,
-        "compressed": False,
-        "compressed_size_mb": image_size_mb,
-        "size": None,
-    }
-
-    if image_size_mb <= max_size_mb:
-        return result
-
-    image_bytes = base64.b64decode(base64_data)
-    with Image.open(io.BytesIO(image_bytes)) as img:
-        scale = (max_size_mb / image_size_mb) ** 0.5
-        new_width = max(1, int(img.width * scale))
-        new_height = max(1, int(img.height * scale))
-        resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        output = io.BytesIO()
-        if resized.mode in ('RGBA', 'LA', 'P'):
-            resized = resized.convert('RGB')
-        resized.save(output, format='JPEG', quality=85, optimize=True)
-    compressed_base64 = base64.b64encode(output.getvalue()).decode('utf-8')
-    compressed_size_mb = len(compressed_base64) * 3 // 4 / (1024 * 1024)
-    result.update({"base64_data": compressed_base64, "compressed": True, "compressed_size_mb": compressed_size_mb, "size": (new_width, new_height)})
-    return result
-
-# from PIL import Image
-# import io
-# def validate_image(image_data, image_type):
-#     try:
-#         decoded_image = base64.b64decode(image_data)
-#         image = Image.open(io.BytesIO(decoded_image))
-
-#         # 检查图片格式是否与声明的类型匹配
-#         # print("image.format", image.format)
-#         if image_type == "image/png" and image.format != "PNG":
-#             raise ValueError("Image is not a valid PNG")
-#         elif image_type == "image/jpeg" and image.format not in ["JPEG", "JPG"]:
-#             raise ValueError("Image is not a valid JPEG")
-
-#         # 如果没有异常,则图片有效
-#         return True
-#     except Exception as e:
-#         print(f"Image validation failed: {str(e)}")
-#         return False
-
-async def get_base64_image(image_url: str) -> tuple[str, str]:
-    """
-    获取 base64 编码的图片数据和 MIME 类型
-    
-    Args:
-        image_url: 图片 URL 或已编码的 base64 字符串
-        
-    Returns:
-        tuple: (base64_image_with_prefix, mime_type)
-               例如: ("data:image/png;base64,xxx", "image/png")
-    """
-    from .file_utils import get_base64_file
-    base64_image, image_type = await get_base64_file(image_url)
-
-    if not image_type.startswith("image/"):
-        raise ValueError(f"Expected an image MIME type, but got: {image_type}")
-
-    # 将 webp 转换为 png（某些 API 不支持 webp）
-    if image_type == "image/webp":
-        base64_image, image_type = await asyncio.to_thread(_convert_webp_base64_to_png, base64_image)
-
-    return base64_image, image_type
-
-def parse_json_safely(json_str):
-    """
-    尝试解析JSON字符串，先使用ast.literal_eval，失败则使用json.loads
-
-    Args:
-        json_str: 要解析的JSON字符串
-
-    Returns:
-        解析后的Python对象
-
-    Raises:
-        Exception: 当两种方法都失败时抛出异常
-    """
-    try:
-        # 首先尝试使用ast.literal_eval解析
-        return ast.literal_eval(json_str)
-    except (SyntaxError, ValueError):
-        try:
-            # 如果失败，尝试使用json.loads解析
-            return json.loads(json_str, strict=False)
-        except json.JSONDecodeError as e:
-            # 两种方法都失败，抛出异常
-            raise Exception(f"无法解析JSON字符串: {e}, {json_str}")
-
-async def upload_image_to_0x0st(base64_image: str, max_size_mb: float = 10.0):
-    """
-    图床上传链路已暂时关闭。
-
-    当前统一返回 None，让上层稳定走 inline base64 回退路径。
-    保留此函数签名，便于后续按需恢复或切换其他上传方案。
-    """
-    _ = base64_image
-    _ = max_size_mb
-    logger.info("[upload_image] External image upload is disabled. Use inline base64 instead.")
-    return None
-
-
-
-
-
-
-if __name__ == "__main__":
-    provider = {
-        "base_url": "https://gateway.ai.cloudflare.com/v1/%7Baccount_id%7D/%7Bgateway_id%7D/google-vertex-ai",
-        "engine": "vertex",
-    }
-    print(get_engine(provider))
-

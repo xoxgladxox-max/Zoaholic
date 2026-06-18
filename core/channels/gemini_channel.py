@@ -9,6 +9,7 @@ import json
 import copy
 import asyncio
 from datetime import datetime
+from uuid import uuid4
 
 from ..models import Message
 from ..utils import (
@@ -25,6 +26,7 @@ from ..response import check_response
 from ..json_utils import json_loads, json_dumps_text
 from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
 from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
 from ..file_utils import extract_base64_data
 from urllib.parse import urlparse
 
@@ -642,6 +644,10 @@ def gemini_json_process(response_json):
     content_parts = []
     function_call_name = None
     function_full_response = None
+    # 修改原因：Gemini parts 中可能出现多个 functionCall，旧返回值只能保存第一个。
+    # 修改方式：继续保留旧的 function_call_name/function_full_response，同时新增 function_calls_list 收集全部调用。
+    # 目的：让流式和非流式出口都能逐个分配唯一 id 与独立 index。
+    function_calls_list = []
 
     json_data = safe_get(response_json, "candidates", 0, "content", default=None)
     finishReason = safe_get(response_json, "candidates", 0, "finishReason", default=None)
@@ -677,10 +683,18 @@ def gemini_json_process(response_json):
             if b64_json:
                 image_base64 = b64_json
         
-        # 处理函数调用 (只取第一个)
-        if "functionCall" in part and function_call_name is None:
-            function_call_name = safe_get(part, "functionCall", "name", default=None)
-            function_full_response = safe_get(part, "functionCall", "args", default=None)
+        # 处理函数调用
+        if "functionCall" in part:
+            current_function_call_name = safe_get(part, "functionCall", "name", default=None)
+            current_function_full_response = safe_get(part, "functionCall", "args", default=None)
+            if current_function_call_name:
+                function_calls_list.append({
+                    "name": current_function_call_name,
+                    "args": current_function_full_response,
+                })
+            if function_call_name is None:
+                function_call_name = current_function_call_name
+                function_full_response = current_function_full_response
 
     if finishReason:
         promptTokenCount = safe_get(response_json, "usageMetadata", "promptTokenCount", default=0)
@@ -705,7 +719,7 @@ def gemini_json_process(response_json):
     if not blockReason:
         blockReason = safe_get(response_json, "candidates", 0, "blockReason", default=None)
 
-    return is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature
+    return is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature, function_calls_list
 
 
 async def fetch_gemini_response(client, url, headers, payload, model, timeout):
@@ -735,16 +749,32 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
     # 检查 blockReason
     if isinstance(parsed_data, list) and len(parsed_data) > 0:
         first_resp = parsed_data[0]
-        is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature = gemini_json_process(first_resp)
+        is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature, function_calls_list = gemini_json_process(first_resp)
         
         if blockReason and blockReason != "STOP":
             msg = _extract_gemini_block_message(first_resp) or blockReason
-            yield {"error": f"Gemini Blocked: {blockReason}", "status_code": 400, "details": msg}
+            yield {
+                "error": {
+                    "message": f"This request was blocked by Gemini safety filters: {msg} (Reason: {blockReason})",
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": "content_filter"
+                },
+                "status_code": 400
+            }
             return
         
         if not safe_get(first_resp, "candidates") and blockReason:
             msg = _extract_gemini_block_message(first_resp) or blockReason
-            yield {"error": f"Gemini Blocked: {blockReason}", "status_code": 400, "details": msg}
+            yield {
+                "error": {
+                    "message": f"This request was blocked by Gemini safety filters: {msg} (Reason: {blockReason})",
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": "content_filter"
+                },
+                "status_code": 400
+            }
             return
 
         # 获取 usage (可能在最后一个响应对象中)
@@ -755,16 +785,19 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
         total_tokens = safe_get(usage_metadata, "totalTokenCount", default=totalTokenCount)
 
         mark_adapter_metrics_managed()
+        # Gemini 的 cachedContentTokenCount 与普通 token 同在 usageMetadata，需要同步写入日志统计和下游响应。
+        cache_usage = extract_cache_usage(usage_metadata)
         merge_usage(
             prompt_tokens=prompt_tokens,
             completion_tokens=candidates_tokens,
             total_tokens=total_tokens,
+            **cache_usage,
         )
 
         # 检查是否返回了有效内容
         has_content = content and content.strip()
         has_reasoning = reasoning_content and reasoning_content.strip()
-        has_function_call = function_call_name is not None
+        has_function_call = bool(function_calls_list)
         has_image = image_base64 is not None
         
         is_image_model = _is_image_model(model)
@@ -820,12 +853,37 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
         if has_content or has_reasoning or has_image or has_function_call:
             mark_content_start()
 
+        # 修改原因：Gemini 非流式返回多个 functionCall 时，旧调用只会把第一个工具传给统一出口。
+        # 修改方式：把 gemini_json_process 收集到的全部 functionCall 转为 OpenAI tool_calls_list，并为每项生成唯一 call_ id。
+        # 目的：避免多个 Gemini 工具调用共享固定 id 或丢失 index。
+        tool_calls_list = []
+        for function_index, function_call in enumerate(function_calls_list):
+            arguments = function_call.get("args")
+            if not isinstance(arguments, str):
+                arguments = json_dumps_text(arguments, ensure_ascii=False)
+            tool_call = {
+                "index": function_index,
+                "id": f"call_{uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": function_call.get("name", ""),
+                    "arguments": arguments,
+                },
+            }
+            if thought_signature:
+                tool_call["extra_content"] = {"google": {"thoughtSignature": thought_signature}}
+            tool_calls_list.append(tool_call)
+
         yield await generate_no_stream_response(
-            timestamp, model, content=content, tools_id=None, 
-            function_call_name=function_call_name, function_call_content=function_full_response, 
-            role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, 
-            completion_tokens=candidates_tokens, reasoning_content=reasoning_content, 
-            image_base64=image_base64, thought_signature=thought_signature, return_dict=True
+            timestamp, model, content=content,
+            role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens,
+            completion_tokens=candidates_tokens, reasoning_content=reasoning_content,
+            image_base64=image_base64, thought_signature=thought_signature,
+            # 非流式 Gemini 输出需要继续携带缓存命中字段，供 OAI 与下游方言转换使用。
+            cached_tokens=cache_usage["cached_tokens"],
+            cache_creation_tokens=cache_usage["cache_creation_tokens"],
+            return_dict=True,
+            tool_calls_list=tool_calls_list or None,
         )
         return
 
@@ -843,6 +901,8 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
         promptTokenCount = 0
         candidatesTokenCount = 0
         totalTokenCount = 0
+        # 流式 Gemini 的缓存命中数量跟随 usageMetadata 出现，跨 chunk 保留后写入 current_info。
+        cachedContentTokenCount = 0
         parts_json = ""
         
         # 用于追踪整个流中是否有有效内容
@@ -851,6 +911,10 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
         has_function_call = False  # 是否有函数调用
         has_reasoning = False  # 是否有思维链
         stream_finished_normally = False  # 是否正常结束
+        # 修改原因：Gemini 流式响应的一个 chunk 可能包含多个 functionCall，旧实现固定工具 id 且无法递增 index。
+        # 修改方式：用 tc_index 为每个 functionCall 分配 OpenAI tool_call_index，并用 uuid4 生成唯一 call_ id。
+        # 目的：让并行工具调用的工具头和参数片段保持一一对应。
+        tc_index = 0
 
         async for line in aiter_decoded_lines(response.aiter_bytes()):
             if not line:
@@ -871,31 +935,36 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
                     continue
 
             # https://ai.google.dev/api/generate-content?hl=zh-cn#FinishReason
-            is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature = gemini_json_process(response_json)
+            is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature, function_calls_list = gemini_json_process(response_json)
                 
             # 调试日志：记录每个 chunk 的关键信息
             from ..log_config import logger
             if image_base64:
                     # 注意：避免在此处直接打印或使用 image_base64，它可能是一个极大的字符串
                 logger.debug(f"[Gemini] image_base64 received, length={len(image_base64)}, finish={finishReason}")
+            # 追踪有效内容（必须在 finishReason 判断之外，每个 chunk 都检查）
+            if is_thinking and reasoning_content:
+                has_reasoning = True
+            if content and content.strip():
+                has_content = True
+            if image_base64:
+                has_image = True
+            if function_calls_list:
+                has_function_call = True
+
             if finishReason:
                 logger.debug(f"[Gemini] finishReason={finishReason}, has_image={bool(image_base64)}, len={len(content) if content else 0}")
 
-                # 追踪有效内容
-                if is_thinking and reasoning_content:
-                    has_reasoning = True
-                if content and content.strip():
-                    has_content = True
-                if image_base64:
-                    has_image = True
-                if function_call_name:
-                    has_function_call = True
-
             if totalTokenCount > 0 or promptTokenCount > 0 or candidatesTokenCount > 0:
+                _cache_usage = extract_cache_usage(safe_get(response_json, "usageMetadata", default={}) or {})
+                if _cache_usage["cached_tokens"]:
+                    cachedContentTokenCount = _cache_usage["cached_tokens"]
                 merge_usage(
                     prompt_tokens=promptTokenCount,
                     completion_tokens=candidatesTokenCount,
                     total_tokens=totalTokenCount,
+                    cached_tokens=cachedContentTokenCount,
+                    cache_creation_tokens=_cache_usage["cache_creation_tokens"],
                 )
 
             if is_thinking:
@@ -932,23 +1001,71 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
 
 
 
-            if function_call_name:
+            for function_call in function_calls_list:
+                function_call_name = function_call.get("name", "")
+                if not function_call_name:
+                    continue
+                current_tc_index = tc_index
+                tc_index += 1
+                function_call_id = f"call_{uuid4().hex[:24]}"
+                function_full_response = function_call.get("args")
+                if not isinstance(function_full_response, str):
+                    function_full_response = json_dumps_text(function_full_response, ensure_ascii=False)
                 mark_content_start()
-                sse_string = await generate_sse_response(timestamp, model, content=None, tools_id="chatcmpl-9inWv0yEtgn873CxMBzHeCeiHctTV", function_call_name=function_call_name, thought_signature=thought_signature)
+                sse_string = await generate_sse_response(
+                    timestamp, model, content=None, tools_id=function_call_id,
+                    function_call_name=function_call_name, thought_signature=thought_signature,
+                    tool_call_index=current_tc_index,
+                )
                 yield sse_string
-            if function_full_response:
                 mark_content_start()
-                sse_string = await generate_sse_response(timestamp, model, content=None, tools_id="chatcmpl-9inWv0yEtgn873CxMBzHeCeiHctTV", function_call_name=None, function_call_content=function_full_response, thought_signature=thought_signature)
+                sse_string = await generate_sse_response(
+                    timestamp, model, content=None, tools_id=function_call_id,
+                    function_call_name=None, function_call_content=function_full_response,
+                    thought_signature=thought_signature, tool_call_index=current_tc_index,
+                )
                 yield sse_string
 
 
             if parts_json == "[]" or (blockReason and blockReason != "STOP"):
                 msg = _extract_gemini_block_message(response_json) or (blockReason or "Empty Response")
-                yield {"error": f"Gemini Blocked: {blockReason or 'Empty Response'}", "status_code": 400, "details": msg}
+                mark_content_start()
+                # 1. 方案 B：发送带拒绝理由的普通 content 加上 finish_reason="content_filter"
+                sse_content_filter = await generate_sse_response(
+                    timestamp, model, content=f"\n[Gemini Safety Block] {msg} (Reason: {blockReason or 'SAFETY'})\n", stop="content_filter"
+                )
+                yield sse_content_filter
+
+                # 2. 方案 C：追加标准的 OAI Error 裸 chunk
+                err_payload = {
+                    "error": {
+                        "message": f"This request was blocked by Gemini safety filters: {msg} (Reason: {blockReason or 'SAFETY'})",
+                        "type": "invalid_request_error",
+                        "param": None,
+                        "code": "content_filter"
+                    }
+                }
+                yield f"data: {json_dumps_text(err_payload, ensure_ascii=False)}\n\n"
                 return
             elif finishReason and finishReason not in ["STOP", "MAX_TOKENS"]:
                 # 非正常结束原因（如 SAFETY, RECITATION 等）
-                yield {"error": f"Gemini Finish Reason: {finishReason}", "status_code": 400, "details": f"{finishReason}"}
+                mark_content_start()
+                # 1. 方案 B：发送带拒绝理由的普通 content 加上 finish_reason="content_filter"
+                sse_content_filter = await generate_sse_response(
+                    timestamp, model, content=f"\n[Gemini Safety Block] Restricted generation due to {finishReason}\n", stop="content_filter"
+                )
+                yield sse_content_filter
+
+                # 2. 方案 C：追加标准的 OAI Error 裸 chunk
+                err_payload = {
+                    "error": {
+                        "message": f"Gemini generation stopped by safety filter. Finish Reason: {finishReason}",
+                        "type": "invalid_request_error",
+                        "param": None,
+                        "code": "content_filter"
+                    }
+                }
+                yield f"data: {json_dumps_text(err_payload, ensure_ascii=False)}\n\n"
                 return
             elif finishReason:
                 # 正常结束（STOP 或 MAX_TOKENS）
@@ -1005,7 +1122,13 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
         
         # 发送 usage chunk（如果有）
         if totalTokenCount > 0:
-            sse_string = await generate_sse_response(timestamp, model, None, None, None, None, None, totalTokenCount, promptTokenCount, candidatesTokenCount)
+            sse_string = await generate_sse_response(
+                timestamp, model, None, None, None, None, None,
+                totalTokenCount, promptTokenCount, candidatesTokenCount,
+                # 流式 Gemini 最终 usage chunk 需要带回跨 chunk 保存的 cachedContentTokenCount。
+                cached_tokens=cachedContentTokenCount,
+                cache_creation_tokens=0,
+            )
             yield sse_string
 
     yield "data: [DONE]" + end_of_line
@@ -1097,4 +1220,5 @@ def register():
         response_adapter=fetch_gemini_response,
         stream_adapter=fetch_gemini_response_stream,
         models_adapter=fetch_gemini_models,
+        source="builtin",
     )

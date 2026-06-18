@@ -13,12 +13,15 @@ Claude Tools 插件
 - -code: 启用 code_execution 工具
 - -computer: 启用 computer_use 工具（beta）
 - -artifacts: 启用 artifacts 工具
+- -fast: 启用 fast mode（speed=fast + beta header）
 
 使用方式：
 - claude-sonnet-4-thinking → 启用思考模式
 - claude-sonnet-4-thinking-32768 → 启用思考模式，budget=32768
 - claude-sonnet-4-search → 启用搜索
 - claude-sonnet-4-thinking-search → 同时启用思考和搜索
+- claude-opus-4-fast → 启用 fast mode
+- claude-sonnet-4-thinking-fast → 思考 + fast mode
 """
 
 import re
@@ -34,14 +37,27 @@ from core.plugins import (
 # 插件元信息
 PLUGIN_INFO = {
     "name": "claude_tools",
-    "version": "1.0.0",
-    "description": "Claude 后缀工具插件 — 在模型名后追加 -thinking/-search/-code/-computer/-artifacts 等后缀，自动注入对应的原生 Claude API 参数。后缀可自由组合，如 claude-sonnet-4-thinking-search。",
+    "version": "1.1.0",
+    "description": "Claude 后缀工具 + 自动缓存。模型名后缀 -thinking/-search/-code/-fast 等自动注入 API 参数；cache 参数自动注入 prompt caching（客户端已带则跳过）。",
     "author": "Zoaholic Team",
     "dependencies": [],
     "metadata": {
         "category": "interceptors",
-        "tags": ["claude", "anthropic", "thinking", "tools"],
-        "params_hint": "无需参数。后缀直接写在模型名后: -thinking[-N] / -search / -code / -computer / -artifacts",
+        "tags": ["claude", "anthropic", "thinking", "tools", "cache"],
+        "params_hint": "cache=5m | cache=1h（自动注入 prompt caching，客户端自带则跳过）。模型后缀无需在此配置，直接写在模型名后即可。",
+        "params_schema": [
+            {
+                "key": "cache",
+                "label": "Prompt Caching",
+                "type": "select",
+                "options": [
+                    {"value": "", "label": "不启用"},
+                    {"value": "5m", "label": "5 分钟 (写入1.25x, 读取0.1x)"},
+                    {"value": "1h", "label": "1 小时 (写入2x, 读取0.1x)"},
+                ],
+                "default": "",
+            },
+        ],
     },
 }
 
@@ -57,13 +73,16 @@ SUPPORTED_SUFFIXES = {
     "-code": "code",
     "-computer": "computer",
     "-artifacts": "artifacts",
+    "-fast": "fast",
 }
 
 # 默认的 thinking budget tokens
 DEFAULT_THINKING_BUDGET = 16384
 
-# thinking 后缀的正则（支持 -thinking 和 -thinking-N 格式）
-THINKING_PATTERN = re.compile(r"-thinking(?:-(\d+))?$", re.IGNORECASE)
+# thinking 后缀正则（支持 -thinking / -thinking-N / -thinking-{effort} 格式）
+# effort 级别: max, xhigh, high, medium, low
+THINKING_PATTERN = re.compile(r"-thinking(?:-(\d+|max|xhigh|high|medium|low))?$", re.IGNORECASE)
+_VALID_EFFORTS = {"max", "xhigh", "high", "medium", "low"}
 
 
 def parse_model_suffixes(model: str) -> Tuple[str, Set[str], Optional[int]]:
@@ -95,8 +114,13 @@ def parse_model_suffixes(model: str) -> Tuple[str, Set[str], Optional[int]]:
         thinking_match = THINKING_PATTERN.search(remaining)
         if thinking_match:
             enabled_features.add("thinking")
-            if thinking_match.group(1):
-                thinking_budget = int(thinking_match.group(1))
+            param = thinking_match.group(1)
+            if param and param.lower() in _VALID_EFFORTS:
+                # effort 级别名 — 存负数作为标记，apply 时识别
+                thinking_budget = -1  # 哨兵值，表示用 effort 名
+                enabled_features.add(f"effort:{param.lower()}")
+            elif param:
+                thinking_budget = int(param)
             else:
                 thinking_budget = DEFAULT_THINKING_BUDGET
             # 移除 thinking 后缀
@@ -119,48 +143,71 @@ def parse_model_suffixes(model: str) -> Tuple[str, Set[str], Optional[int]]:
 
 def is_claude_engine(engine: str) -> bool:
     """
-    检查是否为 Claude 引擎
-
-    Args:
-        engine: 引擎类型
-
-    Returns:
-        是否为 Claude 引擎
+    检查是否为 Claude 引擎。
+    通过渠道注册表的 type_name 动态判断，不再硬编码白名单。
     """
     if not isinstance(engine, str):
         return False
+    engine_lower = engine.lower()
+    # 直接匹配
+    if engine_lower in ("claude", "anthropic"):
+        return True
+    # 查注册表：type_name 含 "claude" 即视为 Claude 系
+    try:
+        from core.channels.registry import get_channel
+        ch = get_channel(engine_lower)
+        if ch and "claude" in ch.type_name.lower():
+            return True
+    except Exception:
+        pass
+    return False
 
-    claude_engines = {"claude", "anthropic", "vertex-claude", "aws"}
-    return engine.lower() in claude_engines
+
+def _needs_legacy_thinking(model: str) -> bool:
+    """判断模型是否只支持旧版 enabled + budget_tokens 格式。
+    
+    Claude 3.x 系列只支持 type: enabled。
+    4.x 及以后全部支持 adaptive，直接用 adaptive + effort。
+    """
+    model_lower = model.lower() if model else ""
+    return "claude-3" in model_lower
 
 
-def apply_thinking_config(payload: Dict[str, Any], budget_tokens: int) -> None:
+def apply_thinking_config(payload: Dict[str, Any], budget_tokens: int, model: str = "") -> None:
     """
     应用 thinking 配置到 payload
 
-    Claude 原生 thinking 格式：
-    {
-        "thinking": {
-            "type": "enabled",
-            "budget_tokens": 10240
-        }
-    }
+    Claude 4.x+: thinking.type = "adaptive" + output_config.effort
+    Claude 3.x: thinking.type = "enabled" + budget_tokens
 
     Args:
         payload: 请求 payload
         budget_tokens: thinking budget tokens
+        model: 模型名，用于判断用哪种格式
     """
-    payload["thinking"] = {
-        "type": "enabled",
-        "budget_tokens": budget_tokens
-    }
+    if not _needs_legacy_thinking(model):
+        # Claude 4.x+ 统一用 adaptive + effort
+        payload["thinking"] = {"type": "adaptive"}
+        # 从 features 里找 effort 级别，没有则默认 max
+        effort = "max"
+        features = payload.pop("_thinking_features", None) or set()
+        for f in features:
+            if f.startswith("effort:"):
+                effort = f.split(":", 1)[1]
+                break
+        payload.setdefault("output_config", {})["effort"] = effort
+        logger.debug(f"[claude_tools] Applied adaptive thinking: effort={effort}")
+    else:
+        payload["thinking"] = {
+            "type": "enabled",
+            "budget_tokens": budget_tokens
+        }
+        logger.debug(f"[claude_tools] Applied thinking config: budget_tokens={budget_tokens}")
 
     # thinking 模式要求 temperature=1，且不能有 top_p/top_k
     payload["temperature"] = 1
     payload.pop("top_p", None)
     payload.pop("top_k", None)
-
-    logger.debug(f"[claude_tools] Applied thinking config: budget_tokens={budget_tokens}")
 
 
 def apply_tool_config(payload: Dict[str, Any], tool_type: str) -> None:
@@ -189,9 +236,9 @@ def apply_tool_config(payload: Dict[str, Any], tool_type: str) -> None:
     # 注意：type 必须包含版本日期后缀
     tool_mapping = {
         "search": {
-            "type": "web_search_20250305",
+            "type": "web_search_20260209",
             "name": "web_search",
-            "max_uses": 5,  # 限制每次请求最多搜索次数
+            "max_uses": 5,
         },
         "code": {
             "type": "code_execution_20250522",
@@ -212,11 +259,67 @@ def apply_tool_config(payload: Dict[str, Any], tool_type: str) -> None:
 
     tool_config = tool_mapping.get(tool_type)
     if tool_config:
-        # 检查是否已存在相同类型的工具
+        # 检查是否已存在相同 type 或 name 的工具（Anthropic 要求 name 唯一）
         existing_types = {t.get("type") for t in payload["tools"] if isinstance(t, dict)}
-        if tool_config["type"] not in existing_types:
+        existing_names = {t.get("name") for t in payload["tools"] if isinstance(t, dict)}
+        if tool_config["type"] not in existing_types and tool_config.get("name") not in existing_names:
             payload["tools"].append(tool_config.copy())
             logger.debug(f"[claude_tools] Added server tool: {tool_config['type']}")
+
+        # web_search_20260209 内置 dynamic filtering，API 会自动注入 code_execution
+        # 不需要也不应该手动添加，否则与 API 自动注入的或客户端已有的冲突
+        # 参考：https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-reference
+
+
+def _has_cache_control(payload: Dict[str, Any]) -> bool:
+    """检测请求体里是否已有 cache_control（客户端自己管缓存）。"""
+    # 顶层
+    if "cache_control" in payload:
+        return True
+    # system 里
+    system = payload.get("system")
+    if isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and "cache_control" in block:
+                return True
+    # messages 里
+    for msg in payload.get("messages", []):
+        if isinstance(msg, dict):
+            if "cache_control" in msg:
+                return True
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and "cache_control" in block:
+                        return True
+    # tools 里
+    for tool in payload.get("tools", []):
+        if isinstance(tool, dict) and "cache_control" in tool:
+            return True
+    return False
+
+
+def _inject_auto_cache(payload: Dict[str, Any], provider: Dict[str, Any]) -> None:
+    """自动注入顶层 cache_control，走 Anthropic 自动缓存。客户端自带则跳过。"""
+    if _has_cache_control(payload):
+        return
+    # 从 provider preferences 的 enabled_plugins 参数读 TTL
+    # 格式：claude_tools:cache=1h 或 claude_tools:cache=5m
+    ttl = None
+    for plugin_entry in provider.get("preferences", {}).get("enabled_plugins", []):
+        if isinstance(plugin_entry, str) and plugin_entry.startswith("claude_tools"):
+            for part in plugin_entry.split(":")[1:]:
+                if part.startswith("cache="):
+                    ttl = part[6:]  # "1h" 或 "5m"
+                    break
+            break
+    if not ttl:
+        return  # 没配 cache 参数，不注入
+    cc = {"type": "ephemeral"}
+    if ttl == "1h":
+        cc["ttl"] = "1h"
+    payload["cache_control"] = cc
+    logger.debug(f"[claude_tools] Injected auto cache_control: {cc}")
 
 
 def update_anthropic_beta_header(headers: Dict[str, Any], features: Set[str]) -> None:
@@ -243,6 +346,7 @@ def update_anthropic_beta_header(headers: Dict[str, Any], features: Set[str]) ->
         # "search": 不需要 beta header，已是正式功能
         "code": "code-execution-2025-05-22",
         "computer": "computer-use-2025-01-24",
+        "fast": "fast-mode-2026-02-01",
     }
 
     for feature in features:
@@ -288,13 +392,19 @@ async def claude_tools_request_interceptor(
     # 更新模型名（去除后缀）
     payload["model"] = base_model
 
-    # 应用 thinking 配置
-    if "thinking" in features and thinking_budget:
-        apply_thinking_config(payload, thinking_budget)
+    # 应用 thinking 配置（尊重用户 overrides —— payload 里已有 thinking 则跳过）
+    if "thinking" in features and thinking_budget and "thinking" not in payload:
+        payload["_thinking_features"] = features  # 传 effort 级别给 apply_thinking_config
+        apply_thinking_config(payload, thinking_budget, model=base_model)
+
+    # 应用 fast mode
+    if "fast" in features:
+        payload["speed"] = "fast"
+        logger.debug("[claude_tools] Enabled fast mode: speed=fast")
 
     # 应用工具配置
     for feature in features:
-        if feature != "thinking":
+        if feature not in ("thinking", "fast"):
             apply_tool_config(payload, feature)
 
     # 更新 anthropic-beta header
@@ -302,6 +412,11 @@ async def claude_tools_request_interceptor(
 
     logger.debug(f"[claude_tools] Modified payload model: {payload['model']}, "
                  f"thinking: {'thinking' in features}, tools: {payload.get('tools', [])}")
+
+    # === 自动 prompt caching ===
+    # 请求体里已有 cache_control（客户端自己管缓存，如 CC）→ 不动
+    # 没有 → 注入顶层 cache_control，走 Anthropic 自动缓存
+    _inject_auto_cache(payload, provider)
 
     return url, headers, payload
 

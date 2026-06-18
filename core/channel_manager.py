@@ -4,7 +4,6 @@ Channel cooldown manager.
 负责记录 provider/model 冷却状态，并根据冷却时间过滤不可用的 provider。
 """
 
-from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 
@@ -19,7 +18,10 @@ class ChannelManager:
 
     def __init__(self, cooldown_period: int = 3) -> None:
         # key: "provider/model" -> value: datetime 上次被标记不可用的时间
-        self._excluded_models = defaultdict(lambda: None)
+        # 修改原因：defaultdict 会在读取不存在的模型时写入新 key，长期运行会积累无效记录。
+        # 修改方式：改用普通 dict，只在 exclude_model 中显式写入冷却记录。
+        # 目的：避免只读查询扩大冷却表，降低内存泄漏风险。
+        self._excluded_models = {}
         self.cooldown_period = cooldown_period
 
     async def exclude_model(self, provider: str, model: str) -> None:
@@ -39,7 +41,10 @@ class ChannelManager:
             cooldown_period: 冷却时间（秒），如果为 0 则使用实例默认值
         """
         model_key = f"{provider}/{model}"
-        excluded_time = self._excluded_models[model_key]
+        # 修改原因：普通 dict 不能再依赖 defaultdict 的自动创建行为。
+        # 修改方式：读取冷却记录时使用 get，缺失时返回 None。
+        # 目的：保持未命中模型直接判定为未冷却，同时不写入无效 key。
+        excluded_time = self._excluded_models.get(model_key)
         if not excluded_time:
             return False
 

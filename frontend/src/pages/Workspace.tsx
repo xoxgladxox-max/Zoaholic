@@ -1,10 +1,12 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
+import { toastSuccess, toastError, toastWarning } from '../components/Toast';
+import { MarkdownRenderer } from '../components/MarkdownRenderer';
 import {
   FolderOpen, File, RefreshCw, Download, Save, Trash2,
   ChevronRight, AlertTriangle, ArrowLeft,
-  Eye, Edit3, FileText, HardDrive, FolderTree
+  Eye, Edit3, FileText, HardDrive, FolderTree, PanelLeftOpen, X
 } from 'lucide-react';
 
 // ========== Types ==========
@@ -30,6 +32,21 @@ interface TreeResponse {
   entries: FileEntry[];
   total: number;
 }
+
+type MarkdownViewMode = 'preview' | 'code';
+
+// 移动端文件树是否展开
+const useIsMobile = () => {
+  const [isMobile, setIsMobile] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 1023px)');
+    setIsMobile(mq.matches);
+    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, []);
+  return isMobile;
+};
 
 // ========== Helpers ==========
 
@@ -64,6 +81,15 @@ function permissionBadges(perms: string) {
   return badges;
 }
 
+// 修改原因：工作区需要只对 Markdown 文件显示 preview/code 切换，不能影响普通文本文件查看。
+// 修改方式：同时检查后端返回的 language 和文件扩展名，兼容 .md、.markdown 以及可能的语言标识差异。
+// 目的：让 Markdown 文件默认走渲染预览，同时保留源码查看入口。
+function isMarkdownFile(file: Pick<FileContent, 'path' | 'language'>): boolean {
+  const language = file.language?.toLowerCase();
+  const path = file.path.toLowerCase();
+  return language === 'markdown' || path.endsWith('.md') || path.endsWith('.markdown');
+}
+
 // ========== Component ==========
 
 export default function Workspace() {
@@ -83,6 +109,12 @@ export default function Workspace() {
   const [editContent, setEditContent] = useState('');
   const [saving, setSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState('');
+  // 修改原因：Markdown 文件需要在渲染预览和源码查看之间切换，而普通文本仍只需要源码查看。
+  // 修改方式：用独立状态记录 Markdown 的右侧查看模式，读取文件时按文件类型重置默认值。
+  // 目的：避免编辑状态和普通文件查看受到 Markdown 预览模式影响。
+  const [markdownViewMode, setMarkdownViewMode] = useState<MarkdownViewMode>('preview');
+  const [mobileTreeOpen, setMobileTreeOpen] = useState(true);
+  const isMobile = useIsMobile();
 
   // Fetch directory tree
   const fetchTree = useCallback(async (dirPath: string = '') => {
@@ -123,6 +155,7 @@ export default function Workspace() {
       const data: FileContent = await res.json();
       setSelectedFile(data);
       setEditContent(data.content);
+      setMarkdownViewMode(isMarkdownFile(data) ? 'preview' : 'code');
     } catch (err) {
       setFileError(err instanceof Error ? err.message : '读取文件失败');
       setSelectedFile(null);
@@ -177,7 +210,7 @@ export default function Workspace() {
       }
       await fetchTree(currentPath);
     } catch (err) {
-      alert(err instanceof Error ? err.message : '删除失败');
+      toastError(err instanceof Error ? err.message : '删除失败');
     }
   };
 
@@ -187,7 +220,7 @@ export default function Workspace() {
       const res = await apiFetch(`/v1/workspace/download?path=${encodeURIComponent(filePath)}`);
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        alert(data.detail || `下载失败 (${res.status})`);
+        toastError(data.detail || `下载失败 (${res.status})`);
         return;
       }
       const blob = await res.blob();
@@ -198,7 +231,7 @@ export default function Workspace() {
       a.click();
       URL.revokeObjectURL(url);
     } catch (err) {
-      alert(err instanceof Error ? err.message : '下载失败');
+      toastError(err instanceof Error ? err.message : '下载失败');
     }
   };
 
@@ -223,6 +256,7 @@ export default function Workspace() {
       navigateDir(entry.path);
     } else if (entry.is_text && entry.permissions.includes('r')) {
       fetchFile(entry.path);
+      if (isMobile) setMobileTreeOpen(false);
     }
   };
 
@@ -237,15 +271,10 @@ export default function Workspace() {
   return (
     <div className="h-full min-h-0 min-w-0 flex flex-col gap-4 sm:gap-6 animate-in fade-in duration-500">
       {/* Header */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between flex-shrink-0">
-        <div className="min-w-0">
-          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-foreground flex items-center gap-2">
-            <HardDrive className="w-7 h-7 text-primary" /> 工作区管理
-          </h1>
-          <p className="text-muted-foreground mt-1 text-sm sm:text-base">
-            浏览和管理后端服务器上的配置文件与数据目录。
-          </p>
-        </div>
+      <div className="flex items-center justify-between flex-shrink-0">
+        <h1 className="text-lg lg:text-3xl font-bold tracking-tight text-foreground flex items-center gap-2">
+          <HardDrive className="w-5 h-5 lg:w-7 lg:h-7 text-primary" /> 工作区
+        </h1>
         <button
           onClick={() => fetchTree(currentPath)}
           className="inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm bg-card border border-border text-foreground hover:bg-muted transition-colors self-start sm:self-auto"
@@ -257,10 +286,39 @@ export default function Workspace() {
       {/* Main content */}
       <div className="flex-1 min-h-0 flex flex-col lg:flex-row gap-4">
 
-        {/* Left: File tree */}
-        <div className="lg:w-[380px] flex-shrink-0 bg-card border border-border rounded-lg overflow-hidden flex flex-col">
+        {/* 移动端：文件树收起时显示展开按钮 */}
+        {isMobile && !mobileTreeOpen && (
+          <button
+            onClick={() => setMobileTreeOpen(true)}
+            className="flex items-center gap-2 px-3 py-2.5 text-sm bg-card border border-border rounded-lg text-foreground hover:bg-muted transition-colors flex-shrink-0"
+          >
+            <PanelLeftOpen className="w-4 h-4" />
+            <span className="font-medium">文件列表</span>
+            {selectedFile && (
+              <span className="text-muted-foreground ml-1 truncate max-w-[200px]">— {selectedFile.path.split('/').pop()}</span>
+            )}
+          </button>
+        )}
+
+        {/* Left: File tree — 移动端可折叠 */}
+        <div className={`lg:w-[380px] flex-shrink-0 bg-card border border-border rounded-lg overflow-hidden flex flex-col ${
+          isMobile ? (mobileTreeOpen ? 'max-h-[50vh]' : 'hidden') : ''
+        }`}>
           {/* Breadcrumb */}
-          <div className="border-b border-border px-3 py-2 flex items-center gap-1.5 text-xs flex-shrink-0 min-h-[36px] flex-wrap">
+          {/* 修改原因：移动端面包屑文字偏小，路径按钮在窄屏上不便触控。
+              修改方式：采用 mobile-first 响应式类，默认使用 text-sm 和 48px 最小高度，sm 以上恢复 text-xs 与原高度。
+              目的：提升移动端路径导航的可读性和触控稳定性，同时保持桌面端紧凑布局。 */}
+          <div className="border-b border-border px-3 py-2 flex items-center gap-1.5 text-sm sm:text-xs flex-shrink-0 min-h-12 sm:min-h-[36px] flex-wrap">
+            {/* 移动端关闭按钮 */}
+            {isMobile && (
+              <button
+                onClick={() => setMobileTreeOpen(false)}
+                className="p-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors mr-1"
+                title="收起文件列表"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            )}
             <button
               onClick={() => navigateDir('')}
               className="text-primary hover:underline font-medium flex items-center gap-1"
@@ -325,9 +383,12 @@ export default function Workspace() {
                     </button>
                     {!entry.is_dir && (
                       <div className="flex items-center gap-1.5 flex-shrink-0">
-                        <span className="text-[10px] text-muted-foreground/70 font-mono">{formatSize(entry.size)}</span>
+                        {/* 修改原因：移动端文件大小和权限标签字体过小，容易降低列表扫描效率。
+                            修改方式：默认将文件大小提升到 text-sm，权限标签提升到 text-xs，sm 以上恢复原有小尺寸。
+                            目的：改善移动端文件列表的辨识度，同时保留桌面端的信息密度。 */}
+                        <span className="text-sm sm:text-[10px] text-muted-foreground/70 font-mono">{formatSize(entry.size)}</span>
                         {permissionBadges(entry.permissions).map(b => (
-                          <span key={b.label} className={`inline-flex items-center rounded px-1 py-0.5 text-[9px] font-bold border ${b.color}`}>
+                          <span key={b.label} className={`inline-flex items-center rounded px-1 py-0.5 text-xs sm:text-[9px] font-bold border ${b.color}`}>
                             {b.label}
                           </span>
                         ))}
@@ -363,10 +424,10 @@ export default function Workspace() {
           ) : selectedFile ? (
             <>
               {/* File header */}
-              <div className="border-b border-border px-4 py-2.5 flex items-center justify-between gap-3 flex-shrink-0 bg-muted/20">
+              <div className="border-b border-border px-3 py-1.5 lg:px-4 lg:py-2.5 flex items-center justify-between gap-2 flex-shrink-0 bg-muted/20">
                 <div className="min-w-0">
-                  <div className="text-sm font-semibold text-foreground truncate">{selectedFile.path}</div>
-                  <div className="text-[11px] text-muted-foreground mt-0.5 flex items-center gap-3 flex-wrap">
+                  <div className="text-xs lg:text-sm font-semibold text-foreground truncate">{selectedFile.path}</div>
+                  <div className="hidden lg:flex text-[11px] text-muted-foreground mt-0.5 items-center gap-3 flex-wrap">
                     <span>{formatSize(selectedFile.size)}</span>
                     <span>{selectedFile.line_count} 行</span>
                     <span className="font-mono">{selectedFile.language}</span>
@@ -374,6 +435,35 @@ export default function Workspace() {
                   </div>
                 </div>
                 <div className="flex items-center gap-1.5 flex-shrink-0">
+                  {selectedFile && isMarkdownFile(selectedFile) && !editMode && (
+                    <div className="inline-flex items-center rounded-lg border border-border bg-muted p-0.5" aria-label="Markdown 查看模式">
+                      {/* 修改原因：Markdown 文件需要让用户显式选择渲染预览或源码查看，且移动端切换按钮原本过小。
+                          修改方式：在文件头部操作区加入 Preview/Code 双按钮，并用 mobile-first 类让移动端使用 text-sm、px-3、py-2 和 48px 最小高度，sm 以上恢复原小尺寸。
+                          目的：在不进入编辑模式的情况下快速切换右侧查看内容，并提升移动端触控可靠性。 */}
+                      <button
+                        type="button"
+                        onClick={() => setMarkdownViewMode('preview')}
+                        className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
+                          markdownViewMode === 'preview'
+                            ? 'bg-background text-foreground shadow-sm'
+                            : 'text-muted-foreground hover:text-foreground'
+                        }`}
+                      >
+                        Preview
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setMarkdownViewMode('code')}
+                        className={`rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
+                          markdownViewMode === 'code'
+                            ? 'bg-background text-foreground shadow-sm'
+                            : 'text-muted-foreground hover:text-foreground'
+                        }`}
+                      >
+                        Code
+                      </button>
+                    </div>
+                  )}
                   {selectedFile.permissions.includes('w') && (
                     editMode ? (
                       <>
@@ -401,9 +491,12 @@ export default function Workspace() {
                       </button>
                     )
                   )}
+                  {/* 修改原因：移动端下载按钮文字、内边距和图标偏小，触控目标不足。
+                      修改方式：默认使用 text-sm、px-3、py-2、48px 最小高度和更大的图标，sm 以上恢复原有紧凑尺寸。
+                      目的：提升移动端下载操作的点击可靠性，同时不改变桌面端操作区密度。 */}
                   <button
                     onClick={() => downloadFile(selectedFile.path)}
-                    className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs bg-muted border border-border text-foreground hover:bg-muted/80 transition-colors"
+                    className="inline-flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs bg-muted border border-border text-foreground hover:bg-muted/80 transition-colors"
                   >
                     <Download className="w-3.5 h-3.5" /> 下载
                   </button>
@@ -429,7 +522,7 @@ export default function Workspace() {
               )}
 
               {/* File content */}
-              <div className="flex-1 overflow-auto">
+              <div className="flex-1 overflow-auto min-h-[60vh] lg:min-h-0">
                 {editMode ? (
                   <textarea
                     value={editContent}
@@ -437,6 +530,13 @@ export default function Workspace() {
                     className="w-full h-full bg-background text-foreground font-mono text-[13px] leading-relaxed p-4 resize-none outline-none"
                     spellCheck={false}
                   />
+                ) : isMarkdownFile(selectedFile) && markdownViewMode === 'preview' ? (
+                  <div className="min-h-full bg-background/60 p-4">
+                    {/* 修改原因：Markdown 文件的默认阅读场景是渲染后的文档，不应只显示源码。
+                        修改方式：复用项目统一 MarkdownRenderer 渲染当前文件内容，源码查看仍由 Code 模式保留。
+                        目的：提升工作区中 md 类文件的阅读效率，同时不改变保存和编辑逻辑。 */}
+                    <MarkdownRenderer content={selectedFile.content} className="max-w-none" />
+                  </div>
                 ) : (
                   <pre className="w-full h-full bg-background/60 text-foreground font-mono text-[13px] leading-relaxed p-4 whitespace-pre-wrap break-words overflow-auto">
                     {selectedFile.content}

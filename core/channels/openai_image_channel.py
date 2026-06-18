@@ -354,4 +354,5 @@ def register():
         request_adapter=get_image_payload,
         response_adapter=fetch_image_response,
         stream_adapter=fetch_image_stream,
+        source="builtin",
     )

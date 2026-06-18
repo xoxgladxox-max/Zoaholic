@@ -51,7 +51,7 @@ EXTENSIONS = [
 ]
 
 # 支持的引擎
-SUPPORTED_ENGINES = {"openai", "azure", "openrouter", "openai-responses"}
+SUPPORTED_ENGINES = {"openai", "azure", "openrouter", "openai-responses", "codex"}
 
 # Reasoning effort 后缀 → effort 值
 REASONING_EFFORT_SUFFIXES = {
@@ -67,7 +67,7 @@ REASONING_EFFORT_SUFFIXES = {
 TOOL_SUFFIXES = {
     "-image": {
         "tool": {"type": "image_generation"},
-        "engines": {"openai-responses"},  # 仅 Responses API 支持
+        "engines": {"openai-responses", "codex"},  # Responses API 格式
     },
 }
 
@@ -147,8 +147,8 @@ def set_reasoning_parameters(payload: Dict[str, Any], effort: str, engine: str) 
     if "summary" not in reasoning:
         reasoning["summary"] = "auto"
 
-    # OpenAI Responses API 只支持 reasoning 对象格式
-    if engine.lower() == "openai-responses":
+    # Responses API 格式引擎只支持 reasoning 对象格式
+    if engine.lower() in ("openai-responses", "codex"):
         return
 
     # Chat Completions API 格式

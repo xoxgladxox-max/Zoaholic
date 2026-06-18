@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useMemo } from 'react';
 import {
   Activity, Cpu, Zap, BarChart3, AlertCircle, CheckCircle2,
   RefreshCw, Server, ChevronDown, ChevronUp, DollarSign, Search, X
@@ -7,10 +7,7 @@ import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
-  PieChart, Pie, Legend
-} from 'recharts';
-import {
-  LineChart, Line, CartesianGrid
+  PieChart, Pie, Legend, LineChart, Line, CartesianGrid
 } from 'recharts';
 
 interface StatData {
@@ -27,11 +24,6 @@ interface AnalysisEntry {
   total_prompt_tokens: number;
   total_completion_tokens: number;
   total_tokens: number;
-}
-
-interface RowPrice {
-  prompt: number;
-  completion: number;
 }
 
 const TIME_RANGES = [
@@ -56,17 +48,17 @@ const SUCCESS_COLOR = 'hsl(160 84% 39%)';
 const WARNING_COLOR = 'hsl(38 92% 50%)';
 const ERROR_COLOR = 'hsl(var(--destructive))';
 
-// 折线图专用色板，颜色间差异大，避免混淆
 const LINE_COLORS = [
-  '#3b82f6', // 蓝
-  '#ef4444', // 红
-  '#22c55e', // 绿
-  '#f59e0b', // 橙
-  '#8b5cf6', // 紫
-  '#ec4899', // 粉
-  '#06b6d4', // 青
-  '#84cc16', // 黄绿
+  '#3b82f6', '#ef4444', '#22c55e', '#f59e0b',
+  '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16',
 ];
+
+const formatCompact = (n: number) => {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 10_000) return `${(n / 1_000).toFixed(1)}K`;
+  return n.toLocaleString();
+};
 
 const formatTokens = (n: number) => {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
@@ -81,20 +73,6 @@ const formatCost = (n: number) => {
   if (n >= 0.01) return `$${n.toFixed(4)}`;
   return `$${n.toFixed(6)}`;
 };
-
-/** 根据 model_price 配置，按最长前缀匹配返回 {prompt, completion}，未命中返回 null */
-function matchModelPrice(modelPrice: Record<string, string>, modelName: string): { prompt: number; completion: number } | null {
-  if (!modelName || !modelPrice || Object.keys(modelPrice).length === 0) return null;
-  const matched = Object.keys(modelPrice)
-    .filter(k => k !== 'default' && modelName.startsWith(k))
-    .sort((a, b) => b.length - a.length);
-  const key = matched.length > 0 ? matched[0] : (modelPrice['default'] !== undefined ? 'default' : null);
-  if (!key) return null;
-  const parts = String(modelPrice[key] || '').split(',').map(s => s.trim());
-  const prompt = parseFloat(parts[0]) || 0;
-  const completion = parseFloat(parts[1]) || 0;
-  return { prompt, completion };
-}
 
 /** 多选下拉组件 */
 function MultiSelect({
@@ -168,11 +146,40 @@ function MultiSelect({
   );
 }
 
+/** UTC 时间字符串转本地时间显示，根据粒度自适应 */
+const formatTimeTick = (utcStr: string, gran?: string) => {
+  try {
+    const s = String(utcStr);
+    // 天粒度：YYYY-MM-DD 格式，不带时区偏移
+    if (gran === 'day' || (s.length <= 10 && /^\d{4}-\d{2}-\d{2}$/.test(s))) {
+      return `${s.slice(5, 7)}/${s.slice(8, 10)}`;
+    }
+    const d = new Date(s.replace(' ', 'T') + 'Z');
+    if (isNaN(d.getTime())) return s;
+    return `${String(d.getMonth() + 1)}/${String(d.getDate())} ${String(d.getHours()).padStart(2,'0')}:00`;
+  } catch {
+    return String(utcStr);
+  }
+};
+
+const formatTimeTooltip = (utcStr: string, gran?: string) => {
+  try {
+    const s = String(utcStr);
+    if (gran === 'day' || (s.length <= 10 && /^\d{4}-\d{2}-\d{2}$/.test(s))) {
+      return s;
+    }
+    const d = new Date(s.replace(' ', 'T') + 'Z');
+    if (isNaN(d.getTime())) return s;
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:00`;
+  } catch {
+    return String(utcStr);
+  }
+};
+
 export default function Dashboard() {
   const [stats, setStats] = useState<StatData | null>(null);
   const [totalTokens, setTotalTokens] = useState(0);
   const [totalCost, setTotalCost] = useState(0);
-  const [globalModelPrice, setGlobalModelPrice] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [timeRange, setTimeRange] = useState(24);
   const { token } = useAuthStore();
@@ -184,53 +191,44 @@ export default function Dashboard() {
   };
 
   // 用量分析状态
-  const [analysisOpen, setAnalysisOpen] = useState(false);
+  const [analysisOpen, setAnalysisOpen] = useState(true);
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [analysisData, setAnalysisData] = useState<AnalysisEntry[]>([]);
   const [analysisProviders, setAnalysisProviders] = useState<string[]>([]);
   const [analysisModels, setAnalysisModels] = useState<string[]>([]);
   const [analysisStart, setAnalysisStart] = useState('');
   const [analysisEnd, setAnalysisEnd] = useState('');
-  const [defaultPromptPrice, setDefaultPromptPrice] = useState(0.3);
-  const [defaultCompletionPrice, setDefaultCompletionPrice] = useState(1.0);
-  const [rowPrices, setRowPrices] = useState<Record<number, RowPrice>>({});
   const [analysisQueried, setAnalysisQueried] = useState(false);
   const [trendData, setTrendData] = useState<Record<string, string | number>[]>([]);
-  const [trendModels, setTrendModels] = useState<string[]>([]);
+  const [trendModelsRaw, setTrendModelsRaw] = useState<string[]>([]);
+  const [tokenBreakdown, setTokenBreakdown] = useState<any[]>([]);
+  const [trendGranularity, setTrendGranularity] = useState<string>('hour');
   const [trendLoading, setTrendLoading] = useState(false);
 
   const fetchData = async () => {
     if (!token) return;
     setLoading(true);
     try {
+      const end = new Date();
+      const start = new Date(end.getTime() - timeRange * 60 * 60 * 1000);
+      const tokenUrl = `/v1/token_usage?start_datetime=${encodeURIComponent(start.toISOString())}&end_datetime=${encodeURIComponent(end.toISOString())}`;
 
-      const statsRes = await apiFetch(`/v1/stats?hours=${timeRange}`);
+      const [statsRes, tokenRes] = await Promise.all([
+        apiFetch(`/v1/stats?hours=${timeRange}`),
+        apiFetch(tokenUrl),
+      ]);
+
       if (statsRes.ok) {
         const data = await statsRes.json();
         setStats(data.stats || data);
         setTotalCost((data.stats || data).total_cost || 0);
       }
 
-      const end = new Date();
-      const start = new Date(end.getTime() - timeRange * 60 * 60 * 1000);
-      const tokenUrl = `/v1/token_usage?start_datetime=${encodeURIComponent(start.toISOString())}&end_datetime=${encodeURIComponent(end.toISOString())}`;
-
-      const tokenRes = await apiFetch(tokenUrl);
       if (tokenRes.ok) {
         const data = await tokenRes.json();
         const total = data.usage?.reduce((sum: number, item: { total_tokens?: number }) => sum + (item.total_tokens || 0), 0) || 0;
         setTotalTokens(total);
       }
-
-      // 获取全局 model_price 配置
-      try {
-        const configRes = await apiFetch('/v1/api_config');
-        if (configRes.ok) {
-          const cfgData = await configRes.json();
-          const prefs = cfgData.preferences || cfgData.api_config?.preferences || {};
-          setGlobalModelPrice(prefs.model_price || {});
-        }
-      } catch { /* ignore */ }
     } catch (err) {
       console.error('Failed to fetch stats:', err);
     } finally {
@@ -243,6 +241,7 @@ export default function Dashboard() {
     setAnalysisLoading(true);
     setAnalysisQueried(true);
     setTrendData([]);
+    setTokenBreakdown([]);
     try {
       const params = new URLSearchParams();
 
@@ -256,89 +255,68 @@ export default function Dashboard() {
         params.set('hours', String(timeRange));
       }
       if (analysisProviders.length > 0) {
-        params.set('provider', analysisProviders.join(','));
+        // 选中主渠道时自动包含其子渠道（子渠道名格式：主渠道名:引擎）
+        const expandedProviders = new Set(analysisProviders);
+        const allProviders = channelStats.map(c => c.provider);
+        analysisProviders.forEach(sel => {
+          allProviders.forEach(p => {
+            if (p.startsWith(sel + ':')) expandedProviders.add(p);
+          });
+        });
+        params.set('provider', Array.from(expandedProviders).join(','));
       }
       if (analysisModels.length > 0) {
         params.set('model', analysisModels.join(','));
       }
 
-      const res = await apiFetch(`/v1/stats/usage_analysis?${params}`);
-      const trendResPromise = apiFetch(`/v1/stats/model_trend?${params}`);
+      const [res, trendRes] = await Promise.all([
+        apiFetch(`/v1/stats/usage_analysis?${params}`),
+        apiFetch(`/v1/stats/model_trend?${params}`),
+      ]);
 
       if (res.ok) {
         const result = await res.json();
-        const data: AnalysisEntry[] = result.data || [];
-        
-        setAnalysisData(prevData => {
-          // 修复价格保留逻辑：根据 provider+model 匹配旧价格
-          const newPrices: Record<number, RowPrice> = {};
-          data.forEach((entry, i) => {
-            const key = `${entry.provider}:${entry.model}`;
-            const oldIdx = prevData.findIndex(p => `${p.provider}:${p.model}` === key);
-            if (oldIdx !== -1 && rowPrices[oldIdx]) {
-              newPrices[i] = rowPrices[oldIdx];
-            } else {
-              // 自动从全局 model_price 前缀匹配填充
-              const auto = matchModelPrice(globalModelPrice, entry.model);
-              newPrices[i] = auto || { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
-            }
-          });
-          setRowPrices(newPrices);
-          return data;
-        });
+        setAnalysisData(result.data || []);
       }
 
-      setTrendLoading(true);
-      const trendRes = await trendResPromise;
       if (trendRes.ok) {
         const contentType = trendRes.headers.get('content-type') || '';
         if (!contentType.includes('application/json')) {
-          console.error('Trend API did not return JSON. The backend may not be restarted and the request likely fell back to index.html.');
+          console.error('Trend API did not return JSON.');
           setTrendData([]);
-          setTrendModels([]);
+          setTrendModelsRaw([]);
+          setTokenBreakdown([]);
         } else {
           const trendResult = await trendRes.json();
-          setTrendData(trendResult.data ||[]);
-          setTrendModels(trendResult.models || []);
+          setTrendData(trendResult.data || []);
+          setTrendModelsRaw(trendResult.models || []);
+          setTokenBreakdown(trendResult.token_breakdown || []);
+          setTrendGranularity(trendResult.granularity || 'hour');
         }
       } else {
-        const text = await trendRes.text().catch(() => '');
-        console.error('Trend API request failed:', trendRes.status, text.slice(0, 200));
         setTrendData([]);
-        setTrendModels([]);
+        setTrendModelsRaw([]);
+        setTokenBreakdown([]);
       }
     } catch (err) {
       console.error('Failed to fetch analysis:', err);
-      setTrendData([]);
-      setTrendModels([]);
+      setTrendModelsRaw([]);
+      setTrendGranularity('hour');
     } finally {
       setAnalysisLoading(false);
       setTrendLoading(false);
     }
   };
 
-  const applyDefaultPricesToAll = () => {
-    const prices: Record<number, RowPrice> = {};
-    analysisData.forEach((_, i) => {
-      const auto = matchModelPrice(globalModelPrice, analysisData[i].model);
-      prices[i] = auto || { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
-    });
-    setRowPrices(prices);
-  };
-
-  const updateRowPrice = (index: number, field: 'prompt' | 'completion', value: number) => {
-    setRowPrices(prev => ({
-      ...prev,
-      [index]: { ...prev[index], [field]: value }
-    }));
-  };
-
   useEffect(() => {
     fetchData();
+    fetchAnalysis();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token, timeRange]);
 
-  const channelStats = stats?.channel_success_rates || [];
+
+
+  const channelStats = (stats?.channel_success_rates || []).slice().sort((a, b) => b.total_requests - a.total_requests);
   const modelStats = stats?.model_request_counts || [];
   const endpointStats = stats?.endpoint_request_counts || [];
 
@@ -358,14 +336,10 @@ export default function Dashboard() {
   const analysisTotalPrompt = analysisData.reduce((s, r) => s + r.total_prompt_tokens, 0);
   const analysisTotalCompletion = analysisData.reduce((s, r) => s + r.total_completion_tokens, 0);
   const analysisTotalTokensAll = analysisData.reduce((s, r) => s + r.total_tokens, 0);
-  const analysisTotalCost = analysisData.reduce((s, entry, i) => {
-    const p = rowPrices[i] || { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
-    return s + (entry.total_prompt_tokens * p.prompt + entry.total_completion_tokens * p.completion) / 1_000_000;
-  }, 0);
 
   const topCards = [
-    { label: '总请求量', value: totalRequests.toLocaleString(), icon: Zap, color: 'text-amber-500', bg: 'bg-amber-500/10' },
-    { label: `Token 消耗 (${timeRangeLabel})`, value: totalTokens.toLocaleString(), icon: BarChart3, color: 'text-blue-500', bg: 'bg-blue-500/10' },
+    { label: '总请求量', value: formatCompact(totalRequests), icon: Zap, color: 'text-amber-500', bg: 'bg-amber-500/10' },
+    { label: `Token 消耗 (${timeRangeLabel})`, value: formatCompact(totalTokens), icon: BarChart3, color: 'text-blue-500', bg: 'bg-blue-500/10' },
     { label: '平均成功率', value: `${(avgSuccessRate * 100).toFixed(1)}%`, icon: CheckCircle2, color: 'text-emerald-500', bg: 'bg-emerald-500/10' },
     { label: '活跃渠道', value: activeChannels.toString(), icon: Cpu, color: 'text-purple-500', bg: 'bg-purple-500/10' },
     { label: `费用 (${timeRangeLabel})`, value: formatCost(totalCost), icon: DollarSign, color: 'text-amber-500', bg: 'bg-amber-500/10' },
@@ -376,11 +350,38 @@ export default function Dashboard() {
     value: item.count
   }));
 
-  const formattedChannelStats = channelStats.slice(0, 6).map(item => ({
+  const formattedChannelStats = channelStats.filter(c => c.total_requests >= 5).slice(0, 8).map(item => ({
     name: item.provider,
-    success_rate: item.success_rate * 100,
+    success_rate: Math.round(item.success_rate * 1000) / 10,
     requests: item.total_requests
   }));
+
+
+
+  // 折线图只显示请求量 top 8 的模型
+  const trendModels = useMemo(() => {
+    if (trendModelsRaw.length <= 8) return trendModelsRaw;
+    const totals = new Map<string, number>();
+    trendData.forEach(row => {
+      trendModelsRaw.forEach(m => {
+        totals.set(m, (totals.get(m) || 0) + (Number(row[m]) || 0));
+      });
+    });
+    return [...totals.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .map(([m]) => m);
+  }, [trendModelsRaw, trendData]);
+
+  // Token 用量堆叠柱状图数据
+  const tokenBarData = useMemo(() => {
+    return tokenBreakdown.map((row: any) => ({
+      hour: row.hour,
+      cached: row.cached_tokens || 0,
+      uncached: Math.max(0, (row.prompt_tokens || 0) - (row.cached_tokens || 0)),
+      output: row.completion_tokens || 0,
+    }));
+  }, [tokenBreakdown]);
 
   if (loading && !stats) {
     return (
@@ -428,7 +429,7 @@ export default function Dashboard() {
             <div className="flex justify-between items-start">
               <div>
                 <p className="text-sm font-medium text-muted-foreground">{stat.label}</p>
-                <h3 className="text-3xl font-bold text-foreground mt-2">{stat.value}</h3>
+                <h3 className="text-2xl sm:text-3xl font-bold text-foreground mt-2 truncate" title={stat.value}>{stat.value}</h3>
               </div>
               <div className={`p-2 rounded-lg ${stat.bg}`}>
                 <stat.icon className={`w-5 h-5 ${stat.color}`} />
@@ -454,6 +455,7 @@ export default function Dashboard() {
                   cursor={{ fill: 'hsl(var(--muted) / 0.5)' }}
                   contentStyle={tooltipStyle}
                   itemStyle={{ color: tooltipStyle.color }}
+                  formatter={(value: number) => [`${value.toFixed(1)}%`, '成功率']}
                 />
                 <Bar dataKey="success_rate" name="成功率" radius={[4, 4, 0, 0]}>
                   {formattedChannelStats.map((entry, index) => (
@@ -535,14 +537,14 @@ export default function Dashboard() {
               渠道健康状况详细
             </h3>
           </div>
-          <div className="overflow-x-auto flex-1">
+          <div className="overflow-auto flex-1" style={{ maxHeight: '400px' }}>
             <table className="w-full text-left text-sm">
-              <thead className="bg-muted text-muted-foreground font-medium">
+              <thead className="bg-muted text-muted-foreground font-medium sticky top-0 z-10">
                 <tr>
-                  <th className="px-6 py-4">渠道名称</th>
-                  <th className="px-6 py-4">健康状态</th>
-                  <th className="px-6 py-4">请求数</th>
-                  <th className="px-6 py-4">成功率</th>
+                  <th className="px-6 py-4 bg-muted">渠道名称</th>
+                  <th className="px-6 py-4 bg-muted">健康状态</th>
+                  <th className="px-6 py-4 bg-muted">请求数</th>
+                  <th className="px-6 py-4 bg-muted">成功率</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-border">
@@ -579,15 +581,15 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* 用量分析与费用模拟 */}
+      {/* 用量分析 */}
       <div className="bg-card border border-border rounded-xl shadow-sm overflow-hidden">
         <button
           onClick={() => setAnalysisOpen(!analysisOpen)}
           className="w-full p-6 flex items-center justify-between hover:bg-muted/30 transition-colors"
         >
           <h3 className="text-base font-semibold text-foreground flex items-center gap-2">
-            <DollarSign className="w-4 h-4 text-amber-500" />
-            用量分析与费用模拟
+            <BarChart3 className="w-4 h-4 text-blue-500" />
+            用量分析
           </h3>
           {analysisOpen ? <ChevronUp className="w-5 h-5 text-muted-foreground" /> : <ChevronDown className="w-5 h-5 text-muted-foreground" />}
         </button>
@@ -616,7 +618,7 @@ export default function Dashboard() {
                   className="w-full px-3 py-2 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 text-foreground"
                 />
               </div>
-              {/* 时间范围快捷按钮 */}
+              {/* 时间范围快捷按钮 + 查询 */}
               <div className="flex items-end gap-2 pb-0.5">
                 {[
                   { label: '1小时', hours: 1 },
@@ -663,116 +665,136 @@ export default function Dashboard() {
               />
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              {/* 默认输入价格 */}
-              <div>
-                <label className="block text-xs font-medium text-muted-foreground mb-1.5">默认输入价格 ($/M)</label>
-                <input
-                  type="number"
-                  step="0.01"
-                  min="0"
-                  value={defaultPromptPrice}
-                  onChange={e => setDefaultPromptPrice(parseFloat(e.target.value) || 0)}
-                  className="w-full px-3 py-2 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 text-foreground"
-                />
-              </div>
-              {/* 默认输出价格 */}
-              <div>
-                <label className="block text-xs font-medium text-muted-foreground mb-1.5">默认输出价格 ($/M)</label>
-                <input
-                  type="number"
-                  step="0.01"
-                  min="0"
-                  value={defaultCompletionPrice}
-                  onChange={e => setDefaultCompletionPrice(parseFloat(e.target.value) || 0)}
-                  className="w-full px-3 py-2 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 text-foreground"
-                />
-              </div>
-              {/* 查询按钮 */}
-              <div className="flex items-end gap-2">
-                <button
-                  onClick={fetchAnalysis}
-                  disabled={analysisLoading}
-                  className="flex-1 px-4 py-2 text-sm font-medium bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
-                >
-                  {analysisLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
-                  查询
-                </button>
-              </div>
+            {/* 查询按钮 */}
+            <div>
+              <button
+                onClick={fetchAnalysis}
+                disabled={analysisLoading}
+                className="px-4 py-2 text-sm font-medium bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors flex items-center gap-2 disabled:opacity-50"
+              >
+                {analysisLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+                查询
+              </button>
             </div>
 
             {/* 查询结果 */}
             {analysisQueried && (
               <div className="space-y-4">
-                {/* 模型趋势折线图 */}
-                <div className="bg-muted/30 rounded-xl p-6 border border-border">
-                  <h4 className="text-sm font-semibold text-foreground mb-4 flex items-center gap-2">
-                    <Activity className="w-4 h-4 text-primary" />
-                    所选模型请求频率趋势（按小时）
-                  </h4>
-                  <p className="text-xs text-muted-foreground mb-4">
-                    如果这里持续显示“暂无趋势数据”，且浏览器控制台提示返回了 HTML，请重启后端服务，使新增的统计接口生效。
-                  </p>
-                  {trendLoading ? (
-                    <div className="h-64 flex items-center justify-center text-sm text-muted-foreground">
-                      <RefreshCw className="w-4 h-4 animate-spin mr-2" />
-                      正在加载趋势数据
-                    </div>
-                  ) : trendData.length > 0 && trendModels.length > 0 ? (
-                    <div className="h-64">
-                      <ResponsiveContainer width="100%" height="100%">
-                        <LineChart data={trendData}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--muted))" vertical={false} />
-                          <XAxis
-                            dataKey="hour"
-                            stroke={AXIS_COLOR}
-                            fontSize={10}
-                            tickFormatter={(utcStr) => {
-                              try {
-                                const d = new Date(String(utcStr).replace(' ', 'T') + 'Z');
-                                if (isNaN(d.getTime())) return String(utcStr);
-                                return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
-                              } catch {
-                                return String(utcStr);
-                              }
-                            }}
-                          />
-                          <YAxis stroke={AXIS_COLOR} fontSize={10} />
-                          <Tooltip
-                            contentStyle={tooltipStyle}
-                            itemStyle={{ fontSize: '12px' }}
-                            labelStyle={{ fontSize: '12px', fontWeight: 'bold', marginBottom: '4px' }}
-                          />
-                          <Legend iconType="circle" wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
-                          {trendModels.map((m, i) => (
-                            <Line
-                              key={m}
-                              type="monotone"
-                              dataKey={m}
-                              name={m}
-                              stroke={LINE_COLORS[i % LINE_COLORS.length]}
-                              strokeWidth={2}
-                              dot={false}
-                              connectNulls
-                              activeDot={{ r: 4 }}
+                {/* 堆叠柱状图：请求次数 + Token 用量 */}
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  {/* 请求次数折线图 */}
+                  <div className="bg-muted/30 rounded-xl p-6 border border-border">
+                    <h4 className="text-sm font-semibold text-foreground mb-4 flex items-center gap-2">
+                      <Zap className="w-4 h-4 text-amber-500" />
+                      请求次数趋势
+                    </h4>
+                    {trendLoading || analysisLoading ? (
+                      <div className="h-64 flex items-center justify-center text-sm text-muted-foreground">
+                        <RefreshCw className="w-4 h-4 animate-spin mr-2" />
+                        加载中
+                      </div>
+                    ) : trendData.length > 0 && trendModels.length > 0 ? (
+                      <div className="h-64">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <LineChart data={trendData} margin={{ top: 5, right: 5, left: 5, bottom: 5 }}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--muted))" vertical={false} />
+                            <XAxis dataKey="hour" stroke={AXIS_COLOR} fontSize={10} tickLine={false} axisLine={false} tickFormatter={(v: string) => formatTimeTick(v, trendGranularity)} />
+                            <YAxis stroke={AXIS_COLOR} fontSize={10} tickLine={false} axisLine={false} tickFormatter={formatCompact} />
+                            <Tooltip
+                              contentStyle={tooltipStyle}
+                              itemStyle={{ fontSize: '12px' }}
+                              labelStyle={{ fontSize: '12px', fontWeight: 'bold', marginBottom: '4px' }}
+                              labelFormatter={(v: string) => formatTimeTooltip(v, trendGranularity)}
                             />
-                          ))}
-                        </LineChart>
-                      </ResponsiveContainer>
-                    </div>
-                  ) : (
-                    <div className="h-64 flex items-center justify-center text-sm text-muted-foreground">
-                      当前筛选条件下暂无趋势数据
-                    </div>
-                  )}
+                            <Legend iconType="circle" wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
+                            {trendModels.map((m, i) => (
+                              <Line
+                                key={m}
+                                type="monotone"
+                                dataKey={m}
+                                name={m}
+                                stroke={LINE_COLORS[i % LINE_COLORS.length]}
+                                strokeWidth={2}
+                                dot={false}
+                                connectNulls
+                                activeDot={{ r: 4 }}
+                              />
+                            ))}
+                          </LineChart>
+                        </ResponsiveContainer>
+                      </div>
+                    ) : (
+                      <div className="h-64 flex items-center justify-center text-sm text-muted-foreground">
+                        暂无趋势数据
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Token 用量堆叠柱状图 */}
+                  <div className="bg-muted/30 rounded-xl p-6 border border-border">
+                    <h4 className="text-sm font-semibold text-foreground mb-4 flex items-center gap-2">
+                      <BarChart3 className="w-4 h-4 text-blue-500" />
+                      Token 用量趋势
+                    </h4>
+                    {trendLoading || analysisLoading ? (
+                      <div className="h-64 flex items-center justify-center text-sm text-muted-foreground">
+                        <RefreshCw className="w-4 h-4 animate-spin mr-2" />
+                        加载中
+                      </div>
+                    ) : tokenBarData.length > 0 ? (
+                      <div className="h-64">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <BarChart data={tokenBarData} margin={{ top: 5, right: 5, left: 5, bottom: 5 }}>
+                            <XAxis dataKey="hour" stroke={AXIS_COLOR} fontSize={10} tickLine={false} axisLine={false} tickFormatter={(v: string) => formatTimeTick(v, trendGranularity)} />
+                            <YAxis stroke={AXIS_COLOR} fontSize={10} tickLine={false} axisLine={false} tickFormatter={formatTokens} />
+                            <Tooltip
+                              contentStyle={tooltipStyle}
+                              itemStyle={{ color: tooltipStyle.color }}
+                              labelFormatter={(label: string) => {
+                                const row = tokenBarData.find(r => r.hour === label);
+                                const total = row ? (row.cached + row.uncached + row.output) : 0;
+                                return `${formatTimeTooltip(label, trendGranularity)}    ${formatTokens(total)} tokens`;
+                              }}
+                              formatter={(value: number, name: string) => {
+                                const labels: Record<string, string> = {
+                                  cached: '输入（命中缓存）',
+                                  uncached: '输入（未命中缓存）',
+                                  output: '输出',
+                                };
+                                return [formatTokens(value), labels[name] || name];
+                              }}
+                            />
+                            <Legend
+                              formatter={(value: string) => {
+                                const labels: Record<string, string> = {
+                                  cached: '输入（命中缓存）',
+                                  uncached: '输入（未命中缓存）',
+                                  output: '输出',
+                                };
+                                return labels[value] || value;
+                              }}
+                              wrapperStyle={{ fontSize: '12px' }}
+                            />
+                            <Bar dataKey="output" stackId="tokens" name="output" fill="#1e3a5f" />
+                            <Bar dataKey="uncached" stackId="tokens" name="uncached" fill="#1e40af" />
+                            <Bar dataKey="cached" stackId="tokens" name="cached" fill="#93c5fd" radius={[4, 4, 0, 0]} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    ) : (
+                      <div className="h-64 flex items-center justify-center text-sm text-muted-foreground">
+                        暂无 Token 数据
+                      </div>
+                    )}
+                  </div>
                 </div>
 
                 {/* 汇总卡片 */}
                 {analysisData.length > 0 && (
-                  <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                     <div className="bg-muted/50 rounded-lg p-3 text-center">
                       <p className="text-xs text-muted-foreground">总请求次数</p>
-                      <p className="text-lg font-bold text-foreground mt-1">{analysisTotalRequests.toLocaleString()}</p>
+                      <p className="text-lg font-bold text-foreground mt-1">{formatCompact(analysisTotalRequests)}</p>
                     </div>
                     <div className="bg-muted/50 rounded-lg p-3 text-center">
                       <p className="text-xs text-muted-foreground">输入 Token</p>
@@ -786,23 +808,6 @@ export default function Dashboard() {
                       <p className="text-xs text-muted-foreground">总 Token</p>
                       <p className="text-lg font-bold text-foreground mt-1">{formatTokens(analysisTotalTokensAll)}</p>
                     </div>
-                    <div className="bg-amber-500/10 rounded-lg p-3 text-center border border-amber-500/20">
-                      <p className="text-xs text-amber-600 dark:text-amber-400">模拟总费用</p>
-                      <p className="text-lg font-bold text-amber-600 dark:text-amber-400 mt-1">{formatCost(analysisTotalCost)}</p>
-                    </div>
-                  </div>
-                )}
-
-                {/* 应用默认价格按钮 */}
-                {analysisData.length > 0 && (
-                  <div className="flex items-center gap-3">
-                    <button
-                      onClick={applyDefaultPricesToAll}
-                      className="px-3 py-1.5 text-xs font-medium bg-muted hover:bg-muted/80 text-foreground border border-border rounded-lg transition-colors"
-                    >
-                      将默认价格应用到所有行
-                    </button>
-                    <span className="text-xs text-muted-foreground">可在表格中逐行调整每个模型的价格</span>
                   </div>
                 )}
 
@@ -816,53 +821,27 @@ export default function Dashboard() {
                         <th className="px-4 py-3 text-right">请求次数</th>
                         <th className="px-4 py-3 text-right">输入 Token</th>
                         <th className="px-4 py-3 text-right">输出 Token</th>
-                        <th className="px-4 py-3 text-center">输入价格 ($/M)</th>
-                        <th className="px-4 py-3 text-center">输出价格 ($/M)</th>
-                        <th className="px-4 py-3 text-right">模拟费用</th>
+                        <th className="px-4 py-3 text-right">总 Token</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-border">
                       {analysisData.length === 0 ? (
                         <tr>
-                          <td colSpan={8} className="px-4 py-8 text-center text-muted-foreground">
+                          <td colSpan={6} className="px-4 py-8 text-center text-muted-foreground">
                             {analysisLoading ? '查询中...' : '暂无数据'}
                           </td>
                         </tr>
                       ) : (
-                        analysisData.map((entry, i) => {
-                          const p = rowPrices[i] || { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
-                          const rowCost = (entry.total_prompt_tokens * p.prompt + entry.total_completion_tokens * p.completion) / 1_000_000;
-                          return (
-                            <tr key={i} className="hover:bg-muted/50 transition-colors">
-                              <td className="px-4 py-3 font-medium text-foreground">{entry.provider}</td>
-                              <td className="px-4 py-3 text-foreground font-mono text-xs">{entry.model}</td>
-                              <td className="px-4 py-3 text-right text-muted-foreground">{entry.request_count.toLocaleString()}</td>
-                              <td className="px-4 py-3 text-right text-muted-foreground">{entry.total_prompt_tokens.toLocaleString()}</td>
-                              <td className="px-4 py-3 text-right text-muted-foreground">{entry.total_completion_tokens.toLocaleString()}</td>
-                              <td className="px-2 py-1 text-center">
-                                <input
-                                  type="number"
-                                  step="0.01"
-                                  min="0"
-                                  value={p.prompt}
-                                  onChange={e => updateRowPrice(i, 'prompt', parseFloat(e.target.value) || 0)}
-                                  className="w-20 px-2 py-1 text-xs text-center bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary/50 text-foreground"
-                                />
-                              </td>
-                              <td className="px-2 py-1 text-center">
-                                <input
-                                  type="number"
-                                  step="0.01"
-                                  min="0"
-                                  value={p.completion}
-                                  onChange={e => updateRowPrice(i, 'completion', parseFloat(e.target.value) || 0)}
-                                  className="w-20 px-2 py-1 text-xs text-center bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary/50 text-foreground"
-                                />
-                              </td>
-                              <td className="px-4 py-3 text-right font-mono font-bold text-amber-600 dark:text-amber-400">{formatCost(rowCost)}</td>
-                            </tr>
-                          );
-                        })
+                        analysisData.map((entry, i) => (
+                          <tr key={i} className="hover:bg-muted/50 transition-colors">
+                            <td className="px-4 py-3 font-medium text-foreground">{entry.provider}</td>
+                            <td className="px-4 py-3 text-foreground font-mono text-xs">{entry.model}</td>
+                            <td className="px-4 py-3 text-right text-muted-foreground">{formatCompact(entry.request_count)}</td>
+                            <td className="px-4 py-3 text-right text-muted-foreground">{formatTokens(entry.total_prompt_tokens)}</td>
+                            <td className="px-4 py-3 text-right text-muted-foreground">{formatTokens(entry.total_completion_tokens)}</td>
+                            <td className="px-4 py-3 text-right font-mono font-bold text-foreground">{formatTokens(entry.total_tokens)}</td>
+                          </tr>
+                        ))
                       )}
                     </tbody>
                   </table>

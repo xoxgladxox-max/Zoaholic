@@ -69,6 +69,16 @@ PLUGIN_INFO = {
         "category": "interceptors",
         "tags": ["gemini", "retry", "empty-content"],
         "params_hint": "填写最大重试次数（数字），如 3 或 5。默认 3 次。",
+        "params_schema": [
+            {
+                "key": "retries",
+                "label": "最大重试次数",
+                "type": "number",
+                "min": 1,
+                "max": 10,
+                "default": 3,
+            },
+        ],
     },
 }
 
@@ -553,7 +563,7 @@ def wrap_gemini_channel():
     _original_stream_adapter = channel.stream_adapter
     _original_response_adapter = channel.response_adapter
     
-    # 重新注册渠道，使用包装后的适配器
+    # 重新注册渠道，使用包装后的适配器（保留原始 source 标记）
     register_channel(
         id="gemini",
         type_name=channel.type_name,
@@ -565,6 +575,7 @@ def wrap_gemini_channel():
         stream_adapter=wrapped_fetch_gemini_response_stream,
         response_adapter=wrapped_fetch_gemini_response,
         models_adapter=channel.models_adapter,
+        source=channel.source,
         overwrite=True,
     )
     
@@ -587,7 +598,7 @@ def unwrap_gemini_channel():
         return
     
     if _original_stream_adapter and _original_response_adapter:
-        # 恢复原始适配器
+        # 恢复原始适配器（保留原始 source 标记）
         register_channel(
             id="gemini",
             type_name=channel.type_name,
@@ -599,6 +610,7 @@ def unwrap_gemini_channel():
             stream_adapter=_original_stream_adapter,
             response_adapter=_original_response_adapter,
             models_adapter=channel.models_adapter,
+            source=channel.source,
             overwrite=True,
         )
         

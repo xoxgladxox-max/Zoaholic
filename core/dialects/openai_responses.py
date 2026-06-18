@@ -9,7 +9,9 @@ OpenAI Responses API 方言
 
 from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
 
+from core.json_utils import json_loads, json_dumps_text
 from core.models import RequestModel, Message, ContentItem
+from core.usage import extract_cache_usage
 
 from .registry import DialectDefinition, EndpointDefinition, register_dialect
 
@@ -217,20 +219,15 @@ async def parse_responses_request(
         "stream": stream,
     }
 
-    # 处理 reasoning 参数
-    reasoning = native_body.get("reasoning")
-    if reasoning and isinstance(reasoning, dict):
-        effort = reasoning.get("effort")
-        if effort in ("high", "low"):
-            # 通过在模型名后添加后缀来传递 reasoning effort
-            # 这是因为 RequestModel 没有 reasoning_effort 字段
-            if not model.endswith(f"-{effort}"):
-                request_data["model"] = f"{model}-{effort}"
-
     # 转换 tools
     tools = convert_responses_tools(native_body.get("tools"))
     if tools:
         request_data["tools"] = tools
+
+    # 透传 reasoning 参数（如 {"effort": "high"}），由 channel 层决定如何处理
+    reasoning = native_body.get("reasoning")
+    if reasoning is not None:
+        request_data["reasoning"] = reasoning
 
     # 可选参数映射
     optional_fields = [
@@ -257,6 +254,24 @@ async def parse_responses_request(
             request_data["response_format"] = text_format
 
     return RequestModel(**request_data)
+
+
+def _responses_usage_from_canonical(usage: Any) -> Dict[str, Any]:
+    """将内核 OpenAI usage 转为 Responses API usage。
+
+    Responses API 的缓存命中字段位于 input_tokens_details.cached_tokens；集中转换可以同时覆盖
+    非流式响应和 usage-only 流式事件。
+    """
+    usage = usage if isinstance(usage, dict) else {}
+    response_usage: Dict[str, Any] = {
+        "input_tokens": usage.get("prompt_tokens", 0),
+        "output_tokens": usage.get("completion_tokens", 0),
+        "total_tokens": usage.get("total_tokens", 0),
+    }
+    cache_usage = extract_cache_usage(usage)
+    if cache_usage["cached_tokens"] > 0:
+        response_usage["input_tokens_details"] = {"cached_tokens": cache_usage["cached_tokens"]}
+    return response_usage
 
 
 async def render_responses_response(
@@ -386,11 +401,8 @@ async def render_responses_response(
     # 添加 usage
     usage = canonical_response.get("usage")
     if usage:
-        response["usage"] = {
-            "input_tokens": usage.get("prompt_tokens", 0),
-            "output_tokens": usage.get("completion_tokens", 0),
-            "total_tokens": usage.get("total_tokens", 0)
-        }
+        # Responses 方言出口需要把 OAI 缓存命中字段转为 input_tokens_details.cached_tokens。
+        response["usage"] = _responses_usage_from_canonical(usage)
 
     return response
 
@@ -406,8 +418,34 @@ async def render_responses_stream(canonical_sse_chunk: str) -> str:
     event: response.output_text.delta
     data: {"type": "response.output_text.delta", "delta": "..."}
     """
-    # 对于透传模式，直接返回原始内容
-    # 实际的格式转换在 channel 层处理
+    if not isinstance(canonical_sse_chunk, str) or not canonical_sse_chunk.startswith("data: "):
+        return canonical_sse_chunk
+
+    data_str = canonical_sse_chunk[6:].strip()
+    if data_str == "[DONE]":
+        return canonical_sse_chunk
+
+    try:
+        canonical = json_loads(data_str)
+    except Exception:
+        return canonical_sse_chunk
+
+    usage = canonical.get("usage")
+    if isinstance(usage, dict):
+        # 经过内核重组的 usage-only chunk 在 Responses API 中用 response.completed 表达。
+        event = {
+            "type": "response.completed",
+            "response": {
+                "id": canonical.get("id", ""),
+                "object": "response",
+                "status": "completed",
+                "model": canonical.get("model", ""),
+                "usage": _responses_usage_from_canonical(usage),
+            },
+        }
+        return f"event: response.completed\ndata: {json_dumps_text(event, ensure_ascii=False)}\n\n"
+
+    # 其它流式内容保持原有行为，避免在本次缓存字段修复中改变文本与工具调用事件结构。
     return canonical_sse_chunk
 
 
@@ -423,7 +461,14 @@ def parse_responses_usage(data: Any) -> Optional[Dict[str, int]]:
             prompt = usage.get("input_tokens", 0)
             completion = usage.get("output_tokens", 0)
             total = usage.get("total_tokens", 0) or (prompt + completion)
-            return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+            # Responses API 的缓存命中字段位于 input_tokens_details，需要和普通 token 同步回传。
+            cache_usage = extract_cache_usage(usage)
+            return {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": total,
+                **cache_usage,
+            }
 
     # 非流式响应
     usage = data.get("usage")
@@ -431,8 +476,15 @@ def parse_responses_usage(data: Any) -> Optional[Dict[str, int]]:
         prompt = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
         completion = usage.get("output_tokens") or usage.get("completion_tokens") or 0
         total = usage.get("total_tokens") or (prompt + completion)
-        if prompt or completion:
-            return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+        # 非流式 Responses API 同样携带 input_tokens_details.cached_tokens，这里避免只解析 token 总数。
+        cache_usage = extract_cache_usage(usage)
+        if prompt or completion or cache_usage["cached_tokens"] or cache_usage["cache_creation_tokens"]:
+            return {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": total,
+                **cache_usage,
+            }
 
     return None
 
@@ -473,6 +525,50 @@ async def responses_handler(
     )
 
 
+async def responses_subpath_handler(
+    request: "Request",
+    background_tasks: "BackgroundTasks",
+    api_index: int,
+    **kwargs,
+):
+    """
+    OpenAI Responses compact endpoint - POST /v1/responses/compact
+
+    Compact is a native Responses auxiliary endpoint.  Keep the original payload
+    for upstream passthrough and only build a minimal RequestModel for auth,
+    rate limit, model routing, and provider selection.
+    """
+    from core.error_response import openai_error_response
+    from routes.deps import get_model_handler
+
+    try:
+        native_body: Dict[str, Any] = await request.json()
+    except Exception:
+        native_body = {}
+
+    model = native_body.get("model")
+    if not isinstance(model, str) or not model.strip():
+        return openai_error_response("Missing required parameter: model", 400)
+
+    request_model = RequestModel(
+        model=model.strip(),
+        messages=[Message(role="user", content="")],
+        stream=False,
+    )
+
+    model_handler = get_model_handler()
+    return await model_handler.request_model(
+        request_model,
+        api_index,
+        background_tasks,
+        endpoint=request.url.path,
+        dialect_id="openai-responses",
+        original_payload=native_body,
+        original_headers=dict(request.headers),
+        passthrough_only=True,
+    )
+
+
 # ============================================================
 # 注册
 # ============================================================
@@ -498,6 +594,17 @@ def register() -> None:
                     tags=["Responses"],
                     summary="Create Response",
                     description="创建响应请求，兼容 OpenAI Responses API 格式（GPT-5/o1/o3 等新模型）",
+                ),
+                # POST /v1/responses/* - Responses 子端点通配透传入口
+                EndpointDefinition(
+                    path="/v1/responses/{subpath:path}",
+                    passthrough_root="/v1/responses",
+                    methods=["POST"],
+                    handler=responses_subpath_handler,
+                    tags=["Responses"],
+                    summary="Responses Passthrough Subpaths",
+                    description="OpenAI Responses API 子端点透传入口（仅在上游为 openai-responses 时可用）",
+                    passthrough_only=True,
                 ),
             ],
         )

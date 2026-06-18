@@ -1,12 +1,14 @@
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
+import { toastSuccess, toastError, toastWarning } from '../components/Toast';
 import {
   Key, Plus, RefreshCw, Copy, Trash2, Edit, Save, X, Search,
   Folder, CheckCircle2, AlertCircle, AlertTriangle,
-  Wand2, Wallet, Brain, Download, Check, Ban
+  Wand2, Wallet, Brain, Download, Check, Ban, BarChart3
 } from 'lucide-react';
 import * as Dialog from '@radix-ui/react-dialog';
+import { KeyAnalyticsSheet } from '../components/KeyAnalyticsSheet';
 
 // ========== Types ==========
 interface ApiKeyData {
@@ -16,6 +18,7 @@ interface ApiKeyData {
   groups?: string[];
   group?: string;
   model?: string[];
+  ip_blacklist?: string[];
   preferences?: {
     credits?: number;
     created_at?: string;
@@ -39,6 +42,12 @@ export default function Admin() {
   const [keys, setKeys] = useState<ApiKeyData[]>([]);
   const [keyStates, setKeyStates] = useState<Record<string, ApiKeyState>>({});
   const [loading, setLoading] = useState(true);
+  const [analyticsKey, setAnalyticsKey] = useState<{api: string; name?: string} | null>(null);
+  // 修改原因：Key Analytics 需要与 Channel Analytics 一样由列表按钮打开侧滑 Sheet，而不是用 analyticsKey 是否为空隐式控制。
+  // 修改方式：增加独立 open 状态，关闭 Sheet 时再清空当前 Key。
+  // 目的：让打开、关闭和切换 Key 的状态更清晰，避免后续增加关闭动画或复用组件时互相影响。
+  const [analyticsOpen, setAnalyticsOpen] = useState(false);
+
 
   // Edit Sheet
   const [isSheetOpen, setIsSheetOpen] = useState(false);
@@ -52,8 +61,10 @@ export default function Admin() {
   const [formModels, setFormModels] = useState<string[]>([]);
   const [formCredits, setFormCredits] = useState('');
   const [formRateLimit, setFormRateLimit] = useState('');
+  const [formModelRateLimits, setFormModelRateLimits] = useState<{model: string; rate: string}[]>([]);
   const [formExcludedChannels, setFormExcludedChannels] = useState<string[]>([]);
   const [formExcludedModels, setFormExcludedModels] = useState<string[]>([]);
+  const [formIpBlacklistText, setFormIpBlacklistText] = useState('');
 
   // Input states
   const [groupInput, setGroupInput] = useState('');
@@ -74,6 +85,34 @@ export default function Admin() {
   const [fetchingModels, setFetchingModels] = useState(false);
 
   // ========== Data Loading ==========
+  const parseIpBlacklistText = (text: string): string[] => {
+    // 修改原因：IP 黑名单输入使用 textarea，每行一个规则，同时需要兼容用户粘贴逗号分隔内容。
+    // 修改方式：按换行和逗号拆分，去除空白并去重后保存为字符串数组。
+    // 目的：让前端提交结构与 api.yaml 中的 ip_blacklist 数组一致。
+    return [...new Set(text.split(/[\n,]+/).map(s => s.trim()).filter(Boolean))];
+  };
+
+  const formatIpBlacklistText = (items: unknown): string => {
+    // 修改原因：后端返回的 ip_blacklist 可能来自旧配置字符串或新配置数组。
+    // 修改方式：数组按行展示，字符串原样展示，其他值视为空。
+    // 目的：编辑时清晰展示一行一个 IP/CIDR，并保留旧配置兼容性。
+    if (Array.isArray(items)) return items.map(item => String(item).trim()).filter(Boolean).join('\n');
+    if (typeof items === 'string') return items.trim();
+    return '';
+  };
+
+  const validateIpBlacklistEntries = (entries: string[]): boolean => {
+    // 修改原因：浏览器端无法完整复用 Python ipaddress，过严校验会误伤 IPv6 压缩格式。
+    // 修改方式：仅拦截空白、逗号和明显缺少 IP 主体的条目，严格校验交给后端 update_config。
+    // 目的：避免前端拒绝合法 IPv6，同时仍减少一部分明显误输入。
+    const invalid = entries.find(entry => /\s|,/.test(entry) || entry.startsWith('/') || entry.endsWith('/'));
+    if (invalid) {
+      toastWarning(`IP 黑名单条目格式不正确：${invalid}`);
+      return false;
+    }
+    return true;
+  };
+
   const fetchData = async () => {
     if (!token) return;
     setLoading(true);
@@ -86,7 +125,9 @@ export default function Admin() {
 
       if (configRes.ok) {
         const config = await configRes.json();
-        setKeys(config.api_config?.api_keys || config.api_keys || []);
+        const apiConfig = config.api_config || config;
+        setKeys(apiConfig.api_keys || []);
+
       }
       if (statesRes.ok) {
         const states = await statesRes.json();
@@ -101,6 +142,8 @@ export default function Admin() {
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { fetchData(); }, []);
+
+
 
   // ========== Sheet Handlers ==========
   const openSheet = (index: number | null = null, copyFrom: ApiKeyData | null = null) => {
@@ -137,12 +180,21 @@ export default function Admin() {
 
       setFormModels(Array.isArray(source.model) ? [...source.model] : []);
       setFormCredits(source.preferences?.credits !== undefined ? String(source.preferences.credits) : '');
-      setFormRateLimit(source.preferences?.rate_limit || '');
+      // rate_limit: string | dict
+      const rl = source.preferences?.rate_limit;
+      if (rl && typeof rl === 'object') {
+        setFormRateLimit((rl as any).default || '');
+        setFormModelRateLimits(Object.entries(rl).filter(([k]) => k !== 'default').map(([model, rate]) => ({ model, rate: String(rate) })));
+      } else {
+        setFormRateLimit(typeof rl === 'string' ? rl : '');
+        setFormModelRateLimits([]);
+      }
       // 黑名单
       const ec = source.preferences?.excluded_channels;
       setFormExcludedChannels(Array.isArray(ec) ? [...ec] : (typeof ec === 'string' && ec.trim() ? ec.split(',').map((s: string) => s.trim()).filter(Boolean) : []));
       const em = source.preferences?.excluded_models;
       setFormExcludedModels(Array.isArray(em) ? [...em] : (typeof em === 'string' && em.trim() ? em.split(',').map((s: string) => s.trim()).filter(Boolean) : []));
+      setFormIpBlacklistText(formatIpBlacklistText(source.ip_blacklist));
     } else {
       setFormApi('');
       setFormName('');
@@ -151,8 +203,10 @@ export default function Admin() {
       setFormModels([]);
       setFormCredits('');
       setFormRateLimit('');
+      setFormModelRateLimits([]);
       setFormExcludedChannels([]);
       setFormExcludedModels([]);
+      setFormIpBlacklistText('');
     }
 
     setIsSheetOpen(true);
@@ -169,7 +223,7 @@ export default function Admin() {
         setFormApi(data.api_key);
       }
     } catch {
-      alert('生成密钥失败');
+      toastError('生成密钥失败');
     }
   };
 
@@ -223,7 +277,7 @@ export default function Admin() {
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        alert(`获取模型失败: ${err.detail || res.status}`);
+        toastError(err, "获取模型失败");
         return;
       }
 
@@ -232,7 +286,7 @@ export default function Admin() {
       const models = (data.models || []).map((m: any) => m.id || m).filter(Boolean);
 
       if (models.length === 0) {
-        alert('当前分组下没有可用模型');
+        toastError('当前分组下没有可用模型');
         return;
       }
 
@@ -242,7 +296,7 @@ export default function Admin() {
       setSelectedModels(new Set(models.filter((m: string) => existing.has(m))));
       setIsFetchModelsOpen(true);
     } catch {
-      alert('获取模型失败');
+      toastError('获取模型失败');
     } finally {
       setFetchingModels(false);
     }
@@ -288,9 +342,12 @@ export default function Admin() {
   // ========== Save ==========
   const handleSave = async () => {
     if (!formApi.trim()) {
-      alert('API Key 不能为空');
+      toastWarning('API Key 不能为空');
       return;
     }
+
+    const keyIpBlacklist = parseIpBlacklistText(formIpBlacklistText);
+    if (!validateIpBlacklistEntries(keyIpBlacklist)) return;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const target: any = { api: formApi.trim() };
@@ -299,6 +356,10 @@ export default function Admin() {
     if (formRole.trim()) target.role = formRole.trim();
     target.groups = formGroups.length > 0 ? formGroups : ['default'];
     if (formModels.length > 0) target.model = formModels;
+    // 修改原因：Key 级 IP 黑名单需要保存在 api_keys 条目的顶层字段，而不是 preferences 中。
+    // 修改方式：textarea 解析为数组后赋给 target.ip_blacklist，空数组也保留，方便清空旧配置。
+    // 目的：让每个 API Key 独立的 IP 黑名单随 API Key 保存一起持久化并热更新。
+    target.ip_blacklist = keyIpBlacklist;
 
     // Preferences
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -314,7 +375,14 @@ export default function Admin() {
         }
       }
     }
-    if (formRateLimit.trim()) {
+    // rate_limit: 有模型规则时存 dict，否则存字符串（向后兼容）
+    const validModelLimits = formModelRateLimits.filter(r => r.model.trim() && r.rate.trim());
+    if (validModelLimits.length > 0) {
+      const rlDict: Record<string, string> = {};
+      if (formRateLimit.trim()) rlDict.default = formRateLimit.trim();
+      validModelLimits.forEach(r => { rlDict[r.model.trim()] = r.rate.trim(); });
+      prefs.rate_limit = rlDict;
+    } else if (formRateLimit.trim()) {
       prefs.rate_limit = formRateLimit.trim();
     }
     // 黑名单字段始终写入 prefs（即使为空数组也写入，用于后续清空逻辑）
@@ -340,6 +408,8 @@ export default function Admin() {
       // 清理 undefined 键
       if (target.preferences.excluded_channels === undefined) delete target.preferences.excluded_channels;
       if (target.preferences.excluded_models === undefined) delete target.preferences.excluded_models;
+      if (Object.keys(target.preferences).length === 0) delete target.preferences;
+      target.ip_blacklist = keyIpBlacklist;
       newKeys[editingIndex] = target;
     } else {
       newKeys.push(target);
@@ -356,12 +426,14 @@ export default function Admin() {
         setIsSheetOpen(false);
         fetchData();
       } else {
-        alert('保存失败');
+        toastError('保存失败');
       }
     } catch {
-      alert('网络错误');
+      toastError('网络错误');
     }
   };
+
+
 
   // ========== Delete ==========
   const handleDelete = async (index: number) => {
@@ -380,10 +452,10 @@ export default function Admin() {
         setKeys(newKeys);
         fetchData();
       } else {
-        alert('删除失败');
+        toastError('删除失败');
       }
     } catch {
-      alert('网络错误');
+      toastError('网络错误');
     }
   };
 
@@ -405,10 +477,10 @@ export default function Admin() {
         fetchData();
       } else {
         const data = await res.json().catch(() => ({}));
-        alert(`清空失败: ${data.detail || res.status}`);
+        toastError(data, "清空失败");
       }
     } catch {
-      alert('网络错误');
+      toastError('网络错误');
     }
   };
 
@@ -422,7 +494,7 @@ export default function Admin() {
   const handleAddCredits = async () => {
     const amount = parseFloat(creditsAmount);
     if (isNaN(amount) || amount <= 0) {
-      alert('请输入大于 0 的有效数字');
+      toastWarning('请输入大于 0 的有效数字');
       return;
     }
 
@@ -436,10 +508,10 @@ export default function Admin() {
         fetchData();
       } else {
         const data = await res.json().catch(() => ({}));
-        alert(`充值失败: ${data.detail || res.status}`);
+        toastError(data, "充值失败");
       }
     } catch {
-      alert('网络错误');
+      toastError('网络错误');
     }
   };
 
@@ -465,6 +537,22 @@ export default function Admin() {
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
+  };
+
+  const openKeyAnalytics = (keyObj: ApiKeyData) => {
+    // 修改原因：分析入口需要从当前 Key 行传入完整 Key 和可读名称，Sheet 内部再计算 key_hash。
+    // 修改方式：优先使用顶层 name，兼容 preferences.name，然后显式打开侧滑 Sheet。
+    // 目的：保持 Admin 列表操作区只负责选择 Key，具体分析请求由 KeyAnalyticsSheet 负责。
+    setAnalyticsKey({ api: keyObj.api, name: keyObj.name || keyObj.preferences?.name });
+    setAnalyticsOpen(true);
+  };
+
+  const handleAnalyticsOpenChange = (open: boolean) => {
+    // 修改原因：Radix Dialog 关闭时只会回传 open=false，需要同步清理已选 Key。
+    // 修改方式：先更新 open 状态，关闭时再把 analyticsKey 置空。
+    // 目的：防止下次打开前短暂显示上一次 Key 的标题或数据。
+    setAnalyticsOpen(open);
+    if (!open) setAnalyticsKey(null);
   };
 
   return (
@@ -531,6 +619,7 @@ export default function Admin() {
                 </div>
                 <div className="flex items-center justify-end gap-1 pt-3 border-t border-border">
                   <button onClick={() => openCreditsDialog(keyObj.api)} className="p-1.5 text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500/10 rounded-md" title="充值"><Wallet className="w-4 h-4" /></button>
+                  <button onClick={() => openKeyAnalytics(keyObj)} className="p-1.5 text-primary hover:bg-primary/10 rounded-md" title="用量分析"><BarChart3 className="w-4 h-4" /></button>
                   <button onClick={() => openSheet(null, keyObj)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md" title="复制"><Copy className="w-4 h-4" /></button>
                   <button onClick={() => openSheet(idx)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md" title="编辑"><Edit className="w-4 h-4" /></button>
                   <button onClick={() => handleDelete(idx)} className="p-1.5 text-red-600 dark:text-red-500 hover:bg-red-500/10 rounded-md" title="删除"><Trash2 className="w-4 h-4" /></button>
@@ -594,7 +683,9 @@ export default function Admin() {
                         <div className="text-xs text-muted-foreground/60 mt-1">创建: {state.created_at}</div>
                       )}
                       {keyObj.preferences?.rate_limit && (
-                        <div className="text-[10px] text-muted-foreground/50 mt-0.5">限流: {keyObj.preferences.rate_limit}</div>
+                        <div className="text-[10px] text-muted-foreground/50 mt-0.5">限流: {typeof keyObj.preferences.rate_limit === 'object'
+                          ? `${(keyObj.preferences.rate_limit as any).default || '无全局'} + ${Object.keys(keyObj.preferences.rate_limit).filter(k => k !== 'default').length} 条模型规则`
+                          : keyObj.preferences.rate_limit}</div>
                       )}
                     </td>
                     <td className="px-6 py-4">
@@ -625,6 +716,9 @@ export default function Admin() {
                       <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                         <button onClick={() => openCreditsDialog(keyObj.api)} className="p-1.5 text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500/10 rounded-md" title="充值额度">
                           <Wallet className="w-4 h-4" />
+                        </button>
+                        <button onClick={() => openKeyAnalytics(keyObj)} className="p-1.5 text-primary hover:bg-primary/10 rounded-md" title="用量分析">
+                          <BarChart3 className="w-4 h-4" />
                         </button>
                         <button onClick={() => openSheet(null, keyObj)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md" title="复制配置">
                           <Copy className="w-4 h-4" />
@@ -687,7 +781,10 @@ export default function Admin() {
                       <Wand2 className="w-4 h-4" /> 生成
                     </button>
                   </div>
-                  <p className="text-xs text-muted-foreground mt-1">建议使用以 zk- 开头的随机字符串</p>
+                  {/* 修改原因：管理员需要知道以星号结尾的 API Key 可作为 BYOK 通配符模板。 */}
+                  {/* 修改方式：仅补充说明文字和代码样式示例，不改变 API Key 输入、生成或保存逻辑。 */}
+                  {/* 目的：让 BYOK 模式的配置方式在管理页可见，减少误配置。 */}
+                  <p className="text-xs text-muted-foreground mt-1">建议使用以 zk- 开头的随机字符串。BYOK 模式：以 * 结尾作为通配符模板（如 <code className="font-mono bg-muted px-1 rounded">byok-gemini-*</code>），用户拼接真实上游 Key 后使用</p>
                 </div>
 
                 <div>
@@ -746,7 +843,62 @@ export default function Admin() {
                     placeholder="例如: 60/min, 1000/day"
                     className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
                   />
-                  <p className="text-xs text-muted-foreground mt-1">控制此 Key 的请求速率，支持多段（如 10/min,1000/day）。留空使用全局默认限流。</p>
+                  <p className="text-xs text-muted-foreground mt-1">全局限速：此 Key 所有模型共享的总量上限。留空使用全局默认。</p>
+
+                  {/* 模型专属限速 */}
+                  <div className="mt-3">
+                    <div
+                      className="flex items-center gap-1.5 cursor-pointer select-none text-xs text-muted-foreground hover:text-foreground transition-colors"
+                      onClick={() => {
+                        if (formModelRateLimits.length === 0) setFormModelRateLimits([{ model: '', rate: '' }]);
+                        else setFormModelRateLimits([]);
+                      }}
+                    >
+                      <span className="text-[10px]">{formModelRateLimits.length > 0 ? '▾' : '▸'}</span>
+                      模型专属限速{formModelRateLimits.length > 0 ? ` (${formModelRateLimits.filter(r => r.model.trim()).length})` : ''}
+                    </div>
+                    {formModelRateLimits.length > 0 && (
+                      <div className="mt-2 space-y-2">
+                        {formModelRateLimits.map((entry, idx) => (
+                          <div key={idx} className="flex gap-2 items-center">
+                            <input
+                              value={entry.model}
+                              onChange={e => {
+                                const next = [...formModelRateLimits];
+                                next[idx] = { ...next[idx], model: e.target.value };
+                                setFormModelRateLimits(next);
+                              }}
+                              placeholder="模型名（支持模糊匹配）"
+                              className="flex-1 bg-background border border-border px-3 py-1.5 rounded-lg text-xs font-mono text-foreground"
+                            />
+                            <input
+                              value={entry.rate}
+                              onChange={e => {
+                                const next = [...formModelRateLimits];
+                                next[idx] = { ...next[idx], rate: e.target.value };
+                                setFormModelRateLimits(next);
+                              }}
+                              placeholder="10/min"
+                              className="w-28 bg-background border border-border px-3 py-1.5 rounded-lg text-xs font-mono text-foreground"
+                            />
+                            <button
+                              onClick={() => setFormModelRateLimits(formModelRateLimits.filter((_, i) => i !== idx))}
+                              className="text-muted-foreground hover:text-destructive transition-colors"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                        <button
+                          onClick={() => setFormModelRateLimits([...formModelRateLimits, { model: '', rate: '' }])}
+                          className="text-xs text-primary hover:text-primary/80 flex items-center gap-1"
+                        >
+                          <Plus className="w-3 h-3" /> 添加规则
+                        </button>
+                        <p className="text-[10px] text-muted-foreground">模型名支持模糊匹配（如 "claude" 匹配所有 claude 模型）。专属规则只计该模型请求数，全局规则汇总所有模型。</p>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </section>
 
@@ -754,6 +906,20 @@ export default function Admin() {
               <section className="space-y-4">
                 <div className="text-sm font-semibold text-foreground border-b border-border pb-2 flex items-center gap-2">
                   <Ban className="w-4 h-4 text-red-500" /> 访问控制
+                </div>
+
+                <div className="space-y-3">
+                  <label className="text-sm font-medium text-foreground mb-1.5 block">IP 黑名单</label>
+                  {/* 修改原因：每个 API Key 需要独立维护 IP 黑名单，且字段存放在 api_keys 条目顶层。 */}
+                  {/* 修改方式：在访问控制区域增加 textarea，一行一个 IP/CIDR，保存时解析到 target.ip_blacklist。 */}
+                  {/* 目的：当前 Key 命中黑名单时在鉴权层直接返回 ip_blocked。 */}
+                  <textarea
+                    value={formIpBlacklistText}
+                    onChange={e => setFormIpBlacklistText(e.target.value)}
+                    placeholder={'例如：\n1.2.3.4\n5.6.7.0/24'}
+                    className="w-full min-h-[96px] bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
+                  />
+                  <p className="text-xs text-muted-foreground">仅影响当前 API Key。全局黑名单会先于 Key 级黑名单检查。</p>
                 </div>
 
                 <div className="space-y-3">
@@ -929,7 +1095,10 @@ export default function Admin() {
                     />
                     <button onClick={addModelsFromInput} className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm">添加</button>
                   </div>
-                  <p className="text-xs text-muted-foreground mt-1">多个用逗号或空格分隔，按回车快速添加</p>
+                  {/* 修改原因：BYOK 渠道需要通过“渠道名/*”这类模型规则授权全部模型。 */}
+                  {/* 修改方式：仅扩展手动输入模型规则下方的说明文字，并加入代码样式示例。 */}
+                  {/* 目的：让管理员在配置模型访问规则时能直接看到 BYOK 授权写法。 */}
+                  <p className="text-xs text-muted-foreground mt-1">多个用逗号或空格分隔，按回车快速添加。BYOK 用户可用 <code className="font-mono bg-muted px-1 rounded">渠道名/*</code> 授权访问指定 BYOK 渠道的所有模型</p>
                 </div>
               </section>
             </div>
@@ -1037,6 +1206,14 @@ export default function Admin() {
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
+
+      {/* Key Analytics Sheet */}
+      <KeyAnalyticsSheet
+        open={analyticsOpen}
+        onOpenChange={handleAnalyticsOpenChange}
+        apiKeyValue={analyticsKey?.api || ''}
+        apiKeyName={analyticsKey?.name}
+      />
     </div>
   );
 }

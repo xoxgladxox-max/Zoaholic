@@ -83,6 +83,10 @@ class ClientManager:
                         "limits": limits,
                     }
 
+                    # Anthropic 域名开 HTTP/2（Claude Code CLI 原生走 HTTP/2）
+                    if "anthropic.com" in host or "claude.ai" in host:
+                        client_config["http2"] = True
+
                     client_config = get_proxy(proxy, client_config)
                     self.clients[client_key] = httpx.AsyncClient(**client_config)
 

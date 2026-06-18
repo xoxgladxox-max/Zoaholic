@@ -2,8 +2,9 @@
 Stats 统计和使用量路由
 """
 
+import hashlib
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Any, Literal
+from typing import Optional, List, Dict, Any, Literal, Mapping
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from fastapi.responses import JSONResponse
@@ -115,6 +116,9 @@ class LogEntry(BaseModel):
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
+    # Prompt Caching 统计随日志返回给前端，用于列表摘要和展开详情展示。
+    cached_tokens: Optional[int] = None
+    cache_creation_tokens: Optional[int] = None
     success: bool = False
     status_code: Optional[int] = None
     prompt_price: Optional[float] = None
@@ -130,7 +134,12 @@ class LogEntry(BaseModel):
     retry_path: Optional[str] = None  # JSON格式的重试路径
     request_headers: Optional[str] = None  # 用户请求头
     request_body: Optional[str] = None  # 用户请求体
+    # 修改原因：前端日志详情需要展示上游请求头和上游响应头，响应模型必须显式暴露这些字段。
+    # 修改方式：在 LogEntry 中补齐 upstream_request_headers 与 upstream_response_headers。
+    # 目的：避免 response_model 过滤掉数据库中已经保存的头信息。
+    upstream_request_headers: Optional[str] = None  # 发送到上游的请求头
     upstream_request_body: Optional[str] = None  # 发送到上游的请求体
+    upstream_response_headers: Optional[str] = None  # 上游返回的响应头
     upstream_response_body: Optional[str] = None  # 上游返回的响应体
     response_body: Optional[str] = None  # 返回给用户的响应体
     raw_data_expires_at: Optional[datetime] = None  # 原始数据过期时间
@@ -166,6 +175,10 @@ LOG_CLEARABLE_FIELDS: Dict[str, str] = {
     "request_body": "用户请求体(request_body)",
     "upstream_request_headers": "上游请求头(upstream_request_headers)",
     "upstream_request_body": "上游请求体(upstream_request_body)",
+    # 修改原因：新增上游响应头后，日志清理接口也需要允许清空该字段。
+    # 修改方式：把 upstream_response_headers 加入后端清理白名单。
+    # 目的：保持 Settings.tsx 可选字段与后端可清理字段一致。
+    "upstream_response_headers": "上游响应头(upstream_response_headers)",
     "upstream_response_body": "上游响应体(upstream_response_body)",
     "response_body": "返回给用户的响应体(response_body)",
     "retry_path": "重试路径(retry_path)",
@@ -177,6 +190,10 @@ DEFAULT_LOG_CLEANUP_FIELDS: List[str] = [
     "request_body",
     "upstream_request_headers",
     "upstream_request_body",
+    # 修改原因：默认清理原始日志数据时也应覆盖新增的上游响应头字段。
+    # 修改方式：将 upstream_response_headers 加入 DEFAULT_LOG_CLEANUP_FIELDS。
+    # 目的：避免自动默认选择遗漏该字段导致旧响应头长期保留。
+    "upstream_response_headers",
     "upstream_response_body",
     "response_body",
     "retry_path",
@@ -220,6 +237,105 @@ class LogsCleanupResponse(BaseModel):
     message: str
 
 
+class KeyAnalyticsSummaryItem(BaseModel):
+    key_hash: str
+    api_key_prefix: str
+    api_key_name: Optional[str] = None
+    api_key_group: Optional[str] = None
+    total_requests: int = 0
+    success_count: int = 0
+    success_rate: float = 0.0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_cost: float = 0.0
+    unique_ips: int = 0
+    unique_models: int = 0
+    last_used: Optional[str] = None
+
+
+class KeyAnalyticsOverview(BaseModel):
+    total_requests: int = 0
+    total_cost: float = 0.0
+    active_keys: int = 0
+    active_ips: int = 0
+
+
+class KeyAnalyticsSummaryResponse(BaseModel):
+    data: List[KeyAnalyticsSummaryItem]
+    # 修改原因：前端摘要卡片中的活跃 Key 和活跃 IP 应统计完整时间范围，不能受表格 limit 影响。
+    # 修改方式：在列表数据之外新增 summary 元数据，由后端按相同时间范围单独聚合。
+    # 目的：保证概览卡片和排行表既共享筛选范围，又能分别表达全局摘要与 Top N 明细。
+    summary: KeyAnalyticsOverview = Field(default_factory=KeyAnalyticsOverview)
+    start_datetime: Optional[str] = None
+    end_datetime: Optional[str] = None
+    hours: Optional[int] = None
+    limit: int = 50
+
+
+class KeyAnalyticsIpDistributionItem(BaseModel):
+    ip: Optional[str] = None
+    request_count: int = 0
+    last_used: Optional[str] = None
+    blocked: bool = False
+
+
+class KeyAnalyticsModelDistributionItem(BaseModel):
+    model: Optional[str] = None
+    request_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost: float = 0.0
+
+
+class KeyAnalyticsModelTrendEntry(BaseModel):
+    timestamp: str
+    model: str
+    request_count: int = 0
+
+
+class KeyAnalyticsRecentErrorItem(BaseModel):
+    timestamp: Optional[str] = None
+    model: Optional[str] = None
+    status_code: Optional[int] = None
+    provider: Optional[str] = None
+
+
+class KeyAnalyticsDetailResponse(BaseModel):
+    key_hash: str
+    api_key_prefix: str
+    api_key_name: Optional[str] = None
+    api_key_group: Optional[str] = None
+    ip_distribution: List[KeyAnalyticsIpDistributionItem]
+    model_distribution: List[KeyAnalyticsModelDistributionItem]
+    model_trend: List[KeyAnalyticsModelTrendEntry]
+    model_trend_models: List[str] = []
+    recent_errors: List[KeyAnalyticsRecentErrorItem]
+    granularity: Literal["hour", "day"]
+    start_datetime: Optional[str] = None
+    end_datetime: Optional[str] = None
+
+
+# 修改原因：日志列表接口不能再 SELECT *，否则会把请求体、响应体和头信息等大 TEXT 字段全部读入内存。
+# 修改方式：用 ORM 表结构生成完整列集合，再显式排除只应在详情页读取的原始数据字段。
+# 目的：保证新增列默认会进入列表字段，而高成本原始字段始终只由 /v1/logs/{id} 单条详情接口读取。
+LOG_LIST_EXCLUDED_FIELD_NAMES = (
+    "request_headers",
+    "request_body",
+    "upstream_request_headers",
+    "upstream_request_body",
+    "upstream_response_headers",
+    "upstream_response_body",
+    "response_body",
+)
+LOG_DETAIL_FIELD_NAMES = tuple(column.key for column in RequestStat.__table__.columns)
+LOG_LIST_COLUMN_NAMES = tuple(
+    column_name
+    for column_name in LOG_DETAIL_FIELD_NAMES
+    if column_name not in LOG_LIST_EXCLUDED_FIELD_NAMES
+)
+LOG_LIST_SQL_COLUMN_CLAUSE = ", ".join(LOG_LIST_COLUMN_NAMES)
+
+
 # ============ Helper Functions ============
 
 
@@ -252,6 +368,271 @@ def parse_datetime_input(dt_input: str) -> datetime:
                 f"Invalid datetime format: {dt_input}. "
                 "Use ISO 8601 (YYYY-MM-DDTHH:MM:SSZ) or Unix timestamp."
             )
+
+
+# 修改原因：D1 分支使用手写 SQL，过去 SELECT * 和独立 COUNT 会重复扫描并读取大字段。
+# 修改方式：把轻量列清单拼成显式 SELECT，并在同一个查询中用窗口函数返回 total。
+# 目的：让测试和运行时代码共用同一个 SQL 构造入口，避免列表接口退回 SELECT *。
+def _build_d1_logs_list_sql() -> str:
+    return f"SELECT {LOG_LIST_SQL_COLUMN_CLAUSE} FROM request_stats WHERE 1=1"
+
+
+# 修改原因：SQLite/PostgreSQL/MySQL 分支同样需要显式列，不能通过 ORM 实体隐式 SELECT *。
+# 修改方式：按字段名生成 SQLAlchemy 列对象，列表查询使用轻量列，详情查询使用完整列。
+# 目的：保持 D1 和 SQLAlchemy 两条数据库路径的日志字段策略一致。
+def _log_list_sa_columns() -> List[Any]:
+    return [getattr(RequestStat, column_name) for column_name in LOG_LIST_COLUMN_NAMES]
+
+
+def _log_detail_sa_columns() -> List[Any]:
+    return [getattr(RequestStat, column_name) for column_name in LOG_DETAIL_FIELD_NAMES]
+
+
+# 修改原因：列表查询和详情查询现在分别返回字典式行数据，需要统一转成 LogEntry。
+# 修改方式：集中处理时间解析、API key 掩码、过期原始数据隐藏以及数值类型转换。
+# 目的：减少 D1 与 SQLAlchemy 分支重复逻辑，并确保列表不返回大字段、详情才返回完整原始字段。
+def _to_optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_api_key_prefix(raw_api_key: str) -> str:
+    if raw_api_key and len(raw_api_key) > 11:
+        return f"{raw_api_key[:7]}...{raw_api_key[-4:]}"
+    return raw_api_key
+
+
+def _log_raw_field(row: Mapping[str, Any], field_name: str, *, include_raw_fields: bool, raw_data_expired: bool) -> Optional[str]:
+    if not include_raw_fields or raw_data_expired:
+        return None
+    value = row.get(field_name)
+    return str(value) if value is not None else None
+
+
+def _log_entry_from_mapping(
+    row: Mapping[str, Any],
+    *,
+    include_raw_fields: bool,
+    now: Optional[datetime] = None,
+) -> LogEntry:
+    now = now or datetime.now(timezone.utc)
+    timestamp = parse_d1_datetime(row.get("timestamp")) or now
+    raw_expires_at = parse_d1_datetime(row.get("raw_data_expires_at"))
+    raw_data_expired = raw_expires_at is not None and raw_expires_at < now
+    raw_api_key = row.get("api_key") or ""
+
+    return LogEntry(
+        id=int(row.get("id") or 0),
+        timestamp=timestamp,
+        endpoint=row.get("endpoint"),
+        client_ip=row.get("client_ip"),
+        provider=row.get("provider"),
+        model=row.get("model"),
+        api_key_prefix=_build_api_key_prefix(str(raw_api_key)),
+        process_time=_to_optional_float(row.get("process_time")),
+        first_response_time=_to_optional_float(row.get("first_response_time")),
+        prompt_tokens=int(row.get("prompt_tokens") or 0),
+        completion_tokens=int(row.get("completion_tokens") or 0),
+        total_tokens=int(row.get("total_tokens") or 0),
+        cached_tokens=int(row.get("cached_tokens") or 0),
+        cache_creation_tokens=int(row.get("cache_creation_tokens") or 0),
+        success=_bool_from_db(row.get("success")),
+        status_code=_to_optional_int(row.get("status_code")),
+        prompt_price=_to_optional_float(row.get("prompt_price")),
+        completion_price=_to_optional_float(row.get("completion_price")),
+        is_flagged=_bool_from_db(row.get("is_flagged")),
+        provider_id=row.get("provider_id"),
+        provider_key_index=_to_optional_int(row.get("provider_key_index")),
+        api_key_name=row.get("api_key_name"),
+        api_key_group=row.get("api_key_group"),
+        retry_count=_to_optional_int(row.get("retry_count")),
+        retry_path=row.get("retry_path") if not raw_data_expired else None,
+        request_headers=_log_raw_field(row, "request_headers", include_raw_fields=include_raw_fields, raw_data_expired=raw_data_expired),
+        request_body=_log_raw_field(row, "request_body", include_raw_fields=include_raw_fields, raw_data_expired=raw_data_expired),
+        upstream_request_headers=_log_raw_field(row, "upstream_request_headers", include_raw_fields=include_raw_fields, raw_data_expired=raw_data_expired),
+        upstream_request_body=_log_raw_field(row, "upstream_request_body", include_raw_fields=include_raw_fields, raw_data_expired=raw_data_expired),
+        upstream_response_headers=_log_raw_field(row, "upstream_response_headers", include_raw_fields=include_raw_fields, raw_data_expired=raw_data_expired),
+        upstream_response_body=_log_raw_field(row, "upstream_response_body", include_raw_fields=include_raw_fields, raw_data_expired=raw_data_expired),
+        response_body=_log_raw_field(row, "response_body", include_raw_fields=include_raw_fields, raw_data_expired=raw_data_expired),
+        raw_data_expires_at=raw_expires_at,
+    )
+
+
+def _build_key_analytics_time_range(
+    hours: Optional[int],
+    start_datetime: Optional[str],
+    end_datetime: Optional[str],
+) -> tuple[datetime, datetime, Optional[int]]:
+    """解析 Key Analytics 时间范围。
+
+    修改原因：两个 Key Analytics 端点共享同一套 hours/start/end 参数，重复解析容易出现边界不一致。
+    修改方式：集中处理默认 24 小时、ISO/时间戳解析和起止时间校验。
+    目的：保证汇总与详情下钻使用完全一致的时间过滤范围。
+    """
+
+    now = datetime.now(timezone.utc)
+    effective_hours = hours if hours is not None else 24
+
+    try:
+        if start_datetime or end_datetime:
+            start_dt = parse_datetime_input(start_datetime) if start_datetime else now - timedelta(hours=effective_hours)
+            end_dt = parse_datetime_input(end_datetime) if end_datetime else now
+        else:
+            start_dt = now - timedelta(hours=effective_hours)
+            end_dt = now
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    if end_dt < start_dt:
+        raise HTTPException(status_code=400, detail="end_datetime cannot be before start_datetime.")
+
+    return start_dt, end_dt, effective_hours
+
+
+def _safe_int(value: Any) -> int:
+    """把数据库聚合值安全转成 int。
+
+    修改原因：SQLite、D1 和不同驱动可能把 COUNT/SUM 返回为 int、float、Decimal 或字符串。
+    修改方式：统一空值归零，再尝试 int(float(value))。
+    目的：让接口返回类型稳定，不受数据库驱动影响。
+    """
+
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return 0
+
+
+def _safe_float(value: Any) -> float:
+    """把数据库聚合值安全转成 float。
+
+    修改原因：费用聚合值在不同数据库驱动中可能不是 Python float。
+    修改方式：统一空值归零并捕获类型转换错误。
+    目的：让费用字段始终以数值形式返回给前端图表。
+    """
+
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _key_analytics_hash(api_key: str) -> str:
+    """生成前端使用的 Key 标识。
+
+    修改原因：前端不能接触完整 API Key，但需要稳定标识某个 Key 用于下钻。
+    修改方式：仅对 request_stats 中保存的 api_key 字段计算 SHA-256，并截取前 16 位。
+    目的：避免暴露原始 Key，同时让列表和详情可以通过哈希关联。
+    """
+
+    return hashlib.sha256((api_key or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _key_analytics_prefix(api_key: str) -> str:
+    """生成 Key Analytics 展示前缀。
+
+    修改原因：request_stats.api_key 可能是原始 Key，也可能已经是前缀加星号的脱敏值，接口必须统一保护输出。
+    修改方式：只保留前 8 位并追加 ***；若数据库里已经包含星号，也不会尝试还原。
+    目的：确保新页面不暴露完整 API Key。
+    """
+
+    text = str(api_key or "")
+    if not text:
+        return ""
+    if len(text) <= 8:
+        return f"{text}***"
+    return f"{text[:8]}***"
+
+
+def _stringify_datetime(value: Any) -> Optional[str]:
+    """把数据库时间值转换为 ISO 字符串或原始字符串。
+
+    修改原因：D1 返回字符串，SQLAlchemy 可能返回 datetime，前端只需要稳定可解析的时间文本。
+    修改方式：优先用 parse_d1_datetime 归一到 UTC ISO，无法解析时返回原字符串。
+    目的：降低跨数据库时间格式差异对页面展示的影响。
+    """
+
+    if value is None:
+        return None
+    parsed = parse_d1_datetime(value)
+    if parsed is not None:
+        return parsed.isoformat()
+    return str(value)
+
+
+def _key_analytics_summary_from_row(row: Mapping[str, Any]) -> Dict[str, Any]:
+    """把数据库汇总行转换为前端安全结构。
+
+    修改原因：聚合查询需要隐藏 api_key 原值，同时补齐成功率、费用和数值类型转换。
+    修改方式：从行中取 api_key 计算 hash/prefix，然后移除原始值并构造响应字典。
+    目的：让 D1 和 SQLAlchemy 分支共用一套输出规则。
+    """
+
+    api_key = str(row.get("api_key") or "")
+    total_requests = _safe_int(row.get("total_requests"))
+    success_count = _safe_int(row.get("success_count"))
+    success_rate = round((success_count / total_requests) * 100, 2) if total_requests > 0 else 0.0
+
+    return {
+        "key_hash": _key_analytics_hash(api_key),
+        "api_key_prefix": _key_analytics_prefix(api_key),
+        "api_key_name": row.get("api_key_name"),
+        "api_key_group": row.get("api_key_group"),
+        "total_requests": total_requests,
+        "success_count": success_count,
+        "success_rate": success_rate,
+        "total_prompt_tokens": _safe_int(row.get("total_prompt_tokens")),
+        "total_completion_tokens": _safe_int(row.get("total_completion_tokens")),
+        "total_cost": round(_safe_float(row.get("total_cost")), 8),
+        "unique_ips": _safe_int(row.get("unique_ips")),
+        "unique_models": _safe_int(row.get("unique_models")),
+        "last_used": _stringify_datetime(row.get("last_used")),
+    }
+
+
+def _key_analytics_cost_sql() -> str:
+    """返回跨 SQLite/D1 可用的费用表达式。
+
+    修改原因：Key Analytics 多个查询都会使用同一费用公式，手写多处容易出现字段或除数不一致。
+    修改方式：集中生成 COALESCE 保护后的 SQL 表达式。
+    目的：保证总费用、模型分布和趋势费用的计算口径一致。
+    """
+
+    return "(COALESCE(prompt_tokens, 0) * COALESCE(prompt_price, 0.0) + COALESCE(completion_tokens, 0) * COALESCE(completion_price, 0.0)) / 1000000.0"
+
+
+def _key_analytics_sa_cost_expr():
+    """返回 SQLAlchemy 费用表达式。
+
+    修改原因：SQLAlchemy 分支不能复用手写 SQL 字符串。
+    修改方式：使用 func.coalesce 构建与 D1 分支一致的表达式。
+    目的：保持跨数据库统计口径一致。
+    """
+
+    return (
+        func.coalesce(RequestStat.prompt_tokens, 0) * func.coalesce(RequestStat.prompt_price, 0.0)
+        + func.coalesce(RequestStat.completion_tokens, 0) * func.coalesce(RequestStat.completion_price, 0.0)
+    ) / 1000000.0
 
 
 def _build_cleanup_time_filters(payload: LogsCleanupRequest) -> tuple[Optional[datetime], Optional[datetime], Optional[datetime], Dict[str, Any]]:
@@ -373,7 +754,7 @@ async def get_stats(
             [start_time],
         )
         model_rows = await d1_client.query_all(
-            "SELECT model, COUNT(*) AS count FROM request_stats "
+            "SELECT model, COUNT(*) AS count FROM channel_stats "
             "WHERE timestamp >= ? GROUP BY model ORDER BY count DESC",
             [start_time],
         )
@@ -461,9 +842,9 @@ async def get_stats(
 
             # 3. 每个模型在所有渠道总的请求次数
             model_stats_rs = await session.execute(
-                select(RequestStat.model, func.count().label('count'))
-                .where(RequestStat.timestamp >= start_time)
-                .group_by(RequestStat.model)
+                select(ChannelStat.model, func.count().label('count'))
+                .where(ChannelStat.timestamp >= start_time)
+                .group_by(ChannelStat.model)
                 .order_by(desc('count'))
             )
             model_stats = [{"model": stat.model, "count": int(stat.count or 0)} for stat in model_stats_rs.fetchall()]
@@ -534,6 +915,407 @@ async def get_stats(
     }
 
     return JSONResponse(content=stats)
+
+
+# ============ Key Analytics (API Key 用量分析) ============
+
+@router.get(
+    "/v1/stats/key_analytics/summary",
+    response_model=KeyAnalyticsSummaryResponse,
+    dependencies=[Depends(rate_limit_dependency)],
+)
+async def get_key_analytics_summary(
+    request: Request = None,
+    token: str = Depends(verify_admin_api_key),
+    hours: Optional[int] = Query(default=24, ge=1, le=8760),
+    start_datetime: Optional[str] = None,
+    end_datetime: Optional[str] = None,
+    limit: int = Query(default=50, ge=1, le=500),
+):
+    """按 API Key 聚合请求用量。
+
+    修改原因：管理端需要独立查看每个用户 API Key 的请求量、成功率、费用和活跃来源。
+    修改方式：直接从 request_stats 按 api_key 分组聚合，并只返回 hash 与前缀，不返回数据库中的 api_key 原值。
+    目的：支撑前端 Key Analytics 页面，同时避免完整 API Key 暴露到浏览器。
+    """
+
+    if DISABLE_DATABASE:
+        return KeyAnalyticsSummaryResponse(data=[], hours=hours or 24, limit=limit)
+
+    start_dt, end_dt, effective_hours = _build_key_analytics_time_range(hours, start_datetime, end_datetime)
+    db_type = (DB_TYPE or "sqlite").lower()
+
+    summary_meta = KeyAnalyticsOverview()
+
+    if db_type == "d1":
+        from db import d1_client
+        if d1_client is None:
+            return KeyAnalyticsSummaryResponse(data=[], summary=summary_meta, hours=effective_hours, limit=limit)
+
+        cost_sql = _key_analytics_cost_sql()
+        summary_rows = await d1_client.query_all(
+            "SELECT COUNT(*) AS total_requests, "
+            f"COALESCE(SUM({_key_analytics_cost_sql()}), 0.0) AS total_cost, "
+            "COUNT(DISTINCT api_key) AS active_keys, "
+            "COUNT(DISTINCT client_ip) AS active_ips "
+            "FROM request_stats WHERE timestamp >= ? AND timestamp <= ? "
+            "AND api_key IS NOT NULL AND api_key != ''",
+            [format_d1_datetime(start_dt), format_d1_datetime(end_dt)],
+        )
+        summary_row = summary_rows[0] if summary_rows else {}
+        summary_meta = KeyAnalyticsOverview(
+            total_requests=_safe_int(summary_row.get("total_requests")),
+            total_cost=round(_safe_float(summary_row.get("total_cost")), 8),
+            active_keys=_safe_int(summary_row.get("active_keys")),
+            active_ips=_safe_int(summary_row.get("active_ips")),
+        )
+        sql = (
+            "SELECT api_key, MAX(api_key_name) AS api_key_name, MAX(api_key_group) AS api_key_group, "
+            "COUNT(*) AS total_requests, "
+            "SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END) AS success_count, "
+            "COALESCE(SUM(prompt_tokens), 0) AS total_prompt_tokens, "
+            "COALESCE(SUM(completion_tokens), 0) AS total_completion_tokens, "
+            f"COALESCE(SUM({cost_sql}), 0.0) AS total_cost, "
+            "COUNT(DISTINCT client_ip) AS unique_ips, "
+            "COUNT(DISTINCT model) AS unique_models, "
+            "MAX(timestamp) AS last_used "
+            "FROM request_stats WHERE timestamp >= ? AND timestamp <= ? "
+            "AND api_key IS NOT NULL AND api_key != '' "
+            "GROUP BY api_key ORDER BY total_requests DESC LIMIT ?"
+        )
+        rows = await d1_client.query_all(sql, [format_d1_datetime(start_dt), format_d1_datetime(end_dt), limit])
+    else:
+        async with async_session_scope() as session:
+            cost_expr = _key_analytics_sa_cost_expr()
+            summary_query = (
+                select(
+                    func.count(RequestStat.id).label("total_requests"),
+                    func.coalesce(func.sum(cost_expr), 0.0).label("total_cost"),
+                    func.count(func.distinct(RequestStat.api_key)).label("active_keys"),
+                    func.count(func.distinct(RequestStat.client_ip)).label("active_ips"),
+                )
+                .where(
+                    RequestStat.timestamp >= start_dt,
+                    RequestStat.timestamp <= end_dt,
+                    RequestStat.api_key.isnot(None),
+                    RequestStat.api_key != "",
+                )
+            )
+            summary_result = await session.execute(summary_query)
+            summary_row = summary_result.mappings().one_or_none() or {}
+            summary_meta = KeyAnalyticsOverview(
+                total_requests=_safe_int(summary_row.get("total_requests")),
+                total_cost=round(_safe_float(summary_row.get("total_cost")), 8),
+                active_keys=_safe_int(summary_row.get("active_keys")),
+                active_ips=_safe_int(summary_row.get("active_ips")),
+            )
+            query = (
+                select(
+                    RequestStat.api_key.label("api_key"),
+                    func.max(RequestStat.api_key_name).label("api_key_name"),
+                    func.max(RequestStat.api_key_group).label("api_key_group"),
+                    func.count(RequestStat.id).label("total_requests"),
+                    func.sum(case((RequestStat.status_code < 400, 1), else_=0)).label("success_count"),
+                    func.coalesce(func.sum(RequestStat.prompt_tokens), 0).label("total_prompt_tokens"),
+                    func.coalesce(func.sum(RequestStat.completion_tokens), 0).label("total_completion_tokens"),
+                    func.coalesce(func.sum(cost_expr), 0.0).label("total_cost"),
+                    func.count(func.distinct(RequestStat.client_ip)).label("unique_ips"),
+                    func.count(func.distinct(RequestStat.model)).label("unique_models"),
+                    func.max(RequestStat.timestamp).label("last_used"),
+                )
+                .where(
+                    RequestStat.timestamp >= start_dt,
+                    RequestStat.timestamp <= end_dt,
+                    RequestStat.api_key.isnot(None),
+                    RequestStat.api_key != "",
+                )
+                .group_by(RequestStat.api_key)
+                .order_by(desc("total_requests"))
+                .limit(limit)
+            )
+            result = await session.execute(query)
+            rows = result.mappings().all()
+
+    data = [_key_analytics_summary_from_row(row) for row in rows]
+    return KeyAnalyticsSummaryResponse(
+        data=[KeyAnalyticsSummaryItem(**item) for item in data],
+        summary=summary_meta,
+        start_datetime=start_dt.isoformat(),
+        end_datetime=end_dt.isoformat(),
+        hours=effective_hours,
+        limit=limit,
+    )
+
+
+@router.get(
+    "/v1/stats/key_analytics/{key_hash}",
+    response_model=KeyAnalyticsDetailResponse,
+    dependencies=[Depends(rate_limit_dependency)],
+)
+async def get_key_analytics_detail(
+    key_hash: str,
+    request: Request = None,
+    token: str = Depends(verify_admin_api_key),
+    hours: Optional[int] = Query(default=24, ge=1, le=8760),
+    start_datetime: Optional[str] = None,
+    end_datetime: Optional[str] = None,
+    limit: int = Query(default=50, ge=1, le=500),
+    granularity: Literal["hour", "day"] = Query(default="hour"),
+):
+    """获取单个 API Key 的下钻分析。
+
+    修改原因：前端下钻只能传 key_hash，不能传完整或脱敏 api_key 原值。
+    修改方式：先在时间范围内枚举 request_stats.api_key 并计算哈希，命中后再用该 api_key 精确过滤详情数据。
+    目的：既保护 Key 原值，又让详情查询保持索引友好的精确匹配。
+    """
+
+    if DISABLE_DATABASE:
+        raise HTTPException(status_code=503, detail="Database is disabled.")
+
+    normalized_hash = (key_hash or "").strip().lower()
+    if not normalized_hash:
+        raise HTTPException(status_code=400, detail="key_hash is required.")
+
+    start_dt, end_dt, _effective_hours = _build_key_analytics_time_range(hours, start_datetime, end_datetime)
+    db_type = (DB_TYPE or "sqlite").lower()
+    cost_sql = _key_analytics_cost_sql()
+
+    matched_api_key: Optional[str] = None
+    matched_name: Optional[str] = None
+    matched_group: Optional[str] = None
+
+    if db_type == "d1":
+        from db import d1_client
+        if d1_client is None:
+            raise HTTPException(status_code=503, detail="D1 client is not initialized.")
+
+        base_params = [format_d1_datetime(start_dt), format_d1_datetime(end_dt)]
+        candidate_rows = await d1_client.query_all(
+            "SELECT api_key, MAX(api_key_name) AS api_key_name, MAX(api_key_group) AS api_key_group "
+            "FROM request_stats WHERE timestamp >= ? AND timestamp <= ? "
+            "AND api_key IS NOT NULL AND api_key != '' GROUP BY api_key",
+            base_params,
+        )
+        for row in candidate_rows:
+            api_key = str(row.get("api_key") or "")
+            if _key_analytics_hash(api_key) == normalized_hash:
+                matched_api_key = api_key
+                matched_name = row.get("api_key_name")
+                matched_group = row.get("api_key_group")
+                break
+
+        if matched_api_key is None:
+            raise HTTPException(status_code=404, detail="API key analytics target not found in the selected time range.")
+
+        detail_params = [*base_params, matched_api_key]
+        ip_rows = await d1_client.query_all(
+            "SELECT client_ip AS ip, COUNT(*) AS request_count, MAX(timestamp) AS last_used "
+            "FROM request_stats WHERE timestamp >= ? AND timestamp <= ? AND api_key = ? "
+            "GROUP BY client_ip ORDER BY request_count DESC LIMIT ?",
+            [*detail_params, limit],
+        )
+        model_rows = await d1_client.query_all(
+            "SELECT model, COUNT(*) AS request_count, "
+            "COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, "
+            "COALESCE(SUM(completion_tokens), 0) AS completion_tokens, "
+            f"COALESCE(SUM({cost_sql}), 0.0) AS cost "
+            "FROM request_stats WHERE timestamp >= ? AND timestamp <= ? AND api_key = ? "
+            "GROUP BY model ORDER BY request_count DESC LIMIT ?",
+            [*detail_params, limit],
+        )
+        time_group = "strftime('%Y-%m-%d 00:00:00', timestamp)" if granularity == "day" else "strftime('%Y-%m-%d %H:00:00', timestamp)"
+        trend_rows = await d1_client.query_all(
+            f"SELECT {time_group} AS time_bucket, COUNT(*) AS request_count, "
+            "SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END) AS success_count, "
+            "COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, "
+            "COALESCE(SUM(completion_tokens), 0) AS completion_tokens, "
+            f"COALESCE(SUM({cost_sql}), 0.0) AS cost "
+            "FROM request_stats WHERE timestamp >= ? AND timestamp <= ? AND api_key = ? "
+            "GROUP BY time_bucket ORDER BY time_bucket ASC",
+            detail_params,
+        )
+        error_rows = await d1_client.query_all(
+            "SELECT timestamp, model, status_code, provider "
+            "FROM request_stats WHERE timestamp >= ? AND timestamp <= ? AND api_key = ? "
+            "AND status_code >= 400 ORDER BY timestamp DESC LIMIT 20",
+            detail_params,
+        )
+    else:
+        async with async_session_scope() as session:
+            candidate_query = (
+                select(
+                    RequestStat.api_key.label("api_key"),
+                    func.max(RequestStat.api_key_name).label("api_key_name"),
+                    func.max(RequestStat.api_key_group).label("api_key_group"),
+                )
+                .where(
+                    RequestStat.timestamp >= start_dt,
+                    RequestStat.timestamp <= end_dt,
+                    RequestStat.api_key.isnot(None),
+                    RequestStat.api_key != "",
+                )
+                .group_by(RequestStat.api_key)
+            )
+            candidate_result = await session.execute(candidate_query)
+            for row in candidate_result.mappings().all():
+                api_key = str(row.get("api_key") or "")
+                if _key_analytics_hash(api_key) == normalized_hash:
+                    matched_api_key = api_key
+                    matched_name = row.get("api_key_name")
+                    matched_group = row.get("api_key_group")
+                    break
+
+            if matched_api_key is None:
+                raise HTTPException(status_code=404, detail="API key analytics target not found in the selected time range.")
+
+            filters = (
+                RequestStat.timestamp >= start_dt,
+                RequestStat.timestamp <= end_dt,
+                RequestStat.api_key == matched_api_key,
+            )
+            cost_expr = _key_analytics_sa_cost_expr()
+
+            ip_result = await session.execute(
+                select(
+                    RequestStat.client_ip.label("ip"),
+                    func.count(RequestStat.id).label("request_count"),
+                    func.max(RequestStat.timestamp).label("last_used"),
+                )
+                .where(*filters)
+                .group_by(RequestStat.client_ip)
+                .order_by(desc("request_count"))
+                .limit(limit)
+            )
+            ip_rows = ip_result.mappings().all()
+
+            model_result = await session.execute(
+                select(
+                    RequestStat.model.label("model"),
+                    func.count(RequestStat.id).label("request_count"),
+                    func.coalesce(func.sum(RequestStat.prompt_tokens), 0).label("prompt_tokens"),
+                    func.coalesce(func.sum(RequestStat.completion_tokens), 0).label("completion_tokens"),
+                    func.coalesce(func.sum(cost_expr), 0.0).label("cost"),
+                )
+                .where(*filters)
+                .group_by(RequestStat.model)
+                .order_by(desc("request_count"))
+                .limit(limit)
+            )
+            model_rows = model_result.mappings().all()
+
+            if db_type == "postgres":
+                time_group = func.date_trunc(granularity, RequestStat.timestamp)
+            elif db_type == "mysql":
+                fmt = "%Y-%m-%d 00:00:00" if granularity == "day" else "%Y-%m-%d %H:00:00"
+                time_group = func.date_format(RequestStat.timestamp, fmt)
+            else:
+                fmt = "%Y-%m-%d 00:00:00" if granularity == "day" else "%Y-%m-%d %H:00:00"
+                time_group = func.strftime(fmt, RequestStat.timestamp)
+
+            trend_result = await session.execute(
+                select(
+                    time_group.label("time_bucket"),
+                    RequestStat.model.label("model"),
+                    func.count(RequestStat.id).label("request_count"),
+                )
+                .where(*filters)
+                .group_by(time_group, RequestStat.model)
+                .order_by(time_group.asc() if hasattr(time_group, "asc") else time_group)
+            )
+            trend_rows = trend_result.mappings().all()
+
+            error_result = await session.execute(
+                select(
+                    RequestStat.timestamp.label("timestamp"),
+                    RequestStat.model.label("model"),
+                    RequestStat.status_code.label("status_code"),
+                    RequestStat.provider.label("provider"),
+                )
+                .where(*filters, RequestStat.status_code >= 400)
+                .order_by(RequestStat.timestamp.desc())
+                .limit(20)
+            )
+            error_rows = error_result.mappings().all()
+
+    # IP 黑名单标注
+    from core.ip_blacklist import is_ip_blacklisted
+    app = request.app
+    global_bl = getattr(app.state, "global_ip_blacklist", None)
+    key_bls = getattr(app.state, "api_key_ip_blacklists", []) or []
+    # 找到当前 key 的 index
+    _api_keys = getattr(app.state, "config", {}).get("api_keys", [])
+    _key_bl = None
+    for _ki, _kobj in enumerate(_api_keys):
+        if isinstance(_kobj, dict) and str(_kobj.get("api", "")).strip() == (matched_api_key or "").strip():
+            _key_bl = key_bls[_ki] if _ki < len(key_bls) else None
+            break
+
+    def _is_ip_blocked(ip_str):
+        if not ip_str:
+            return False
+        if is_ip_blacklisted(global_bl, ip_str):
+            return True
+        if _key_bl and is_ip_blacklisted(_key_bl, ip_str):
+            return True
+        return False
+
+    ip_distribution = [
+        KeyAnalyticsIpDistributionItem(
+            ip=row.get("ip"),
+            request_count=_safe_int(row.get("request_count")),
+            last_used=_stringify_datetime(row.get("last_used")),
+            blocked=_is_ip_blocked(row.get("ip")),
+        )
+        for row in ip_rows
+    ]
+    model_distribution = [
+        KeyAnalyticsModelDistributionItem(
+            model=row.get("model"),
+            request_count=_safe_int(row.get("request_count")),
+            prompt_tokens=_safe_int(row.get("prompt_tokens")),
+            completion_tokens=_safe_int(row.get("completion_tokens")),
+            cost=round(_safe_float(row.get("cost")), 8),
+        )
+        for row in model_rows
+    ]
+    # 构建按模型拆分的趋势数据
+    model_trend = [
+        KeyAnalyticsModelTrendEntry(
+            timestamp=_stringify_datetime(row.get("time_bucket")) or str(row.get("time_bucket") or ""),
+            model=row.get("model") or "unknown",
+            request_count=_safe_int(row.get("request_count")),
+        )
+        for row in trend_rows
+    ]
+    # 提取趋势图中出现的模型列表（按总请求量降序，最多8个）
+    _model_counts: dict = {}
+    for entry in model_trend:
+        _model_counts[entry.model] = _model_counts.get(entry.model, 0) + entry.request_count
+    model_trend_models = sorted(_model_counts, key=lambda m: -_model_counts[m])[:8]
+    recent_errors = [
+        KeyAnalyticsRecentErrorItem(
+            timestamp=_stringify_datetime(row.get("timestamp")),
+            model=row.get("model"),
+            status_code=_to_optional_int(row.get("status_code")),
+            provider=row.get("provider"),
+        )
+        for row in error_rows
+    ]
+
+    return KeyAnalyticsDetailResponse(
+        key_hash=normalized_hash,
+        api_key_prefix=_key_analytics_prefix(matched_api_key or ""),
+        api_key_name=matched_name,
+        api_key_group=matched_group,
+        ip_distribution=ip_distribution,
+        model_distribution=model_distribution,
+        model_trend=model_trend,
+        model_trend_models=model_trend_models,
+        recent_errors=recent_errors,
+        granularity=granularity,
+        start_datetime=start_dt.isoformat(),
+        end_datetime=end_dt.isoformat(),
+    )
 
 
 # ============ Usage Analysis (用量分析与费用模拟) ============
@@ -688,7 +1470,10 @@ async def get_usage_analysis(
     from core.stats import get_current_model_prices
     app = get_app()
     for entry in data:
-        prompt_price, completion_price = get_current_model_prices(
+        # 修改原因：get_current_model_prices 新增 cached_price 第三段，旧的二元组解包会在路由实时计价时报错。
+        # 修改方式：这里仍只按汇总 prompt_tokens 估算当前价格成本，因此第三段用 _ 显式忽略。
+        # 目的：保持该查询接口返回结构不变，同时兼容新的三元组价格接口。
+        prompt_price, completion_price, _ = get_current_model_prices(
             app, entry["model"], provider_name=entry["provider"]
         )
         entry["total_cost"] = (
@@ -715,6 +1500,7 @@ async def get_model_trend(
     hours: Optional[int] = Query(default=24, ge=1, le=8760),
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    granularity: Optional[str] = Query(default=None, regex='^(hour|day)$'),
 ):
     """
     获取筛选模型的时间趋势数据，用于折线图展示。
@@ -730,14 +1516,23 @@ async def get_model_trend(
     provider_list = [p.strip() for p in provider.split(',') if p.strip()] if provider else []
     model_list = [m.strip() for m in model.split(',') if m.strip()] if model else []
 
+    # 自动选择聚合粒度：>48h 用天，否则用小时
+    if not granularity:
+        span_hours = (end_dt - start_dt).total_seconds() / 3600
+        granularity = 'day' if span_hours > 48 else 'hour'
+
     if (DB_TYPE or "sqlite").lower() == "d1":
         from db import d1_client
-        # D1/SQLite 使用 strftime 聚合。D1 存储的是字符串，通常格式为 'YYYY-MM-DD HH:MM:SS'
-        # 我们将其截断到小时 'YYYY-MM-DD HH'
-        time_group = "strftime('%Y-%m-%d %H:00:00', timestamp)"
+        if granularity == 'day':
+            time_group = "strftime('%Y-%m-%d', timestamp)"
+        else:
+            time_group = "strftime('%Y-%m-%d %H:00:00', timestamp)"
         sql = f"""
             SELECT {time_group} AS hour, model, COUNT(*) AS count,
-            SUM(COALESCE(total_tokens, 0)) AS tokens
+            SUM(COALESCE(total_tokens, 0)) AS tokens,
+            SUM(COALESCE(prompt_tokens, 0)) AS prompt_tokens,
+            SUM(COALESCE(completion_tokens, 0)) AS completion_tokens,
+            SUM(COALESCE(cached_tokens, 0)) AS cached_tokens
             FROM request_stats WHERE timestamp >= ? AND timestamp <= ?
         """
         params = [format_d1_datetime(start_dt), format_d1_datetime(end_dt)]
@@ -756,20 +1551,25 @@ async def get_model_trend(
         async with async_session_scope() as session:
             # PostgreSQL/MySQL 等数据库使用不同的日期截断函数
             if (DB_TYPE or "").lower() == "postgres":
-                time_group = func.date_trunc('hour', RequestStat.timestamp)
+                time_group = func.date_trunc(granularity, RequestStat.timestamp)
                 order_expr = time_group
             elif (DB_TYPE or "").lower() == "mysql":
-                time_group = func.date_format(RequestStat.timestamp, '%Y-%m-%d %H:00:00')
+                fmt = '%Y-%m-%d' if granularity == 'day' else '%Y-%m-%d %H:00:00'
+                time_group = func.date_format(RequestStat.timestamp, fmt)
                 order_expr = time_group
             else: # SQLite fallback
-                time_group = func.strftime('%Y-%m-%d %H:00:00', RequestStat.timestamp)
+                fmt = '%Y-%m-%d' if granularity == 'day' else '%Y-%m-%d %H:00:00'
+                time_group = func.strftime(fmt, RequestStat.timestamp)
                 order_expr = time_group
 
             query = select(
                 time_group.label('hour'),
                 RequestStat.model,
                 func.count().label('count'),
-                func.sum(func.coalesce(RequestStat.total_tokens, 0)).label('tokens')
+                func.sum(func.coalesce(RequestStat.total_tokens, 0)).label('tokens'),
+                func.sum(func.coalesce(RequestStat.prompt_tokens, 0)).label('prompt_tokens'),
+                func.sum(func.coalesce(RequestStat.completion_tokens, 0)).label('completion_tokens'),
+                func.sum(func.coalesce(RequestStat.cached_tokens, 0)).label('cached_tokens')
             ).where(RequestStat.timestamp >= start_dt, RequestStat.timestamp <= end_dt)
 
             if provider_list:
@@ -784,7 +1584,9 @@ async def get_model_trend(
             query = query.group_by(time_group, RequestStat.model).order_by(order_expr)
             result = await session.execute(query)
             data = [
-                {"hour": str(row.hour), "model": row.model, "count": int(row.count), "tokens": int(row.tokens or 0)}
+                {"hour": str(row.hour), "model": row.model, "count": int(row.count), "tokens": int(row.tokens or 0),
+                 "prompt_tokens": int(row.prompt_tokens or 0), "completion_tokens": int(row.completion_tokens or 0),
+                 "cached_tokens": int(row.cached_tokens or 0)}
                 for row in result.fetchall()
             ]
 
@@ -805,10 +1607,23 @@ async def get_model_trend(
     chart_data = sorted(chart_dict.values(), key=lambda x: x['hour'])
     tokens_chart_data = sorted(tokens_chart_dict.values(), key=lambda x: x['hour'])
 
+    # token 细分数据（按小时聚合，不按模型分）
+    token_breakdown: dict = {}
+    for item in data:
+        h = item['hour']
+        if h not in token_breakdown:
+            token_breakdown[h] = {"hour": h, "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
+        token_breakdown[h]["prompt_tokens"] += item.get("prompt_tokens", 0) or 0
+        token_breakdown[h]["completion_tokens"] += item.get("completion_tokens", 0) or 0
+        token_breakdown[h]["cached_tokens"] += item.get("cached_tokens", 0) or 0
+    token_breakdown_data = sorted(token_breakdown.values(), key=lambda x: x['hour'])
+
     return JSONResponse(content={
         "data": chart_data,
         "tokens_data": tokens_chart_data,
+        "token_breakdown": token_breakdown_data,
         "models": sorted(list(models_seen)),
+        "granularity": granularity,
         "start_datetime": start_dt.isoformat(),
         "end_datetime": end_dt.isoformat(),
     })
@@ -1327,8 +2142,10 @@ async def get_logs(
         if d1_client is None:
             return LogsPage(items=[], total=0, page=page, page_size=page_size, total_pages=0)
 
-        sql = "SELECT * FROM request_stats WHERE 1=1"
-        count_sql = "SELECT COUNT(*) AS total FROM request_stats WHERE 1=1"
+        # 修改原因：D1/SQLite 列表分支原来 SELECT * 并额外 COUNT，会读取大字段且重复扫描。
+        # 修改方式：使用轻量列清单和 COUNT(*) OVER()，total 随当前页数据一起返回。
+        # 目的：让 /v1/logs 列表只承担摘要查询，展开详情再访问 /v1/logs/{id} 拉取完整行。
+        sql = _build_d1_logs_list_sql()
         params: list[Any] = []
 
         if start_time:
@@ -1337,8 +2154,7 @@ async def get_logs(
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid start_time: {e}")
             sql += " AND timestamp >= ?"
-            count_sql += " AND timestamp >= ?"
-            params.append(start_dt)
+            params.append(format_d1_datetime(start_dt))
 
         if end_time:
             try:
@@ -1346,91 +2162,46 @@ async def get_logs(
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid end_time: {e}")
             sql += " AND timestamp <= ?"
-            count_sql += " AND timestamp <= ?"
-            params.append(end_dt)
+            params.append(format_d1_datetime(end_dt))
 
         if provider:
             like_value = f"%{provider}%"
             sql += " AND (provider_id LIKE ? OR provider LIKE ?)"
-            count_sql += " AND (provider_id LIKE ? OR provider LIKE ?)"
             params.extend([like_value, like_value])
 
         if api_key:
             like_value = f"%{api_key}%"
             sql += " AND (api_key_name LIKE ? OR api_key_group LIKE ? OR api_key LIKE ?)"
-            count_sql += " AND (api_key_name LIKE ? OR api_key_group LIKE ? OR api_key LIKE ?)"
             params.extend([like_value, like_value, like_value])
 
         if model:
             like_value = f"%{model}%"
             sql += " AND model LIKE ?"
-            count_sql += " AND model LIKE ?"
             params.append(like_value)
 
         if success is not None:
             success_value = 1 if success else 0
             sql += " AND success = ?"
-            count_sql += " AND success = ?"
             params.append(success_value)
 
+        # 先查 COUNT（轻量，不带大字段）
+        count_sql = sql.replace(f"SELECT {LOG_LIST_SQL_COLUMN_CLAUSE}", "SELECT COUNT(*) AS total", 1)
         total = int(await d1_client.query_value(count_sql, params, column="total", default=0) or 0)
         if total == 0:
             return LogsPage(items=[], total=0, page=page, page_size=page_size, total_pages=0)
 
-        total_pages = (total + page_size - 1) // page_size
-        if page > total_pages:
-            page = total_pages
         offset = (page - 1) * page_size
-
         sql += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
         rows = await d1_client.query_all(sql, [*params, page_size, offset])
 
-        items: List[LogEntry] = []
+        if not rows:
+            return LogsPage(items=[], total=0, page=page, page_size=page_size, total_pages=0)
+        total_pages = (total + page_size - 1) // page_size if total > 0 else 0
         now = datetime.now(timezone.utc)
-        for row in rows:
-            raw_api_key = row.get("api_key") or ""
-            if raw_api_key and len(raw_api_key) > 11:
-                api_key_prefix = f"{raw_api_key[:7]}...{raw_api_key[-4:]}"
-            else:
-                api_key_prefix = raw_api_key
-
-            ts = parse_d1_datetime(row.get("timestamp")) or datetime.now(timezone.utc)
-            raw_expires_at = parse_d1_datetime(row.get("raw_data_expires_at"))
-            raw_data_expired = raw_expires_at is not None and raw_expires_at < now
-
-            items.append(
-                LogEntry(
-                    id=int(row.get("id") or 0),
-                    timestamp=ts,
-                    endpoint=row.get("endpoint"),
-                    client_ip=row.get("client_ip"),
-                    provider=row.get("provider"),
-                    model=row.get("model"),
-                    api_key_prefix=api_key_prefix,
-                    process_time=float(row.get("process_time")) if row.get("process_time") is not None else None,
-                    first_response_time=float(row.get("first_response_time")) if row.get("first_response_time") is not None else None,
-                    prompt_tokens=int(row.get("prompt_tokens") or 0),
-                    completion_tokens=int(row.get("completion_tokens") or 0),
-                    total_tokens=int(row.get("total_tokens") or 0),
-                    success=_bool_from_db(row.get("success")),
-                    status_code=int(row.get("status_code")) if row.get("status_code") is not None else None,
-                    prompt_price=float(row.get("prompt_price")) if row.get("prompt_price") is not None else None,
-                    completion_price=float(row.get("completion_price")) if row.get("completion_price") is not None else None,
-                    is_flagged=_bool_from_db(row.get("is_flagged")),
-                    provider_id=row.get("provider_id"),
-                    provider_key_index=int(row.get("provider_key_index")) if row.get("provider_key_index") is not None else None,
-                    api_key_name=row.get("api_key_name"),
-                    api_key_group=row.get("api_key_group"),
-                    retry_count=int(row.get("retry_count")) if row.get("retry_count") is not None else None,
-                    retry_path=row.get("retry_path") if not raw_data_expired else None,
-                    request_headers=row.get("request_headers") if not raw_data_expired else None,
-                    request_body=row.get("request_body") if not raw_data_expired else None,
-                    upstream_request_body=row.get("upstream_request_body") if not raw_data_expired else None,
-                    upstream_response_body=row.get("upstream_response_body") if not raw_data_expired else None,
-                    response_body=row.get("response_body") if not raw_data_expired else None,
-                    raw_data_expires_at=raw_expires_at,
-                )
-            )
+        items = [
+            _log_entry_from_mapping(row, include_raw_fields=False, now=now)
+            for row in rows
+        ]
 
         return LogsPage(
             items=items,
@@ -1443,7 +2214,7 @@ async def get_logs(
     async with async_session_scope() as session:
         # 构建基础查询条件
         conditions = []
-        
+
         # 时间筛选
         if start_time:
             try:
@@ -1451,14 +2222,14 @@ async def get_logs(
                 conditions.append(RequestStat.timestamp >= start_dt)
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid start_time: {e}")
-        
+
         if end_time:
             try:
                 end_dt = parse_datetime_input(end_time)
                 conditions.append(RequestStat.timestamp <= end_dt)
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid end_time: {e}")
-        
+
         # 模糊搜索：渠道（兼容 provider_id 与 provider 字段）
         if provider:
             conditions.append(
@@ -1467,7 +2238,7 @@ async def get_logs(
                     RequestStat.provider.ilike(f"%{provider}%")
                 )
             )
-        
+
         # 模糊搜索：令牌（API key 名称或分组，及原始 api_key）
         if api_key:
             conditions.append(
@@ -1477,100 +2248,44 @@ async def get_logs(
                     RequestStat.api_key.ilike(f"%{api_key}%")
                 )
             )
-        
+
         # 模型名模糊匹配
         if model:
             conditions.append(RequestStat.model.ilike(f"%{model}%"))
-        
+
         # 成功/失败筛选
         if success is not None:
             conditions.append(RequestStat.success == success)
-        
-        # 统计总数
-        count_query = select(func.count(RequestStat.id)).where(*conditions)
-        result = await session.execute(count_query)
-        total = result.scalar() or 0
-
-        if total == 0:
-            return LogsPage(
-                items=[],
-                total=0,
-                page=page,
-                page_size=page_size,
-                total_pages=0,
-            )
-
-        total_pages = (total + page_size - 1) // page_size
-        if page > total_pages:
-            page = total_pages
 
         offset = (page - 1) * page_size
 
+        # 先查 COUNT（轻量，走索引）
+        count_query = select(func.count()).where(*conditions)
+        total = (await session.execute(count_query)).scalar() or 0
+        if total == 0:
+            return LogsPage(items=[], total=0, page=page, page_size=page_size, total_pages=0)
+
+        # 再查轻量列（不含 body 大字段）
         query = (
-            select(RequestStat)
+            select(*_log_list_sa_columns())
             .where(*conditions)
             .order_by(RequestStat.timestamp.desc())
             .offset(offset)
             .limit(page_size)
         )
         rows_result = await session.execute(query)
-        rows = rows_result.scalars().all()
+        rows = rows_result.mappings().all()
 
-    items: List[LogEntry] = []
+    if not rows:
+        return LogsPage(items=[], total=0, page=page, page_size=page_size, total_pages=0)
+
+    total = total
+    total_pages = (total + page_size - 1) // page_size if total > 0 else 0
     now = datetime.now(timezone.utc)
-    
-    for row in rows:
-        api_key = row.api_key or ""
-        if api_key and len(api_key) > 11:
-            prefix = api_key[:7]
-            suffix = api_key[-4:]
-            api_key_prefix = f"{prefix}...{suffix}"
-        else:
-            api_key_prefix = api_key
-
-        # 检查原始数据是否过期
-        raw_data_expired = False
-        if row.raw_data_expires_at:
-            # 确保时区一致性：如果数据库时间没有时区信息，将其视为UTC
-            expires_at = row.raw_data_expires_at
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
-            raw_data_expired = expires_at < now
-
-        items.append(
-            LogEntry(
-                id=row.id,
-                timestamp=row.timestamp,
-                endpoint=row.endpoint,
-                client_ip=row.client_ip,
-                provider=row.provider,
-                model=row.model,
-                api_key_prefix=api_key_prefix,
-                process_time=row.process_time,
-                first_response_time=row.first_response_time,
-                prompt_tokens=row.prompt_tokens,
-                completion_tokens=row.completion_tokens,
-                total_tokens=row.total_tokens,
-                success=row.success if hasattr(row, 'success') else False,
-                status_code=row.status_code if hasattr(row, 'status_code') else None,
-                prompt_price=getattr(row, 'prompt_price', None),
-                completion_price=getattr(row, 'completion_price', None),
-                is_flagged=row.is_flagged,
-                # 扩展日志字段
-                provider_id=row.provider_id,
-                provider_key_index=row.provider_key_index,
-                api_key_name=row.api_key_name,
-                api_key_group=row.api_key_group,
-                retry_count=row.retry_count,
-                retry_path=row.retry_path if not raw_data_expired else None,
-                request_headers=row.request_headers if not raw_data_expired else None,
-                request_body=row.request_body if not raw_data_expired else None,
-                upstream_request_body=getattr(row, 'upstream_request_body', None) if not raw_data_expired else None,
-                upstream_response_body=getattr(row, 'upstream_response_body', None) if not raw_data_expired else None,
-                response_body=row.response_body if not raw_data_expired else None,
-                raw_data_expires_at=row.raw_data_expires_at,
-            )
-        )
+    items = [
+        _log_entry_from_mapping(row, include_raw_fields=False, now=now)
+        for row in rows
+    ]
 
     return LogsPage(
         items=items,
@@ -1579,6 +2294,51 @@ async def get_logs(
         page_size=page_size,
         total_pages=total_pages,
     )
+
+
+@router.get("/v1/logs/{log_id}", response_model=LogEntry, dependencies=[Depends(rate_limit_dependency)])
+async def get_log_detail(
+    request: Request,
+    log_id: int,
+    token: str = Depends(verify_admin_api_key),
+):
+    """
+    获取单条请求日志完整详情，仅管理员可访问。
+    """
+    if DISABLE_DATABASE:
+        raise HTTPException(status_code=503, detail="Database is disabled.")
+
+    if (DB_TYPE or "sqlite").lower() == "d1":
+        from db import d1_client
+        if d1_client is None:
+            raise HTTPException(status_code=404, detail="Log not found.")
+
+        # 修改原因：列表接口已经排除原始大字段，展开详情时才需要读取完整日志行。
+        # 修改方式：单条详情端点按 id 执行 SELECT *，只对用户展开的那一条日志读取 body 和 headers。
+        # 目的：把高成本大字段读取从列表分页路径移到按需详情路径。
+        rows = await d1_client.query_all(
+            "SELECT * FROM request_stats WHERE id = ? LIMIT 1",
+            [log_id],
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="Log not found.")
+        return _log_entry_from_mapping(rows[0], include_raw_fields=True)
+
+    async with async_session_scope() as session:
+        # 修改原因：SQLAlchemy 详情接口需要返回完整字段，但仍限定为单个主键，避免列表查询拉取大字段。
+        # 修改方式：显式选择 request_stats 的全部列并按 id 限制一行。
+        # 目的：保持详情展示能力不变，同时让列表接口维持轻量查询。
+        query = (
+            select(*_log_detail_sa_columns())
+            .where(RequestStat.id == log_id)
+            .limit(1)
+        )
+        result = await session.execute(query)
+        row = result.mappings().one_or_none()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Log not found.")
+    return _log_entry_from_mapping(row, include_raw_fields=True)
 
 
 # ==================== 后台日志 & 出站请求日志 ====================
@@ -1649,3 +2409,95 @@ async def get_outbound_logs(
         search=search,
     )
     return JSONResponse(content=result)
+
+
+# ── 内存级 provider 活跃度缓存 ──
+import time as _time
+_provider_last_seen: dict[str, float] = {}  # provider → unix timestamp
+_activity_warmed = False
+
+def record_provider_activity(provider: str):
+    """每次请求经过时调用，O(1) 写入内存"""
+    if provider:
+        _provider_last_seen[provider] = _time.time()
+
+async def warm_provider_activity():
+    """启动时从 DB 预热缓存（后台执行，不阻塞启动）"""
+    global _activity_warmed
+    try:
+        from db import DISABLE_DATABASE, DB_TYPE
+        if DISABLE_DATABASE:
+            _activity_warmed = True
+            return
+        if (DB_TYPE or "sqlite").lower() == "d1":
+            _activity_warmed = True
+            return
+        from db import async_session_scope, RequestStat
+        from sqlalchemy import func, select
+        async with async_session_scope() as session:
+            stmt = select(
+                RequestStat.provider,
+                func.max(RequestStat.timestamp).label("last_active")
+            ).group_by(RequestStat.provider)
+            result = await session.execute(stmt)
+            for row in result.fetchall():
+                provider = row[0]
+                last_active = row[1]
+                if provider and last_active:
+                    ts = last_active.timestamp() if hasattr(last_active, 'timestamp') else _time.time()
+                    # 只填充还没有的（运行时记录优先）
+                    if provider not in _provider_last_seen:
+                        _provider_last_seen[provider] = ts
+        _activity_warmed = True
+        import logging
+        logging.getLogger(__name__).info(f"[provider_activity] Warmed cache from DB: {len(_provider_last_seen)} providers")
+    except Exception as e:
+        _activity_warmed = True
+        import logging
+        logging.getLogger(__name__).warning(f"[provider_activity] Warm failed: {e}")
+
+# 每日活跃度刷新已移至 main.py 统一 daily_maintenance 循环
+
+@router.get("/v1/stats/provider_activity", dependencies=[Depends(rate_limit_dependency)])
+async def provider_activity():
+    """
+    返回每个 provider 的最后活跃时间（从内存缓存读取，秒回）。
+    Returns: {"activity": {"provider_name": 1714567890.123, ...}, "warmed": true}
+    """
+    return JSONResponse(content={"activity": _provider_last_seen, "warmed": _activity_warmed})
+
+
+@router.post("/v1/stats/resolve_prices", dependencies=[Depends(rate_limit_dependency)])
+async def resolve_prices(request: Request):
+    """
+    批量查询模型价格。走完整 6 层级联（渠道 > 全局 > 外部库 > default > 0）。
+    
+    Body: {"models": [{"model": "gpt-4o", "provider": "openai"}, ...]}
+    Returns: {"prices": {"gpt-4o": {"prompt": 2.5, "completion": 10.0}, ...}}
+    """
+    from core.stats import get_current_model_prices
+    app = get_app()
+    body = await request.json()
+    models = body.get("models", [])
+    
+    prices = {}
+    for item in models:
+        if isinstance(item, str):
+            model_name = item
+            provider_name = None
+        elif isinstance(item, dict):
+            model_name = item.get("model", "")
+            provider_name = item.get("provider")
+        else:
+            continue
+        if not model_name or model_name in prices:
+            continue
+        # 修改原因：价格解析现在会返回 cached_price，批量解析接口目前只承诺 prompt 和 completion。
+        # 修改方式：解包第三段但不写入响应，避免改变前端或外部调用方的响应结构。
+        # 目的：兼容三元组返回值，并维持 resolve_prices 的旧接口契约。
+        prompt_price, completion_price, _ = get_current_model_prices(
+            app, model_name, provider_name=provider_name
+        )
+        prices[model_name] = {"prompt": prompt_price, "completion": completion_price}
+    
+    return JSONResponse(content={"prices": prices})

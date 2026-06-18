@@ -12,6 +12,7 @@ import Layout from './components/Layout';
 import Login from './pages/Login';
 import Setup from './pages/Setup';
 import { useAuthStore } from './store/authStore';
+import { ToastProvider } from './components/Toast';
 
 // 导入 themeStore 以确保主题初始化代码执行
 import './store/themeStore';
@@ -20,6 +21,7 @@ function App() {
   const { isAuthenticated } = useAuthStore();
 
   return (
+    <ToastProvider>
     <BrowserRouter>
       <Routes>
         <Route path="/setup" element={<Setup />} />
@@ -39,6 +41,7 @@ function App() {
         </Route>
       </Routes>
     </BrowserRouter>
+    </ToastProvider>
   );
 }
 

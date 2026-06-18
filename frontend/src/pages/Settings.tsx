@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
+import { toastSuccess, toastError, toastWarning } from '../components/Toast';
 import {
-  Save, RefreshCw, AlertCircle, Zap, Shield,
+  Save, RefreshCw, AlertCircle, Zap, Shield, Ban,
   Timer, Database, Blocks, Plus, Trash2, Link, DollarSign
 } from 'lucide-react';
 
@@ -47,6 +48,10 @@ const LOG_CLEANUP_FIELD_OPTIONS: { key: string; label: string }[] = [
   { key: 'request_body', label: '用户请求体' },
   { key: 'upstream_request_headers', label: '上游请求头' },
   { key: 'upstream_request_body', label: '上游请求体' },
+  // 修改原因：日志清理界面需要能选择新增的上游响应头字段。
+  // 修改方式：在上游请求体之后加入 upstream_response_headers 选项。
+  // 目的：保持前端清理选项与后端 LOG_CLEARABLE_FIELDS 一致。
+  { key: 'upstream_response_headers', label: '上游响应头' },
   { key: 'upstream_response_body', label: '上游响应体' },
   { key: 'response_body', label: '返回给用户的响应体' },
   { key: 'retry_path', label: '重试路径' },
@@ -62,6 +67,7 @@ export default function Settings() {
   const [preferences, setPreferences] = useState<Preferences>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [globalIpBlacklistText, setGlobalIpBlacklistText] = useState('');
 
   // 数据库清理状态
   const [cleanupAction, setCleanupAction] = useState<CleanupAction>('clear_fields');
@@ -101,6 +107,13 @@ export default function Settings() {
             ];
           }
           setPreferences(loadedPreferences);
+          const apiConfig = data.api_config || data;
+          const rawBl = apiConfig.ip_blacklist;
+          setGlobalIpBlacklistText(
+            Array.isArray(rawBl) ? rawBl.filter(Boolean).join('\n')
+            : typeof rawBl === 'string' ? rawBl.trim()
+            : ''
+          );
         }
       } catch (err) {
         console.error('Failed to load settings:', err);
@@ -180,12 +193,12 @@ export default function Settings() {
     if (!token) return;
 
     if (cleanupAction === 'clear_fields' && cleanupFields.length === 0) {
-      alert('请至少选择一个要清空的字段');
+      toastWarning('请至少选择一个要清空的字段');
       return;
     }
 
     if (cleanupTimeMode === 'older_than_hours' && cleanupOlderThanHours < 1) {
-      alert('按小时清理时，小时数必须大于等于 1');
+      toastWarning('按小时清理时，小时数必须大于等于 1');
       return;
     }
 
@@ -220,12 +233,12 @@ export default function Settings() {
     if (!token) return;
 
     if (cleanupAction === 'clear_fields' && cleanupFields.length === 0) {
-      alert('请至少选择一个要清空的字段');
+      toastWarning('请至少选择一个要清空的字段');
       return;
     }
 
     if (cleanupConfirmText.trim().toUpperCase() !== requiredConfirmPhrase) {
-      alert(`请输入确认词 ${requiredConfirmPhrase} 后再执行`);
+      toastWarning(`请输入确认词 ${requiredConfirmPhrase} 后再执行`);
       return;
     }
 
@@ -272,30 +285,33 @@ export default function Settings() {
         const parts = String(priceStr || '').split(',').map(s => s.trim());
         const inp = parts[0] || '0';
         const out = parts[1] || '0';
-        if (isNaN(Number(inp)) || isNaN(Number(out))) {
-          alert(`模型价格「${trimmed}」的价格值无效，请填写数字`);
+        const cached = parts[2] || '';
+        if (isNaN(Number(inp)) || isNaN(Number(out)) || (cached && isNaN(Number(cached)))) {
+          toastWarning(`模型价格「${trimmed}」的价格值无效，请填写数字`);
           return;
         }
-        validEntries.push([trimmed, `${inp},${out}`]);
+        validEntries.push([trimmed, cached ? `${inp},${out},${cached}` : `${inp},${out}`]);
       }
       cleanedPreferences.model_price = validEntries.length > 0 ? Object.fromEntries(validEntries) : null;
     }
+
+    const ipEntries = [...new Set(globalIpBlacklistText.split(/[\n,]+/).map(s => s.trim()).filter(Boolean))];
 
     setSaving(true);
     try {
       const res = await apiFetch('/v1/api_config/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ preferences: cleanedPreferences })
+        body: JSON.stringify({ preferences: cleanedPreferences, ip_blacklist: ipEntries })
       });
       if (res.ok) {
-        alert('配置已保存成功');
+        toastSuccess('配置已保存成功');
       } else {
         const msg = await parseErrorMessage(res);
-        alert(`保存失败：${msg}`);
+        toastSuccess(`保存失败：${msg}`);
       }
     } catch {
-      alert('网络错误');
+      toastSuccess('网络错误');
     } finally {
       setSaving(false);
     }
@@ -336,16 +352,7 @@ export default function Settings() {
           </div>
           <div className="p-6 space-y-6">
             <div className="grid grid-cols-2 gap-6">
-              <div>
-                <label className="text-sm font-medium text-foreground mb-1.5 block">最大重试次数</label>
-                <input
-                  type="number" min="1" max="100"
-                  value={preferences.max_retry_count ?? 10}
-                  onChange={e => updatePreference('max_retry_count', parseInt(e.target.value))}
-                  className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
-                />
-                <p className="text-xs text-muted-foreground mt-1">多渠道场景下的最大重试次数上限（1-100）</p>
-              </div>
+              {/* max_retry_count 已废弃 — 重试终止靠 key_rules 冷却 + is_all_rate_limited 兜底 */}
               <div>
                 <label className="text-sm font-medium text-foreground mb-1.5 block">渠道冷却时间 (秒)</label>
                 <input
@@ -421,18 +428,20 @@ export default function Settings() {
               </div>
             ) : (
               <div className="space-y-2">
-                <div className="grid grid-cols-[1fr_5.5rem_5.5rem_2rem] gap-2 text-[11px] text-muted-foreground font-medium px-1">
+                <div className="grid grid-cols-[1fr_5rem_5rem_5rem_2rem] gap-2 text-[11px] text-muted-foreground font-medium px-1">
                   <span>模型名 / 前缀</span>
                   <span className="text-center">输入 $/M</span>
                   <span className="text-center">输出 $/M</span>
+                  <span className="text-center">缓存 $/M</span>
                   <span></span>
                 </div>
                 {Object.entries(preferences.model_price || {}).map(([prefix, priceStr], idx) => {
                   const parts = String(priceStr || '').split(',').map(s => s.trim());
                   const inputPrice = parts[0] || '';
                   const outputPrice = parts[1] || '';
+                  const cachedPrice = parts[2] || '';
                   return (
-                    <div key={idx} className="grid grid-cols-[1fr_5.5rem_5.5rem_2rem] gap-2 items-center">
+                    <div key={idx} className="grid grid-cols-[1fr_5rem_5rem_5rem_2rem] gap-2 items-center">
                       <input
                         type="text"
                         value={prefix}
@@ -450,7 +459,8 @@ export default function Settings() {
                         onChange={e => {
                           const mp = { ...(preferences.model_price || {}) };
                           const entries = Object.entries(mp);
-                          entries[idx] = [prefix, `${e.target.value},${outputPrice}`];
+                          const newVal = cachedPrice ? `${e.target.value},${outputPrice},${cachedPrice}` : `${e.target.value},${outputPrice}`;
+                          entries[idx] = [prefix, newVal];
                           updatePreference('model_price', Object.fromEntries(entries));
                         }}
                         placeholder="0.3"
@@ -462,10 +472,25 @@ export default function Settings() {
                         onChange={e => {
                           const mp = { ...(preferences.model_price || {}) };
                           const entries = Object.entries(mp);
-                          entries[idx] = [prefix, `${inputPrice},${e.target.value}`];
+                          const newVal = cachedPrice ? `${inputPrice},${e.target.value},${cachedPrice}` : `${inputPrice},${e.target.value}`;
+                          entries[idx] = [prefix, newVal];
                           updatePreference('model_price', Object.fromEntries(entries));
                         }}
                         placeholder="1.0"
+                        className="bg-background border border-border px-2 py-1.5 rounded-lg text-sm font-mono text-center text-foreground focus:border-primary outline-none"
+                      />
+                      <input
+                        type="text"
+                        value={cachedPrice}
+                        onChange={e => {
+                          const mp = { ...(preferences.model_price || {}) };
+                          const entries = Object.entries(mp);
+                          const val = e.target.value;
+                          const newVal = val ? `${inputPrice},${outputPrice},${val}` : `${inputPrice},${outputPrice}`;
+                          entries[idx] = [prefix, newVal];
+                          updatePreference('model_price', Object.fromEntries(entries));
+                        }}
+                        placeholder="自动"
                         className="bg-background border border-border px-2 py-1.5 rounded-lg text-sm font-mono text-center text-foreground focus:border-primary outline-none"
                       />
                       <button
@@ -506,13 +531,19 @@ export default function Settings() {
                 />
               </div>
               <div>
-                <label className="text-sm font-medium text-foreground mb-1.5 block">Keepalive 心跳间隔 (秒)</label>
+                {/* 修改原因：后端 keepalive_interval 默认值已从关闭心跳改为 15 秒，前端需要展示一致的默认值与关闭方式。
+                    修改方式：把数字输入框的 fallback 改为 15，并在输入框下方补充单位语义和 0 关闭说明。
+                    目的：让管理员在全局配置页能清楚理解 SSE 心跳的默认行为。 */}
+                <label className="text-sm font-medium text-foreground mb-1.5 block">SSE 心跳间隔 (秒)</label>
                 <input
                   type="number" min="0" max="300"
-                  value={preferences.keepalive_interval?.default ?? 25}
+                  value={preferences.keepalive_interval?.default ?? 15}
                   onChange={e => updatePreference('keepalive_interval', { ...(preferences.keepalive_interval || {}), default: parseInt(e.target.value) })}
                   className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
                 />
+                <p className="mt-1.5 text-xs text-muted-foreground">
+                  流式请求时，上游无响应超过此秒数将发送 SSE 心跳，防止连接超时断开。设为 0 关闭
+                </p>
               </div>
             </div>
 
@@ -600,6 +631,23 @@ export default function Settings() {
                 </p>
               </div>
             )}
+          </div>
+        </section>
+
+        {/* 全局 IP 黑名单 */}
+        <section className="bg-card border border-border rounded-xl overflow-hidden">
+          <div className="p-4 border-b border-border bg-muted/30 flex items-center gap-2 font-medium text-foreground">
+            <Ban className="w-5 h-5 text-red-500" /> IP 黑名单
+          </div>
+          <div className="p-6 space-y-3">
+            <p className="text-sm text-muted-foreground">全局 IP 黑名单对所有请求生效，包括 API 和管理接口。每行填写一个精确 IP 或 CIDR 网段。</p>
+            <textarea
+              value={globalIpBlacklistText}
+              onChange={e => setGlobalIpBlacklistText(e.target.value)}
+              placeholder={'例如：\n1.2.3.4\n10.0.0.0/8'}
+              className="w-full min-h-[120px] bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
+            />
+            <p className="text-xs text-muted-foreground">点击页面顶部「保存配置」按钮后生效。各 API Key 还可在 Key 管理页独立配置 Key 级黑名单。</p>
           </div>
         </section>
 

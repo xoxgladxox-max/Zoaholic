@@ -15,13 +15,20 @@ Key Rules 统一错误处理引擎
       - match: { status: 529 }         # 错误码映射
         remap: 429
         duration: 30
+        retry: true                    # 强制允许重试，可省略表示走默认逻辑
       - match: default                 # 兜底
         duration: 60
+        retry: false                   # 强制禁止重试
 
 duration 含义：
   -1  = 永久禁用（需手动恢复）
    0  = 不做 key 处理（仅 remap 生效）
   >0  = 冷却 N 秒后自动恢复
+
+retry 含义：
+  不配置 = 使用 handler 既有硬编码重试逻辑
+  true   = 命中规则后强制允许重试
+  false  = 命中规则后强制禁止重试
 """
 
 from __future__ import annotations
@@ -94,6 +101,12 @@ def _normalize_rules(rules: List[dict]) -> List[dict]:
                     entry["remap"] = remap
             except (TypeError, ValueError):
                 pass
+
+        # 修改原因：Key Rules 新增 retry 三态，缺失必须继续表示“走 handler 默认逻辑”。
+        # 修改方式：只保留原始布尔值 true/false，字符串、数字等非布尔输入一律丢弃。
+        # 目的：避免配置中的空值或字符串被误解释为强制重试或禁止重试。
+        if isinstance(rule.get("retry"), bool):
+            entry["retry"] = rule["retry"]
         
         normalized.append(entry)
     
@@ -179,6 +192,19 @@ def resolve_key_rules(preferences: Dict[str, Any]) -> List[dict]:
     ])
 
 
+def apply_key_rule_retry_override(
+    rule_result: Optional[Dict[str, Any]],
+    retry_enabled: bool,
+) -> bool:
+    """根据命中的 key rule 覆盖 handler 已计算出的默认重试开关。"""
+    # 修改原因：retry 是三态字段，只有显式 true/false 才能覆盖默认硬编码逻辑。
+    # 修改方式：检查匹配结果中的 retry 是否为 bool，是则返回该布尔值，否则保持原 retry_enabled。
+    # 目的：让未配置 retry 的旧规则完全维持原行为，同时支持按规则强制开关重试。
+    if isinstance(rule_result, dict) and isinstance(rule_result.get("retry"), bool):
+        return rule_result["retry"]
+    return retry_enabled
+
+
 def match_key_rules(
     rules: List[dict],
     status_code: int,
@@ -227,6 +253,11 @@ def match_key_rules(
                 result["duration"] = rule["duration"]
             if "remap" in rule:
                 result["remap"] = rule["remap"]
+            # 修改原因：handler 只能根据匹配结果判断本次错误是否需要覆盖重试策略。
+            # 修改方式：匹配命中后把规范化规则中保留的 retry 布尔值透传出去。
+            # 目的：让 retry 的三态语义贯穿配置读取、规则匹配和请求重试判断。
+            if "retry" in rule:
+                result["retry"] = rule["retry"]
             return result
     
     return None

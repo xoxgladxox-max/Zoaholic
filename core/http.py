@@ -128,7 +128,7 @@ def _patched_async_client_init(self, *args, **kwargs):
 
     # 自动注入上下文代理：当调用方未显式指定代理参数时，从 ContextVar 继承
     _proxy_url = _current_proxy.get(None)
-    if _proxy_url and "proxy" not in kwargs and "proxies" not in kwargs and "transport" not in kwargs:
+    if _proxy_url and "proxy" not in kwargs and "transport" not in kwargs:
         from core.utils import get_proxy
         kwargs.update(get_proxy(_proxy_url, {}))
 

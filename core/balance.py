@@ -7,7 +7,7 @@
 
 配置示例（provider.preferences.balance）:
     template: "new-api"          # 可选，使用预置模板
-    endpoint: "/api/status"      # 余额接口地址（绝对 URL 或相对路径）
+    endpoint: "/api/usage/token"  # 余额接口地址（绝对 URL 或相对路径）
     method: "GET"                # 请求方法，默认 GET
     auth: "bearer"               # 认证方式：bearer / header / none
     mapping:                     # 字段提取映射（dot notation）
@@ -29,7 +29,7 @@ from .json_utils import json_loads
 
 BALANCE_TEMPLATES: Dict[str, Dict[str, Any]] = {
     "new-api": {
-        "endpoint": "/api/status",
+        "endpoint": "/api/usage/token",
         "method": "GET",
         "auth": "bearer",
         "mapping": {
@@ -40,13 +40,52 @@ BALANCE_TEMPLATES: Dict[str, Dict[str, Any]] = {
         },
     },
     "openrouter": {
-        "endpoint": "https://openrouter.ai/api/v1/key",
+        "endpoint": "https://openrouter.ai/api/v1/credits",
         "method": "GET",
         "auth": "bearer",
         "mapping": {
-            "total": "data.limit",
-            "used": "data.usage",
+            "total": "data.total_credits",
+            "used": "data.total_usage",
             "value_type": "'amount'",
+        },
+    },
+    "deepseek": {
+        "endpoint": "https://api.deepseek.com/user/balance",
+        "method": "GET",
+        "auth": "bearer",
+        "mapping": {
+            "available": "balance_infos.0.total_balance+balance_infos.1.total_balance",
+            "currency": "balance_infos.0.currency",
+            "value_type": "'quota'",
+        },
+    },
+    "kimi-plan": {
+        "endpoint": "https://api.kimi.com/coding/v1/usages",
+        "method": "GET",
+        "auth": "bearer",
+        "mapping": {
+            "total": "usage.limit",
+            "used": "usage.used",
+            "available": "usage.remaining",
+            "value_type": "'amount'",
+        },
+    },
+    "kimi": {
+        "endpoint": "https://api.moonshot.cn/v1/users/me/balance",
+        "method": "GET",
+        "auth": "bearer",
+        "mapping": {
+            "percent": "data.available_balance",
+            "value_type": "'percent'",
+        },
+    },
+    "siliconflow": {
+        "endpoint": "https://api.siliconflow.cn/v1/user/info",
+        "method": "GET",
+        "auth": "bearer",
+        "mapping": {
+            "percent": "data.balance",
+            "value_type": "'percent'",
         },
     },
 }
@@ -55,12 +94,78 @@ BALANCE_TEMPLATES: Dict[str, Dict[str, Any]] = {
 # ==================== 工具函数 ====================
 
 
+def _safe_eval_expr(expr: str, data: Any) -> Any:
+    """安全执行简单数学表达式，变量引用为 dot notation 路径。
+
+    只允许数字字面量、四则运算(+-*/)、括号、路径引用。
+    用 ast 模块解析，拒绝任何函数调用或其他操作。
+
+    示例:
+        "usage.standard.userTokens / usage.standard.userLimit * 100"
+    """
+    import ast
+    import re
+
+    # 提取所有 dot notation 路径（字母、数字、下划线、点号组成的标识符链）
+    path_pattern = re.compile(r'[a-zA-Z_][a-zA-Z0-9_.]*')
+    paths = path_pattern.findall(expr)
+
+    # 替换路径为实际数值
+    resolved_expr = expr
+    for p in sorted(set(paths), key=len, reverse=True):  # 长路径优先替换
+        val = _extract_dot_path(data, p)
+        f = _to_float(val)
+        if f is None:
+            return None  # 有路径解析不出来就放弃
+        resolved_expr = resolved_expr.replace(p, repr(f))
+
+    # AST 安全校验：只允许数字和运算符
+    try:
+        tree = ast.parse(resolved_expr, mode='eval')
+    except SyntaxError:
+        return None
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Expression, ast.BinOp, ast.UnaryOp,
+                             ast.Constant, ast.Num,
+                             ast.Add, ast.Sub, ast.Mult, ast.Div,
+                             ast.FloorDiv, ast.Mod, ast.Pow,
+                             ast.USub, ast.UAdd)):
+            continue
+        # 不允许的节点类型
+        return None
+
+    try:
+        result = eval(compile(tree, '<expr>', 'eval'))
+        return result
+    except Exception:
+        return None
+
+
+def _extract_dot_path(data: Any, path: str) -> Any:
+    """纯 dot notation 提取，不处理 eval: 和 + 语法。"""
+    current = data
+    for key in path.split("."):
+        if isinstance(current, dict):
+            current = current.get(key)
+        elif isinstance(current, list):
+            try:
+                current = current[int(key)]
+            except (ValueError, IndexError):
+                return None
+        else:
+            return None
+    return current
+
+
 def extract_value(data: Any, path: Optional[str]) -> Any:
     """按 dot notation 从 dict 中提取值。
 
-    - "data.totalQuota"  → data["data"]["totalQuota"]
-    - "'CNY'"            → 常量字符串 "CNY"
-    - None / 空串        → None
+    - "data.totalQuota"        → data["data"]["totalQuota"]
+    - "'CNY'"                  → 常量字符串 "CNY"
+    - "a.0.val+a.1.val"        → 两个路径求和
+    - "eval:a.b / c.d * 100"   → 安全表达式求值
+    - None / 空串              → None
     """
     if path is None:
         return None
@@ -70,24 +175,28 @@ def extract_value(data: Any, path: Optional[str]) -> Any:
     if not path:
         return None
 
+    # eval: 前缀 = 安全表达式求值
+    if path.startswith("eval:"):
+        return _safe_eval_expr(path[5:].strip(), data)
+
     # 单引号包裹 = 常量
     if path.startswith("'") and path.endswith("'") and len(path) >= 2:
         return path[1:-1]
 
+    # 支持 "+" 分隔的多路径求和，如 "a.0.val+a.1.val"
+    if "+" in path:
+        total = 0.0
+        has_any = False
+        for sub_path in path.split("+"):
+            sub_val = extract_value(data, sub_path.strip())
+            f = _to_float(sub_val)
+            if f is not None:
+                total += f
+                has_any = True
+        return total if has_any else None
+
     # dot notation 遍历
-    current = data
-    for key in path.split("."):
-        if isinstance(current, dict):
-            current = current.get(key)
-        elif isinstance(current, list):
-            # 支持数字索引，如 "items.0.value"
-            try:
-                current = current[int(key)]
-            except (ValueError, IndexError):
-                return None
-        else:
-            return None
-    return current
+    return _extract_dot_path(data, path)
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -125,6 +234,29 @@ def resolve_balance_endpoint(base_url: str, endpoint: str) -> str:
         return f"{clean_base}/{endpoint}"
 
 
+
+# base_url 域名 → 模板自动匹配（用户没配 balance 时生效）
+_URL_TEMPLATE_MAP: list[tuple[str, str]] = [
+    ("deepseek.com", "deepseek"),
+    ("deepseek.ai", "deepseek"),
+    ("moonshot.cn", "kimi"),
+    ("kimi.com", "kimi-plan"),
+    ("siliconflow.cn", "siliconflow"),
+    ("siliconcloud.cn", "siliconflow"),
+    ("openrouter.ai", "openrouter"),
+]
+
+
+def _auto_detect_template(base_url: str) -> Optional[str]:
+    """根据 base_url 域名自动匹配余额查询模板。"""
+    if not base_url:
+        return None
+    url_lower = base_url.lower()
+    for domain, template_name in _URL_TEMPLATE_MAP:
+        if domain in url_lower:
+            return template_name
+    return None
+
 def build_balance_config(provider: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """从 provider 配置中解析余额查询配置。
 
@@ -137,6 +269,11 @@ def build_balance_config(provider: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     balance_cfg = prefs.get("balance")
     if not balance_cfg or not isinstance(balance_cfg, dict):
+        # 用户没配 balance → 尝试根据 base_url 自动匹配模板
+        auto_template = _auto_detect_template(provider.get("base_url", ""))
+        if auto_template and auto_template in BALANCE_TEMPLATES:
+            import copy
+            return copy.deepcopy(BALANCE_TEMPLATES[auto_template])
         return None
 
     # 加载模板作为基础
@@ -213,6 +350,9 @@ async def query_provider_balance(client, provider: Dict[str, Any]) -> Dict[str, 
     api_key = provider.get("api") or provider.get("api_key") or ""
     if isinstance(api_key, list):
         api_key = api_key[0] if api_key else ""
+    # 支持 {"sk-xxx": "label"} 格式 — 取 key
+    if isinstance(api_key, dict) and len(api_key) == 1:
+        api_key = str(next(iter(api_key.keys())))
 
     if auth_mode == "bearer" and api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -298,6 +438,10 @@ async def query_provider_balance(client, provider: Dict[str, Any]) -> Dict[str, 
         if raw_percent is not None:
             multiplier = _to_float(balance_cfg.get("percent_multiplier")) or 1
             result["percent"] = raw_percent * multiplier
+    elif value_type == "quota":
+        # 纯额度模式：只有 available，以 100 为基准算百分比色彩
+        result["available"] = _to_float(extract_value(raw_data, mapping.get("available")))
+        result["currency"] = extract_value(raw_data, mapping.get("currency"))
     else:
         result["total"] = _to_float(extract_value(raw_data, mapping.get("total")))
         result["used"] = _to_float(extract_value(raw_data, mapping.get("used")))
@@ -310,6 +454,15 @@ async def query_provider_balance(client, provider: Dict[str, Any]) -> Dict[str, 
             result["used"] = result["total"] - result["available"]
         elif result["used"] is not None and result["available"] is not None and result["total"] is None:
             result["total"] = result["used"] + result["available"]
+
+        # 修改原因：前端机房卡片需要短百分比标签，但百分比口径应由后端统一补齐。
+        # 修改方式：amount 模式在 total 可用且大于 0 时，优先用 available/total 计算剩余额度百分比；没有 available 时用 total-used 兜底。
+        # 目的：让前端直接读取 percent 字段，同时保留 available、used、total 原始明细。
+        if result["total"] is not None and result["total"] > 0:
+            if result["available"] is not None:
+                result["percent"] = round(result["available"] / result["total"] * 100, 2)
+            elif result["used"] is not None:
+                result["percent"] = round((result["total"] - result["used"]) / result["total"] * 100, 2)
 
     result["expires_at"] = extract_value(raw_data, mapping.get("expires_at"))
 

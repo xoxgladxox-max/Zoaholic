@@ -22,7 +22,7 @@ from ..utils import (
     safe_get,
     get_model_dict,
     get_base64_image,
-    get_tools_mode,
+    is_tools_disabled,
     generate_sse_response,
     end_of_line,
     parse_json_safely,
@@ -32,8 +32,10 @@ from ..response import check_response
 from ..json_utils import json_loads, json_dumps_text
 from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
 from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
 from ..file_utils import extract_base64_data
 from .claude_channel import gpt2claude_tools_json
+from core.oauth.providers.base import OAuthProvider
 
 
 # ============================================================
@@ -182,6 +184,84 @@ async def get_access_token(client_email, private_key):
         return response.json()["access_token"]
 
 
+
+class VertexProvider(OAuthProvider):
+    """Vertex AI Service Account OAuth provider."""
+    redirect_mode = "manual"
+    localhost_redirect_uri = ""
+
+    async def refresh_token(self, credential: dict, config=None) -> dict:
+        # 修改原因：Vertex AI 使用服务账号 JWT 换取 access_token，不走浏览器授权流程。
+        # 修改方式：从导入的 credential 读取 client_email/private_key，并复用现有 get_access_token 生成 Bearer token。
+        # 目的：让 OAuthManager 可以刷新并保存 Vertex AI 的短期 access_token。
+        client_email = credential.get("client_email", "")
+        private_key = credential.get("private_key", "")
+        # 自动检测：如果 refresh_token 字段是 service account JSON，解析并提取字段
+        if not client_email or not private_key:
+            raw_token = credential.get("refresh_token", "")
+            if isinstance(raw_token, str) and raw_token.strip().startswith("{"):
+                try:
+                    import json
+                    sa = json.loads(raw_token)
+                    if isinstance(sa, dict) and sa.get("client_email") and sa.get("private_key"):
+                        client_email = sa["client_email"].strip()
+                        private_key = sa["private_key"]
+                        credential["client_email"] = client_email
+                        credential["private_key"] = private_key
+                        if sa.get("project_id"):
+                            credential["project_id"] = sa["project_id"].strip()
+                        credential.pop("refresh_token", None)
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        if not client_email or not private_key:
+            raise ValueError("Missing client_email or private_key in credential")
+        access_token = await get_access_token(client_email, private_key)
+        credential["access_token"] = access_token
+        credential["expires_at"] = int(time.time()) + 3500
+        credential.setdefault("email", client_email)
+        return credential
+
+    def build_auth_url(self, state, redirect_uri):
+        # 修改原因：Vertex AI 的服务账号导入不需要生成浏览器 OAuth 授权地址。
+        # 修改方式：显式抛出 NotImplementedError，避免调用方误以为支持网页授权。
+        # 目的：把 Vertex OAuth 入口限制为手动导入服务账号凭据。
+        raise NotImplementedError("Vertex AI uses service account import, not browser auth")
+
+    async def exchange_code(self, code, redirect_uri, code_verifier=None, config=None):
+        # 修改原因：Vertex AI 的服务账号导入不需要授权码换取 token。
+        # 修改方式：显式抛出 NotImplementedError，防止误走 code exchange 分支。
+        # 目的：保持 Vertex OAuth provider 的认证路径单一且可预测。
+        raise NotImplementedError("Vertex AI uses service account import, not code exchange")
+
+    def get_default_base_url(self):
+        # 修改原因：注册 OAuth provider 时需要提供 Vertex AI 默认 API 根地址。
+        # 修改方式：返回 Google Vertex AI 官方 aiplatform 根地址。
+        # 目的：让 OAuth 解析后的 provider 与现有渠道默认地址保持一致。
+        return "https://aiplatform.googleapis.com/v1beta"
+
+
+def _get_vertex_project_id(provider: dict) -> str:
+    """从 provider 配置或 OAuth 凭据上下文中读取 Vertex project_id。"""
+    # 修改原因：OAuthManager.resolve 传给 payload adapter 的是 access_token 字符串，service account JSON 中的 project_id 不会出现在 provider 配置里。
+    # 修改方式：优先读取 provider 顶层和 preferences 中的 project_id/project，缺失时读取请求上下文中的 _oauth_credential_metadata.project_id。
+    # 目的：让服务账号 JSON 导入的 Vertex OAuth 账号在请求时仍能构造包含项目 ID 的 Vertex AI URL。
+    preferences = provider.get("preferences") if isinstance(provider.get("preferences"), dict) else {}
+    project_id = provider.get("project_id") or preferences.get("project_id") or preferences.get("project")
+    project_id = str(project_id or "").strip()
+    if project_id:
+        return project_id
+    try:
+        from core.middleware import request_info
+
+        current_info = request_info.get()
+    except Exception:
+        return ""
+    metadata = current_info.get("_oauth_credential_metadata") if isinstance(current_info, dict) else None
+    if isinstance(metadata, dict):
+        return str(metadata.get("project_id") or "").strip()
+    return ""
+
+
 def normalize_vertex_payload(payload: dict) -> dict:
     """规范化 Vertex Gemini 负载，合并驼峰和下划线字段，处理拼写错误"""
     # Vertex AI 标准使用 snake_case
@@ -211,11 +291,18 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
     headers = {
         'Content-Type': 'application/json'
     }
-    if provider.get("client_email") and provider.get("private_key"):
+    if api_key and not (provider.get("client_email") and provider.get("private_key")):
+        # 修改原因：OAuthManager 会把 Vertex OAuth credential 解析后的 access_token 作为 api_key 传入。
+        # 修改方式：当 provider 没有服务账号字段时，把 api_key 写入 Authorization Bearer 头。
+        # 目的：让 OAuth 路径与传统服务账号路径共用 Vertex AI 的 Bearer 认证格式。
+        headers['Authorization'] = f"Bearer {api_key}"
+    elif provider.get("client_email") and provider.get("private_key"):
+        # 修改原因：仍需兼容 yaml 中直接配置服务账号 client_email/private_key 的传统路径。
+        # 修改方式：保留现有 JWT 换取 access_token 的逻辑，并写入 Authorization Bearer 头。
+        # 目的：新增 OAuth 支持时不破坏已有 Vertex AI 配置。
         access_token = await get_access_token(provider['client_email'], provider['private_key'])
         headers['Authorization'] = f"Bearer {access_token}"
-    if provider.get("project_id"):
-        project_id = provider.get("project_id")
+    project_id = _get_vertex_project_id(provider)
 
     if request.stream:
         gemini_stream = "streamGenerateContent"
@@ -224,31 +311,26 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
     model_dict = get_model_dict(provider)
     original_model = model_dict[request.model]
 
-    # https://cloud.google.com/vertex-ai/generative-ai/docs/models/gemini/2-0-flash?hl=zh-cn
-    pro_models = ["gemini-2.5"]
-    global_models = ["gemini-2.5-flash-image-preview", "gemini-3-pro"]
-    if any(global_model in original_model for global_model in global_models):
-        location = gemini_preview
-    elif any(pro_model in original_model for pro_model in pro_models):
-        location = gemini2_5_pro_exp
-    else:
-        location = gemini1
+    # 所有模型统一走 global endpoint（Gemini + Claude 均支持）
+    location = gemini_preview  # ThreadSafeCircularList(["global"])
 
-    vertex_base_url = provider.get("base_url", "")
+    vertex_base_url = provider.get("base_url", "https://aiplatform.googleapis.com/v1beta").rstrip('/')
+
     if vertex_base_url.endswith('#'):
         url = vertex_base_url[:-1].rstrip('/')
-    elif "google-vertex-ai" in vertex_base_url or any(global_model in original_model for global_model in global_models):
-        url = vertex_base_url.rstrip('/') + "/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(
+    elif "google-vertex-ai" in vertex_base_url:
+        url = vertex_base_url + "/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(
             LOCATION=await location.next(),
             PROJECT_ID=project_id,
             MODEL_ID=original_model,
             stream=gemini_stream
         )
-    elif api_key is not None and api_key[2] == ".":
-        url = f"https://aiplatform.googleapis.com/v1/publishers/google/models/{original_model}:{gemini_stream}?key={api_key}"
+    elif api_key is not None and len(api_key) > 2 and api_key[2] == "." and "Authorization" not in headers:
+        url = f"{vertex_base_url}/publishers/google/models/{original_model}:{gemini_stream}?key={api_key}"
         headers.pop("Authorization", None)
     else:
-        url = "https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(
+        url = "{BASE_URL}/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(
+            BASE_URL=vertex_base_url,
             LOCATION=await location.next(),
             PROJECT_ID=project_id,
             MODEL_ID=original_model,
@@ -307,11 +389,11 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
             tool_calls = msg.tool_calls
 
         if tool_calls:
-            tools_mode = get_tools_mode(provider)
-            # 根据 tools_mode 决定处理多少个工具调用
-            calls_to_process = tool_calls if tools_mode == "parallel" else tool_calls[:1]
             parts = []
-            for tool_call in calls_to_process:
+            # 修改原因：Vertex Gemini 历史中的工具调用必须完整保留。
+            # 修改方式：直接遍历全部 tool_calls，不再截断。
+            # 目的：避免 functionCall 与后续 functionResponse 不匹配。
+            for tool_call in tool_calls:
                 function_arguments = {
                     "functionCall": {
                         "name": tool_call.function.name,
@@ -459,6 +541,11 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
             if field == "tools":
+                # 修改原因：provider.tools=False 仍需要禁用 Vertex Gemini 工具声明。
+                # 修改方式：遇到工具字段时先检查禁用开关，禁用则跳过声明转换。
+                # 目的：保留禁用工具能力，避免 payload 携带工具声明。
+                if is_tools_disabled(provider):
+                    continue
                 processed_tools = []
                 for tool in value:
                     f_def = copy.deepcopy(tool["function"])
@@ -488,7 +575,7 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
             else:
                 payload[field] = value
 
-    payload["generationConfig"] = generation_config
+    payload.setdefault("generationConfig", {}).update(generation_config)
     if "max_output_tokens" not in generation_config:
         payload["generationConfig"]["max_output_tokens"] = 32768
 
@@ -538,27 +625,28 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
     headers = {
         'Content-Type': 'application/json',
     }
-    if provider.get("client_email") and provider.get("private_key"):
+    if api_key and not (provider.get("client_email") and provider.get("private_key")):
+        # 修改原因：OAuthManager 会把 Vertex OAuth credential 解析后的 access_token 作为 api_key 传入。
+        # 修改方式：当 provider 没有服务账号字段时，把 api_key 写入 Authorization Bearer 头。
+        # 目的：让 OAuth 路径与传统服务账号路径共用 Vertex AI 的 Bearer 认证格式。
+        headers['Authorization'] = f"Bearer {api_key}"
+    elif provider.get("client_email") and provider.get("private_key"):
+        # 修改原因：仍需兼容 yaml 中直接配置服务账号 client_email/private_key 的传统路径。
+        # 修改方式：保留现有 JWT 换取 access_token 的逻辑，并写入 Authorization Bearer 头。
+        # 目的：新增 OAuth 支持时不破坏已有 Vertex AI 配置。
         access_token = await get_access_token(provider['client_email'], provider['private_key'])
         headers['Authorization'] = f"Bearer {access_token}"
-    if provider.get("project_id"):
-        project_id = provider.get("project_id")
+    project_id = _get_vertex_project_id(provider)
 
     model_dict = get_model_dict(provider)
     original_model = model_dict[request.model]
-    if "claude-3-5-sonnet" in original_model or "claude-3-7-sonnet" in original_model or "4-5@" in original_model:
-        location = c35s
-    elif "claude-3-opus" in original_model:
-        location = c3o
-    elif "claude-sonnet-4" in original_model or "claude-opus-4" in original_model:
-        location = c4
-    elif "claude-3-sonnet" in original_model:
-        location = c3s
-    elif "claude-3-haiku" in original_model:
-        location = c3h
+    # Claude on Vertex 统一走 global endpoint
+    location = gemini_preview  # ThreadSafeCircularList(["global"])
 
+    vertex_base_url = provider.get("base_url", "https://aiplatform.googleapis.com/v1").rstrip('/')
     claude_stream = "streamRawPredict"
-    url = "https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/anthropic/models/{MODEL}:{stream}".format(
+    url = "{BASE_URL}/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/anthropic/models/{MODEL}:{stream}".format(
+        BASE_URL=vertex_base_url,
         LOCATION=await location.next(),
         PROJECT_ID=project_id,
         MODEL=original_model,
@@ -608,11 +696,11 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
             tool_call_id = msg.tool_call_id
 
         if tool_calls:
-            tools_mode = get_tools_mode(provider)
             tool_calls_list = []
-            # 根据 tools_mode 决定处理多少个工具调用
-            calls_to_process = tool_calls if tools_mode == "parallel" else tool_calls[:1]
-            for tool_call in calls_to_process:
+            # 修改原因：Vertex Claude 历史中的工具调用必须完整保留。
+            # 修改方式：直接遍历全部 tool_calls，不再截断。
+            # 目的：避免 tool_use 与后续 tool_result 数量不一致。
+            for tool_call in tool_calls:
                 tool_calls_list.append({
                     "type": "tool_use",
                     "id": tool_call.id,
@@ -688,8 +776,10 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
         if field not in miss_fields and value is not None:
             payload[field] = value
 
-    tools_mode = get_tools_mode(provider)
-    if request.tools and tools_mode != "none":
+    # 修改原因：provider.tools=False 仍需要禁用 Vertex Claude 工具声明。
+    # 修改方式：仅在工具未禁用时转换 request.tools。
+    # 目的：保留禁用工具能力，同时移除无意义的工具模式变量。
+    if request.tools and not is_tools_disabled(provider):
         tools = []
         for tool in request.tools:
             json_tool = await gpt2claude_tools_json(tool.dict()["function"])
@@ -712,7 +802,10 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
                         "type": "any"
                     }
 
-    if tools_mode == "none":
+    # 修改原因：禁用工具时，payload 中不能残留工具字段。
+    # 修改方式：用统一的禁用判断清理 tools 和 tool_choice。
+    # 目的：延续 provider.tools=False 的禁用语义。
+    if is_tools_disabled(provider):
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
 
@@ -745,24 +838,56 @@ async def fetch_vertex_claude_response(client, url, headers, payload, model, tim
     response_json = await asyncio.to_thread(json_loads, response_bytes)
     mark_adapter_metrics_managed()
     
-    # Vertex Claude 格式解析与标准 Claude 类似
-    content = safe_get(response_json, "content", 0, "text")
-    prompt_tokens = safe_get(response_json, "usage", "input_tokens")
-    output_tokens = safe_get(response_json, "usage", "output_tokens")
-    total_tokens = (prompt_tokens or 0) + (output_tokens or 0)
+    # Vertex Claude 格式解析与标准 Claude 类似；缓存字段也要按 Claude 口径补入 prompt_tokens。
+    content_list = response_json.get("content", [])
+    text_parts = []
+    # 修改原因：Vertex Claude 非流式 content 也可能包含多个 tool_use，不能只读取第一个 text。
+    # 修改方式：遍历全部 content block，文本累积到 content，tool_use 转成带 index 的 tool_calls_list。
+    # 目的：让 Vertex Claude 与标准 Claude 在并行工具调用时保持一致输出。
+    tool_calls_list = []
+    for item in content_list:
+        item_type = item.get("type", "") if isinstance(item, dict) else ""
+        if item_type == "text":
+            text_parts.append(item.get("text", ""))
+        elif item_type == "tool_use":
+            tool_calls_list.append({
+                "index": len(tool_calls_list),
+                "id": item.get("id"),
+                "type": "function",
+                "function": {
+                    "name": item.get("name", ""),
+                    "arguments": json_dumps_text(item.get("input"), ensure_ascii=False),
+                },
+            })
+    content = "".join(text_parts) if text_parts else None
+    usage = safe_get(response_json, "usage", default={}) or {}
+    cache_usage = extract_cache_usage(usage)
+    prompt_tokens = (
+        (usage.get("input_tokens") or 0)
+        + cache_usage["cached_tokens"]
+        + cache_usage["cache_creation_tokens"]
+    )
+    output_tokens = usage.get("output_tokens", 0)
+    total_tokens = prompt_tokens + (output_tokens or 0)
     role = safe_get(response_json, "role")
     merge_usage(
         prompt_tokens=prompt_tokens,
         completion_tokens=output_tokens,
         total_tokens=total_tokens,
+        **cache_usage,
     )
-    if content:
+    if content or tool_calls_list:
         mark_content_start()
 
     from ..utils import generate_no_stream_response
     yield await generate_no_stream_response(
         timestamp, model, content=content, role=role,
-        total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=output_tokens, return_dict=True
+        total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=output_tokens,
+        # Vertex Claude 非流式输出同样需要缓存字段，供下游 OpenAI 或方言转换使用。
+        cached_tokens=cache_usage["cached_tokens"],
+        cache_creation_tokens=cache_usage["cache_creation_tokens"],
+        return_dict=True,
+        tool_calls_list=tool_calls_list or None,
     )
 
 
@@ -786,6 +911,8 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
         promptTokenCount = 0
         candidatesTokenCount = 0
         totalTokenCount = 0
+        # Vertex 流式响应可能出现 Gemini 风格 cachedContentTokenCount，需跨 JSON 片段暂存到最终 usage chunk。
+        cachedContentTokenCount = 0
 
         async for line in aiter_decoded_lines(response.aiter_bytes()):
 
@@ -800,6 +927,10 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
                 if is_finish and '\"totalTokenCount\": ' in line:
                     json_data = parse_json_safely( "{" + line + "}")
                     totalTokenCount = json_data.get('totalTokenCount', 0)
+                if is_finish and '\"cachedContentTokenCount\": ' in line:
+                    # Vertex Gemini 风格流式 usage 可能分散在多行 JSON 片段中，这里单独采集缓存命中字段。
+                    json_data = parse_json_safely( "{" + line + "}")
+                    cachedContentTokenCount = json_data.get('cachedContentTokenCount', 0)
 
                 if line and '\"text\": \"' in line and is_finish == False:
                     try:
@@ -822,24 +953,149 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
 
         if need_function_call:
             function_call = json_loads(function_full_response)
-            function_call_name = function_call["name"]
-            function_call_id = function_call["id"]
-            mark_content_start()
-            sse_string = await generate_sse_response(timestamp, model, content=None, tools_id=function_call_id, function_call_name=function_call_name)
-            yield sse_string
-            function_full_response = json_dumps_text(function_call["input"], ensure_ascii=False)
-            sse_string = await generate_sse_response(timestamp, model, content=None, tools_id=function_call_id, function_call_name=None, function_call_content=function_full_response)
-            yield sse_string
+            # 修改原因：Vertex Claude 流式路径独立处理 tool_use，旧输出没有显式传递 tool_call_index。
+            # 修改方式：把解析结果规范为列表后逐项递增 function_index，并在工具头和参数片段中使用同一个 index。
+            # 目的：即使上游返回多个工具调用，也不会把参数合并到 index=0。
+            function_calls = function_call if isinstance(function_call, list) else [function_call]
+            for function_index, function_call in enumerate(function_calls):
+                function_call_name = function_call["name"]
+                function_call_id = function_call["id"]
+                mark_content_start()
+                sse_string = await generate_sse_response(
+                    timestamp, model, content=None, tools_id=function_call_id,
+                    function_call_name=function_call_name, tool_call_index=function_index,
+                )
+                yield sse_string
+                function_full_response = json_dumps_text(function_call["input"], ensure_ascii=False)
+                sse_string = await generate_sse_response(
+                    timestamp, model, content=None, tools_id=function_call_id,
+                    function_call_name=None, function_call_content=function_full_response,
+                    tool_call_index=function_index,
+                )
+                yield sse_string
 
         merge_usage(
             prompt_tokens=promptTokenCount,
             completion_tokens=candidatesTokenCount,
             total_tokens=totalTokenCount,
+            cached_tokens=cachedContentTokenCount,
+            cache_creation_tokens=0,
         )
-        sse_string = await generate_sse_response(timestamp, model, None, None, None, None, None, totalTokenCount, promptTokenCount, candidatesTokenCount)
+        sse_string = await generate_sse_response(
+            timestamp, model, None, None, None, None, None,
+            totalTokenCount, promptTokenCount, candidatesTokenCount,
+            # Vertex 流式最终 usage chunk 要保留 cachedContentTokenCount 映射后的 cached_tokens。
+            cached_tokens=cachedContentTokenCount,
+            cache_creation_tokens=0,
+        )
         yield sse_string
 
     yield "data: [DONE]" + end_of_line
+
+
+_VERTEX_KEY_HINT = """
+export default function render(ctx) {
+    ctx.el.textContent = 'Key 填服务账号 JSON（整段粘贴），系统自动解析 project_id 和签发 access_token';
+}
+""".strip()
+
+_VERTEX_BASE_URL_HINT = """
+export default function render(ctx) {
+    ctx.el.textContent = '默认 https://aiplatform.googleapis.com（Region 和 Project ID 从服务账号 JSON 自动读取）';
+}
+""".strip()
+
+_VERTEX_TOKEN_URL_HINT = """
+export default function render(ctx) {
+    ctx.el.textContent = 'Vertex 使用服务账号 JWT 自签 token，无需填写此项';
+}
+""".strip()
+
+
+async def fetch_vertex_gemini_models(client, provider):
+    """获取 Vertex AI Gemini 可用模型列表。"""
+    from ..log_config import logger
+
+    base_url = provider.get('base_url', 'https://aiplatform.googleapis.com/v1beta').rstrip('/')
+
+    # 路由层已经把 OAuth token resolve 到 provider['api'] 里了
+    token = provider.get('api')
+    if isinstance(token, list):
+        token = token[0] if token else None
+    if not token:
+        return []
+
+    # Model Garden 公共目录: /v1beta1/publishers/google/models（不带 project/location）
+    # 从 base_url 提取域名部分
+    import re as _re
+    domain_match = _re.match(r'(https?://[^/]+)', base_url)
+    api_base = domain_match.group(1) if domain_match else 'https://aiplatform.googleapis.com'
+    url = f"{api_base}/v1beta1/publishers/google/models"
+    headers = {'Authorization': f'Bearer {token}'}
+
+    models = []
+    page_token = None
+    for _ in range(10):
+        params = {'pageSize': 100}
+        if page_token:
+            params['pageToken'] = page_token
+        try:
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+        except Exception as e:
+            logger.warning(f'[Vertex] Failed to list Gemini models: {e}')
+            break
+        data = response.json()
+        for m in data.get('publisherModels', data.get('models', [])):
+            name = m.get('name', '')
+            if '/models/' in name:
+                name = name.split('/models/')[-1]
+            name = name.strip()
+            if name and name not in models:
+                models.append(name)
+        page_token = data.get('nextPageToken')
+        if not page_token:
+            break
+    return models
+
+
+async def fetch_vertex_claude_models(client, provider):
+    """获取 Vertex AI Claude 可用模型列表。"""
+    from ..log_config import logger
+
+    base_url = provider.get('base_url', 'https://aiplatform.googleapis.com/v1').rstrip('/')
+
+    # 路由层已经把 OAuth token resolve 到 provider['api'] 里了
+    token = provider.get('api')
+    if isinstance(token, list):
+        token = token[0] if token else None
+    if not token:
+        return []
+
+    # Model Garden 公共目录: /v1beta1/publishers/anthropic/models
+    import re as _re
+    domain_match = _re.match(r'(https?://[^/]+)', base_url)
+    api_base = domain_match.group(1) if domain_match else 'https://aiplatform.googleapis.com'
+    url = f"{api_base}/v1beta1/publishers/anthropic/models"
+    headers = {'Authorization': f'Bearer {token}'}
+
+    try:
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+    except Exception as e:
+        logger.warning(f'[Vertex] Failed to list Claude models: {e}')
+        return []
+
+    data = response.json()
+    models = []
+    for m in data.get('publisherModels', data.get('models', [])):
+        name = m.get('name', '')
+        if '/models/' in name:
+            name = name.split('/models/')[-1]
+        name = name.strip()
+        if name and name not in models:
+            models.append(name)
+    return models
 
 
 def register():
@@ -851,24 +1107,40 @@ def register():
     register_channel(
         id="vertex-gemini",
         type_name="vertex-gemini",
-        default_base_url="https://aiplatform.googleapis.com",
+        default_base_url="https://aiplatform.googleapis.com/v1beta",
         auth_header="Authorization: Bearer {access_token}",
         description="Google Vertex AI (Gemini)",
         request_adapter=get_vertex_gemini_payload,
         response_adapter=fetch_vertex_gemini_response,
         stream_adapter=fetch_gemini_response_stream,
-        models_adapter=None,
+        models_adapter=fetch_vertex_gemini_models,
+        oauth_provider=VertexProvider(),
+        ui_slots={
+            "key_hint": _VERTEX_KEY_HINT,
+            "base_url_hint": _VERTEX_BASE_URL_HINT,
+            "token_url_hint": _VERTEX_TOKEN_URL_HINT,
+            "import_placeholder": '{"type": "service_account", "project_id": "...", ...}',
+        },
+        source="builtin",
     )
     
     # 注册 Vertex Claude
     register_channel(
         id="vertex-claude",
         type_name="vertex-claude",
-        default_base_url="https://aiplatform.googleapis.com",
+        default_base_url="https://aiplatform.googleapis.com/v1",
         auth_header="Authorization: Bearer {access_token}",
         description="Google Vertex AI (Claude)",
         request_adapter=get_vertex_claude_payload,
         response_adapter=fetch_vertex_claude_response,
         stream_adapter=fetch_vertex_claude_response_stream,
-        models_adapter=None,
+        models_adapter=fetch_vertex_claude_models,
+        oauth_provider=VertexProvider(),
+        ui_slots={
+            "key_hint": _VERTEX_KEY_HINT,
+            "base_url_hint": _VERTEX_BASE_URL_HINT,
+            "token_url_hint": _VERTEX_TOKEN_URL_HINT,
+            "import_placeholder": '{"type": "service_account", "project_id": "...", ...}',
+        },
+        source="builtin",
     )

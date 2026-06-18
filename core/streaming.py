@@ -6,13 +6,14 @@ Streaming response helpers.
 
 import json
 import asyncio
+import weakref
 from time import time
 
 from starlette.responses import Response
 from starlette.types import Scope, Receive, Send
 
 from core.log_config import logger
-from core.stats import update_stats
+from core.stats import enqueue_stats
 from core.utils import truncate_for_logging
 from utils import safe_get
 
@@ -22,7 +23,7 @@ class LoggingStreamingResponse(Response):
     包装底层流式响应：
     - 透传 chunk 给客户端
     - 解析 usage 字段，填充 current_info 中的 token 统计
-    - 在完成后调用 update_stats 写入数据库
+    - 在完成后调用 enqueue_stats 入队，由后台 consumer 批量写入数据库
     """
 
     def __init__(
@@ -40,7 +41,10 @@ class LoggingStreamingResponse(Response):
         self.body_iterator = content
         self._closed = False
         self.current_info = current_info or {}
-        self.app = app
+        # 修改原因：流式 Response 持有 FastAPI app 强引用会把 app.state 上的注册表一并留在引用链中。
+        # 修改方式：仅保存 weakref.ref，使用时再解引用，避免 Response → app → state 的循环引用。
+        # 目的：让每个流式请求完成后可以更快释放响应对象和相关请求上下文。
+        self.app = weakref.ref(app) if (app is not None and not isinstance(app, weakref.ReferenceType)) else app
         self.debug = debug
         self.dialect_id = dialect_id or self.current_info.get("dialect_id")
 
@@ -88,25 +92,159 @@ class LoggingStreamingResponse(Response):
             except Exception as send_err:
                 logger.error(f"Error sending error message: {str(send_err)}")
         finally:
-            await send(
-                {
-                    "type": "http.response.body",
-                    "body": b"",
-                    "more_body": False,
-                }
-            )
-            if hasattr(self.body_iterator, "aclose") and not self._closed:
-                await self.body_iterator.aclose()
-                self._closed = True
-
-            # 记录处理时间并写入统计
-            if "start_time" in self.current_info:
-                process_time = time() - self.current_info["start_time"]
-                self.current_info["process_time"] = process_time
             try:
-                await update_stats(self.current_info, app=self.app)
-            except Exception as e:
-                logger.error(f"Error updating stats in LoggingStreamingResponse: {str(e)}")
+                try:
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": b"",
+                            "more_body": False,
+                        }
+                    )
+                except Exception as send_err:
+                    logger.debug(f"Error sending final streaming frame: {str(send_err)}")
+
+                iterator = self.body_iterator
+                if iterator is not None and hasattr(iterator, "aclose") and not self._closed:
+                    await iterator.aclose()
+                    self._closed = True
+
+                current_info = self.current_info or {}
+                # 修改原因：self.app 现在保存的是弱引用，直接把 weakref 传给统计逻辑会丢失 app.state。
+                # 修改方式：在请求收尾处只解引用一次，并把解引用后的 app 传给后续统计和守卫逻辑。
+                # 目的：既保留原有统计能力，又避免 Response 长期强持有 FastAPI app。
+                app = self.app() if self.app else None
+
+                # 记录处理时间并写入统计
+                if "start_time" in current_info:
+                    process_time = time() - current_info["start_time"]
+                    current_info["process_time"] = process_time
+                # sticky_ip: 200 + 0 completion_tokens = 流内报错/空响应，清 session 让下次 round_robin 重新分配
+                try:
+
+                    if (
+                        current_info.get("status_code") == 200
+                        and current_info.get("completion_tokens", 0) == 0
+                        and current_info.get("success")
+                        and app
+                    ):
+                        # 从流内容提取错误信息（精确解析给日志展示用）
+                        # 优先用 upstream_response_body（上游原始返回体），fallback 到 response_body（转换后）
+                        stream_error_msg = self._extract_stream_error(prefer_upstream=True)
+                        # raw body 给 key_rules 关键词匹配用（不依赖硬编码解析）
+                        raw_body = current_info.get("upstream_response_body", "") or current_info.get("response_body", "") or ""
+                        if isinstance(raw_body, bytes):
+                            raw_body = raw_body.decode("utf-8", errors="replace")
+
+                        # 标记为 "假200" — 流建立但无有效输出
+                        current_info["status_code"] = 502
+                        current_info["success"] = False
+                        current_info["error_message"] = stream_error_msg or "Stream completed with 0 output tokens (possible in-stream error)"
+                        logger.warning(
+                            f"[stream_guard] {current_info.get('provider', '?')} "
+                            f"200→502: 0 completion_tokens, error={stream_error_msg!r}"
+                        )
+
+                        from core.utils import provider_api_circular_list
+                        channel_id = current_info.get("provider", "")
+
+                        # key_rules 匹配用 raw body（关键词在任何层级 JSON 里都能命中）
+                        try:
+                            from core.key_rules import resolve_key_rules, match_key_rules
+                            provider_cfg = current_info.get("_provider_cfg")
+                            if provider_cfg and channel_id:
+                                _key_rules = resolve_key_rules(provider_cfg.get("preferences") or {})
+                                if _key_rules:
+                                    _rule = match_key_rules(_key_rules, 502, raw_body)
+                                    if _rule:
+                                        current_api = current_info.get("_used_api_key", "")
+                                        clist = provider_api_circular_list.get(channel_id)
+                                        if clist and current_api:
+                                            _duration = _rule.get("duration", 0)
+                                            _reason = f"stream_guard:{_rule.get('reason', 'key_rule')}"
+                                            if _duration == -1:
+                                                await clist.set_auto_disabled(current_api, duration=0, reason=_reason)
+                                            elif _duration > 0:
+                                                await clist.set_auto_disabled(current_api, duration=_duration, reason=_reason)
+                                            logger.info(f"[stream_guard] key_rule matched: {_reason}, duration={_duration}, key={current_api[:12]}...")
+                        except Exception as e:
+                            logger.debug(f"[stream_guard] key_rules failed: {e}")
+
+                        # sticky_ip: 清 session
+                        clist = provider_api_circular_list.get(channel_id)
+                        if clist and clist.schedule_algorithm == "sticky_ip":
+                            client_ip = current_info.get("client_ip", "")
+                            if client_ip and client_ip in clist._sticky_sessions:
+                                clist._sticky_sessions.pop(client_ip, None)
+                except Exception:
+                    pass
+
+                try:
+                    # 修改原因：流式响应结束时直接 await update_stats 会让请求协程等待 SQLite 串行写入。
+                    # 修改方式：改为同步 enqueue_stats 保存 current_info 快照，后续由常驻 consumer 批量落库。
+                    # 目的：释放流式请求上下文，避免统计写入和 db_semaphore 等待造成协程堆积。
+                    enqueue_stats(current_info, app=app)
+                except Exception as e:
+                    logger.error(f"Error enqueueing stats in LoggingStreamingResponse: {str(e)}")
+            finally:
+                # 修改原因：current_info 和 body_iterator 会连接 provider、api_key、上游响应迭代器等请求级对象。
+                # 修改方式：无论流式发送、关闭迭代器或统计写入是否异常，最终都断开这些强引用。
+                # 目的：让 Response 生命周期结束后及时释放请求上下文，降低 GC 处理循环引用的压力。
+                self.current_info = None
+                self.body_iterator = None
+
+    def _extract_stream_error(self, prefer_upstream: bool = False) -> str:
+        """从 current_info 的响应体中提取错误信息。
+        
+        尝试解析 SSE error event 和 JSON error 对象。
+        返回错误消息字符串，没找到则返回空字符串。
+        
+        Args:
+            prefer_upstream: 优先从 upstream_response_body（上游原始返回体）提取，
+                           fallback 到 response_body（转换后的返回体）。
+        """
+        ci = self.current_info or {}
+        if prefer_upstream:
+            body = ci.get("upstream_response_body", "") or ci.get("response_body", "")
+        else:
+            body = ci.get("response_body", "")
+        if not body:
+            return ""
+        if isinstance(body, bytes):
+            body = body.decode("utf-8", errors="replace")
+        
+        # 尝试从 SSE 事件中提取 error
+        import re
+        for match in re.finditer(r'data:\s*({.+?})\s*(?:\n|$)', body):
+            try:
+                obj = json.loads(match.group(1))
+                if isinstance(obj, dict):
+                    # OpenAI Responses API: {"type":"error","error":{"type":"...","message":"..."}}
+                    err = obj.get("error")
+                    if isinstance(err, dict) and err.get("message"):
+                        return err["message"]
+                    # Standard SSE error
+                    if obj.get("type") == "error" and obj.get("message"):
+                        return obj["message"]
+            except (json.JSONDecodeError, TypeError):
+                continue
+        
+        # 尝试整体 JSON
+        try:
+            obj = json.loads(body)
+            if isinstance(obj, dict):
+                err = obj.get("error")
+                if isinstance(err, dict) and err.get("message"):
+                    return err["message"]
+                if isinstance(err, str):
+                    return err
+        except (json.JSONDecodeError, TypeError):
+            pass
+        
+        # 截取前 200 字符作为兜底
+        if len(body) < 500:
+            return body[:200]
+        return ""
 
     def _try_extract_usage(self, resp: dict) -> None:
         """从已解析的 JSON 对象中提取 usage 并合并到 current_info。
@@ -123,14 +261,20 @@ class LoggingStreamingResponse(Response):
         if dialect and dialect.parse_usage:
             usage_info = dialect.parse_usage(resp)
 
-        # 当前方言未解析出 usage 且不是 openai 时，用 openai 格式保底
+        # 当前方言未解析出 usage 且不是 openai 时，用 openai 格式保底。
         if not usage_info and d_id != "openai":
             o_dialect = get_dialect("openai")
             if o_dialect and o_dialect.parse_usage:
                 usage_info = o_dialect.parse_usage(resp)
 
+        if not usage_info:
+            # 透传响应可能是任意原生协议；最后用宽松 parser 覆盖缓存字段，避免 current_info 漏记。
+            from core.dialects.passthrough import parse_passthrough_usage
+            usage_info = parse_passthrough_usage(resp)
+
         if usage_info:
-            for _usage_key in ("prompt_tokens", "completion_tokens"):
+            # usage 解析同时覆盖普通 token 与 Prompt Caching 字段，保证透传流式响应也能入库缓存统计。
+            for _usage_key in ("prompt_tokens", "completion_tokens", "cached_tokens", "cache_creation_tokens"):
                 new_val = usage_info.get(_usage_key, 0)
                 if new_val > 0:
                     self.current_info[_usage_key] = new_val
@@ -257,8 +401,25 @@ class LoggingStreamingResponse(Response):
             except Exception as e:
                 logger.error(f"Error saving response body: {str(e)}")
 
+        # 非 SSE 响应（如 Gemini 非流式透传）的 usage 提取：
+        # _try_parse_line 只能解析 SSE 格式（按行 data: {json}），
+        # 纯 JSON 响应按行切分后每行都不是完整 JSON，导致 usage 漏采。
+        # 流结束后如果 completion_tokens 仍为 0，尝试把完整响应体当 JSON 解析。
+        if self.current_info.get("completion_tokens", 0) == 0 and response_chunks:
+            try:
+                full_body = b"".join(response_chunks).decode("utf-8", errors="replace")
+                full_resp = json.loads(full_body)
+                if isinstance(full_resp, dict):
+                    self._try_extract_usage(full_resp)
+            except Exception:
+                pass
+
     async def close(self) -> None:
         if not self._closed:
             self._closed = True
-            if hasattr(self.body_iterator, "aclose"):
-                await self.body_iterator.aclose()
+            iterator = self.body_iterator
+            # 修改原因：__call__ 结束后会把 body_iterator 清空，close 可能在清理后被再次调用。
+            # 修改方式：先取局部 iterator，并在存在 aclose 方法时才关闭。
+            # 目的：保持 close 幂等，避免清理引用后再次关闭触发 AttributeError。
+            if iterator is not None and hasattr(iterator, "aclose"):
+                await iterator.aclose()

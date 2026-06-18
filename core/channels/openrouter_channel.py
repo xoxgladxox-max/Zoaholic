@@ -19,6 +19,7 @@ from ..response import check_response
 from ..json_utils import json_loads, json_dumps_text
 from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
 from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
 
 
 # ============================================================
@@ -51,6 +52,11 @@ async def get_openrouter_payload(request, engine, provider, api_key=None):
     }
     if api_key:
         headers['Authorization'] = f'Bearer {api_key}'
+    # 修改原因：OpenRouter 要求普通请求和透传请求都携带站点标识请求头。
+    # 修改方式：在非透传请求构建阶段补齐与 get_openrouter_passthrough_meta 一致的请求头。
+    # 目的：让从 OpenAI 通用渠道移除 URL 检测后，OpenRouter 渠道仍完整注入自身专属 header。
+    headers['HTTP-Referer'] = "https://github.com/HCPTangHY/Zoaholic"
+    headers['X-Title'] = "Zoaholic"
     
     from ..utils import resolve_base_url
     url = resolve_base_url(provider.get("base_url", "https://openrouter.ai/api/v1"), "/chat/completions")
@@ -164,10 +170,12 @@ async def fetch_openrouter_response(client, url, headers, payload, model, timeou
     response_json = await asyncio.to_thread(json_loads, response_bytes)
     mark_adapter_metrics_managed()
     usage = response_json.get("usage", {}) if isinstance(response_json, dict) else {}
+    # OpenRouter 透出 OpenAI 兼容 usage 时也可能包含缓存命中字段，统一写入日志统计。
     merge_usage(
         prompt_tokens=usage.get("prompt_tokens", 0),
         completion_tokens=usage.get("completion_tokens", 0),
         total_tokens=usage.get("total_tokens", 0),
+        **extract_cache_usage(usage),
     )
     if safe_get(response_json, "choices", 0, "message", "content", default=None):
         mark_content_start()
@@ -230,35 +238,50 @@ async def fetch_openrouter_response_stream(client, url, headers, payload, model,
                             # 处理 function call
                             tool_calls = delta.get("tool_calls")
                             if tool_calls:
-                                tool_call = tool_calls[0]
-                                function = tool_call.get("function", {})
-                                if tool_call.get("id"):
-                                    mark_content_start()
-                                    sse_string = await generate_sse_response(
-                                        timestamp, model, content=None,
-                                        tools_id=tool_call["id"],
-                                        function_call_name=function.get("name")
-                                    )
-                                    yield sse_string
-                                if function.get("arguments"):
-                                    mark_content_start()
-                                    sse_string = await generate_sse_response(
-                                        timestamp, model, content=None,
-                                        tools_id=tool_call.get("id"),
-                                        function_call_content=function["arguments"]
-                                    )
-                                    yield sse_string
+                                # 修改原因：OpenRouter 兼容流可能一次返回多个 tool_calls，旧逻辑只处理第一个且没有传 index。
+                                # 修改方式：遍历全部 tool_calls，并把上游 index 原样传给统一 SSE 出口。
+                                # 目的：避免多个 OpenRouter 工具调用的参数被合并到 index=0。
+                                for tool_call in tool_calls:
+                                    tool_call_index = tool_call.get("index", 0)
+                                    function = tool_call.get("function", {})
+                                    if tool_call.get("id"):
+                                        mark_content_start()
+                                        sse_string = await generate_sse_response(
+                                            timestamp, model, content=None,
+                                            tools_id=tool_call["id"],
+                                            function_call_name=function.get("name"),
+                                            tool_call_index=tool_call_index,
+                                        )
+                                        yield sse_string
+                                    if function.get("arguments"):
+                                        mark_content_start()
+                                        sse_string = await generate_sse_response(
+                                            timestamp, model, content=None,
+                                            tools_id=tool_call.get("id"),
+                                            function_call_content=function["arguments"],
+                                            tool_call_index=tool_call_index,
+                                        )
+                                        yield sse_string
                             
                             # 检查是否结束
                             finish_reason = choices[0].get("finish_reason")
                             if finish_reason:
                                 usage = json_data.get("usage", {})
-                                merge_usage(prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0), total_tokens=usage.get("total_tokens", 0))
+                                cache_usage = extract_cache_usage(usage)
+                                # 流式结束 chunk 中的缓存字段需要在生成 usage SSE 前写入 current_info，并继续返回给下游。
+                                merge_usage(
+                                    prompt_tokens=usage.get("prompt_tokens", 0),
+                                    completion_tokens=usage.get("completion_tokens", 0),
+                                    total_tokens=usage.get("total_tokens", 0),
+                                    **cache_usage,
+                                )
                                 sse_string = await generate_sse_response(
                                     timestamp, model, None, None, None, None, None,
                                     usage.get("total_tokens", 0),
                                     usage.get("prompt_tokens", 0),
-                                    usage.get("completion_tokens", 0)
+                                    usage.get("completion_tokens", 0),
+                                    cached_tokens=cache_usage["cached_tokens"],
+                                    cache_creation_tokens=cache_usage["cache_creation_tokens"],
                                 )
                                 yield sse_string
                     except json.JSONDecodeError:
@@ -306,4 +329,5 @@ def register():
         response_adapter=fetch_openrouter_response,
         stream_adapter=fetch_openrouter_response_stream,
         models_adapter=fetch_openrouter_models,
+        source="builtin",
     )

@@ -1,13 +1,26 @@
 """
-请求处理模块
+请求处理入口模块。
 
-包含 process_request 函数和 ModelRequestHandler 类，
-负责向 provider 发送请求、处理响应、错误重试等逻辑。
+修改原因：core.handler.py 原来同时承载普通请求、透传请求和调度处理器，文件体积过大。
+修改方式：将普通请求处理移入 core.process_request，将透传请求处理移入 core.passthrough，并在此处重新导出旧名字。
+目的：不改变外部调用方式，继续兼容 from core.handler import process_request 等旧导入路径。
 """
+
+# 修改原因：外部代码仍从 core.handler 导入这些请求处理函数。
+# 修改方式：在 handler 顶部重新导出拆分后的实现。
+# 目的：保持兼容，不要求调用方修改导入路径。
+from core.process_request import process_request
+from core.passthrough import (
+    _filter_passthrough_headers,
+    _fetch_passthrough_stream,
+    _fetch_passthrough_response,
+    _passthrough_error_wrapper,
+    process_request_passthrough,
+)
 
 import json
 import asyncio
-from collections import defaultdict
+from collections import OrderedDict, deque
 from core.json_utils import json_dumps_text, json_loads
 from datetime import datetime, timedelta, timezone
 from time import time
@@ -23,7 +36,7 @@ from core.log_config import logger
 from core.streaming import LoggingStreamingResponse
 from core.request import get_payload
 from core.response import fetch_response, fetch_response_stream, check_response
-from core.stats import update_stats
+from core.stats import batch_update_channel_stats, update_channel_stats, enqueue_stats
 from core.models import (
     RequestModel,
     ImageGenerationRequest,
@@ -33,6 +46,7 @@ from core.models import (
 )
 from core.utils import get_engine, provider_api_circular_list, truncate_for_logging, is_local_api_key
 from core.routing import get_right_order_providers
+from core.byok import get_byok_real_key, get_byok_template_key, is_byok_provider
 from core.error_response import openai_error_response
 from utils import safe_get, error_handling_wrapper, apply_custom_headers, has_header_case_insensitive
 
@@ -40,10 +54,20 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
 
 # 默认超时时间（10分钟，支持长时间 reasoning 请求）
+# 默认超时时间（10分钟，支持长时间 reasoning 请求）
 DEFAULT_TIMEOUT = 600
 
 # 调试模式标志
 is_debug = False
+
+# 修改原因：每个请求结束时单独 create_task 写 channel_stats，会在 SQLite 锁等待时堆积大量协程。
+# 修改方式：使用固定上限 deque 保存轻量统计参数，并由一个常驻 consumer 批量写入。
+# 目的：限制内存占用，避免后台统计写入协程随请求数量线性增长。
+_channel_stats_buffer: deque = deque(maxlen=10000)
+_channel_stats_consumer_started = False
+_channel_stats_flush_event: Optional[asyncio.Event] = None
+_CHANNEL_STATS_BATCH_SIZE = 50
+_CHANNEL_STATS_FLUSH_INTERVAL = 2
 
 
 def set_debug_mode(debug: bool):
@@ -52,29 +76,186 @@ def set_debug_mode(debug: bool):
     is_debug = debug
 
 
-def _fire_and_forget_channel_stats(update_channel_stats_func: Callable, *args, **kwargs) -> None:
-    """异步写入 ChannelStat，不依赖 FastAPI BackgroundTasks。
+# 修改原因：provider 轮转游标和锁表原来使用 defaultdict，会随着请求模型和虚拟优先级 key 无上限增长。
+# 修改方式：基于 OrderedDict 实现一个轻量 LRU 字典，访问时刷新顺序，写入后超过 maxsize 就淘汰最久未使用项。
+# 目的：不新增第三方依赖的前提下限制内存占用，并保留现有 dict 风格调用方式。
+class LRUDict(OrderedDict):
+    def __init__(self, maxsize=500):
+        super().__init__()
+        self._maxsize = maxsize
 
-    背景：
-    - BackgroundTasks 会在响应生命周期结束后执行。
-    - 对于流式接口/客户端提前断开等场景，BackgroundTasks 有可能不被执行，
-      导致 channel_stats 缺失，从而 /v1/stats 的成功率永远是 0 或空。
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
 
-    这里用 create_task 让统计写入尽量独立于请求/响应生命周期。
-    """
+    def __setitem__(self, key, value):
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        if len(self) > self._maxsize:
+            self.popitem(last=False)
 
-    async def _run():
+    def get(self, key, default=None):
+        if key in self:
+            return self[key]
+        return default
+
+
+async def _resolve_oauth_api_key(app: "FastAPI", api_key: Optional[str], channel_id: Optional[str] = None) -> Optional[str]:
+    """把指定渠道下的 OAuth key_id 解析成 access_token，静态 key 原样返回。"""
+    # 修改原因：oauth_state.json 已按 provider name 分层，同一个 key_id 可能在多个渠道中存在不同凭据。
+    # 修改方式：解析时要求调用方传入当前 provider['provider']，只在对应渠道下查找 key_id。
+    # 目的：保持静态 key 向后兼容，同时避免 OAuth access_token 被跨渠道误解析。
+    if not api_key or not channel_id or app is None or not hasattr(app, "state") or not hasattr(app.state, "oauth_manager"):
+        return api_key
+    resolved = await app.state.oauth_manager.resolve(channel_id, api_key)
+    if resolved is not None:
+        # 修改原因：OAuth resolve 只返回 access_token，但部分 channel adapter 还需要 project_id、email 等非敏感字段。
+        # 修改方式：解析成功后从 OAuthManager 读取过滤后的 credential 元数据，写入当前请求上下文。
+        # 目的：提供通用元数据透传机制，让各 adapter 自行决定是否读取这些字段。
         try:
-            await update_channel_stats_func(*args, **kwargs)
+            from core.middleware import request_info
+            current_info = request_info.get()
+            if isinstance(current_info, dict):
+                current_info["_oauth_resolved"] = True
+                metadata = app.state.oauth_manager.get_credential_metadata(channel_id, api_key)
+                if metadata:
+                    current_info["_oauth_credential_metadata"] = metadata
+        except Exception:
+            pass
+        return resolved
+    return api_key
+
+
+def _fill_failure_provider_info(
+    current_info: Dict[str, Any],
+    provider_name: Optional[str],
+    request_model_name: str,
+) -> None:
+    # 修改原因：错误路径过去只记录成功请求中的 provider 和 model，导致 500 日志显示“未知”或“-”。
+    # 修改方式：在失败统计写入前统一补齐最后尝试的 provider、缺失的 provider_id 和缺失的 model。
+    # 目的：让不重试错误和所有重试耗尽错误都能在日志中定位最后失败渠道与请求模型。
+    provider_value = provider_name if provider_name else None
+    current_info["provider"] = provider_value
+    if not current_info.get("provider_id"):
+        current_info["provider_id"] = provider_value
+    if not current_info.get("model"):
+        current_info["model"] = request_model_name
+
+
+def _channel_stats_item_from_call(args: tuple, kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """把 update_channel_stats 的调用参数转换为批量写入所需的字典。"""
+    # 修改原因：consumer 收到的是旧函数签名的 *args/**kwargs，批量写入函数需要结构化条目。
+    # 修改方式：兼容当前调用方使用的前四个位置参数，以及 success/provider_api_key 关键字参数。
+    # 目的：保持 _fire_and_forget_channel_stats 对外签名不变，同时让内部可以批量落库。
+    required_names = ("request_id", "provider", "model", "api_key", "success")
+    values: Dict[str, Any] = {}
+    for index, name in enumerate(required_names):
+        if len(args) > index:
+            values[name] = args[index]
+        elif name in kwargs:
+            values[name] = kwargs[name]
+        else:
+            return None
+    values["provider_api_key"] = args[5] if len(args) > 5 else kwargs.get("provider_api_key")
+    return values
+
+
+async def _flush_channel_stats_batch(batch: List[tuple]) -> None:
+    """批量刷新 channel stats，非标准调用回退到原函数逐条执行。"""
+    # 修改原因：生产路径传入 core.stats.update_channel_stats，可以合并为一次批量写入；测试或扩展路径可能传入其他可调用对象。
+    # 修改方式：只把标准 update_channel_stats 调用转换为 batch_update_channel_stats，其余调用仍逐条 await 原函数。
+    # 目的：在修复生产协程泄漏和 SQLite 写放大的同时，不破坏旧的可调用参数兼容性。
+    batch_items: List[Dict[str, Any]] = []
+    fallback_calls: List[tuple] = []
+    for func, args, kwargs in batch:
+        if func is update_channel_stats:
+            item = _channel_stats_item_from_call(args, kwargs)
+            if item is not None:
+                batch_items.append(item)
+                continue
+        fallback_calls.append((func, args, kwargs))
+
+    if batch_items:
+        try:
+            await batch_update_channel_stats(batch_items)
         except Exception as e:
-            # 避免 "Task exception was never retrieved"
+            logger.error(f"Error updating channel stats (batch): {e}")
+
+    for func, args, kwargs in fallback_calls:
+        try:
+            await func(*args, **kwargs)
+        except Exception as e:
             logger.error(f"Error updating channel stats: {str(e)}")
 
+
+def _fire_and_forget_channel_stats(update_channel_stats_func: Callable, *args, **kwargs) -> None:
+    """将统计数据放入 buffer，由常驻 consumer 批量写入。"""
+    # 修改原因：每次调用都 create_task 会在 SQLite 串行写入和 database locked 重试时堆积协程。
+    # 修改方式：这里只追加轻量参数到固定长度 deque，并确保单个 consumer 负责后续写入。
+    # 目的：把后台任务数量固定为一个，极端情况下由 deque(maxlen=10000) 丢弃最旧统计兜底。
+    _channel_stats_buffer.append((update_channel_stats_func, args, kwargs))
+    _ensure_consumer_started()
+    if len(_channel_stats_buffer) >= _CHANNEL_STATS_BATCH_SIZE and _channel_stats_flush_event is not None:
+        _channel_stats_flush_event.set()
+
+
+def _ensure_consumer_started() -> None:
+    """确保 channel stats 常驻 consumer 已经启动。"""
+    global _channel_stats_consumer_started, _channel_stats_flush_event
+    # 修改原因：请求路径是同步函数，不能 await 启动后台任务，也不能为每条统计创建新任务。
+    # 修改方式：在存在 running loop 时创建一个常驻 consumer，并复用同一 loop 上的唤醒事件。
+    # 目的：既保持调用方无需修改，又避免启动或关闭阶段没有事件循环时抛出异常。
+    if _channel_stats_consumer_started:
+        return
     try:
-        asyncio.create_task(_run())
+        loop = asyncio.get_running_loop()
+        _channel_stats_flush_event = asyncio.Event()
+        loop.create_task(_channel_stats_consumer())
+        _channel_stats_consumer_started = True
     except RuntimeError:
-        # event loop 未就绪（极少数启动/关闭阶段），忽略即可
         pass
+
+
+async def _channel_stats_consumer() -> None:
+    """常驻后台任务：每 2 秒或攒满 50 条时批量写入。"""
+    global _channel_stats_consumer_started, _channel_stats_flush_event
+    # 修改原因：SQLite 写入需要串行化，逐请求后台协程会在锁等待时消耗大量内存。
+    # 修改方式：consumer 按固定批量从 deque 取出统计项，并调用 batch_update_channel_stats 一次提交多条。
+    # 目的：降低协程数量、事务次数和 fsync 次数，同时在任务取消时尽量 flush 剩余统计。
+    try:
+        while True:
+            try:
+                if _channel_stats_flush_event is None:
+                    await asyncio.sleep(_CHANNEL_STATS_FLUSH_INTERVAL)
+                else:
+                    await asyncio.wait_for(
+                        _channel_stats_flush_event.wait(),
+                        timeout=_CHANNEL_STATS_FLUSH_INTERVAL,
+                    )
+                    _channel_stats_flush_event.clear()
+            except asyncio.TimeoutError:
+                pass
+
+            if not _channel_stats_buffer:
+                continue
+
+            batch = []
+            while _channel_stats_buffer and len(batch) < _CHANNEL_STATS_BATCH_SIZE:
+                batch.append(_channel_stats_buffer.popleft())
+            await _flush_channel_stats_batch(batch)
+    except asyncio.CancelledError:
+        while _channel_stats_buffer:
+            batch = []
+            while _channel_stats_buffer and len(batch) < _CHANNEL_STATS_BATCH_SIZE:
+                batch.append(_channel_stats_buffer.popleft())
+            await _flush_channel_stats_batch(batch)
+    except Exception as e:
+        logger.error(f"Channel stats consumer crashed: {e}")
+    finally:
+        _channel_stats_consumer_started = False
+        _channel_stats_flush_event = None
 
 
 def get_preference_value(provider_timeouts: Dict[str, Any], original_model: str) -> Optional[int]:
@@ -136,594 +317,28 @@ def get_preference(
     return timeout_value
 
 
-async def process_request(
-    request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest],
-    provider: Dict[str, Any],
-    background_tasks: BackgroundTasks,
-    app: "FastAPI",
-    request_info_getter: Callable[[], Dict[str, Any]],
-    update_channel_stats_func: Callable,
-    endpoint: Optional[str] = None,
-    role: Optional[str] = None,
-    timeout_value: int = DEFAULT_TIMEOUT,
-    keepalive_interval: Optional[int] = None
-) -> Response:
-    """
-    向单个 provider 发送请求并处理响应
-    
-    Args:
-        request: 请求对象
-        provider: provider 配置
-        background_tasks: 后台任务
-        app: FastAPI 应用实例
-        request_info_getter: 获取当前请求信息的函数
-        update_channel_stats_func: 更新渠道统计的函数
-        endpoint: 请求端点
-        role: 用户角色
-        timeout_value: 超时时间
-        keepalive_interval: keepalive 间隔
-        
-    Returns:
-        响应对象
-        
-    Raises:
-        Exception: 请求失败时抛出异常
-    """
-    timeout_value = int(timeout_value)
-    model_dict = provider["_model_dict_cache"]
-    original_model = model_dict[request.model]
-    
-    if is_local_api_key(provider['provider']):
-        api_key = provider['provider']
-    elif provider.get("api"):
-        api_key = await provider_api_circular_list[provider['provider']].next(original_model)
-    else:
-        api_key = None
+def normalize_keepalive_interval(keepalive_interval: Any, timeout_value: Any) -> Optional[int]:
+    """把 keepalive_interval 规范化为可用于 SSE 心跳的正整数秒数。"""
+    # 修改原因：keepalive_interval 来自配置库，可能缺失、为 0/负数、字符串，或大于请求超时。
+    # 修改方式：集中转换和边界检查，只有正整数且小于请求超时时才启用。
+    # 目的：避免无效配置触发热循环/无意义心跳，同时让默认 15 秒心跳稳定生效。
+    try:
+        interval = int(keepalive_interval)
+    except (TypeError, ValueError):
+        return None
 
-    # 将实际使用的 api_key 提前存入 request_info，供重试循环精确定位出错的 key
-    current_info_early = request_info_getter()
-    current_info_early["_used_api_key"] = api_key
-
-    engine, stream_mode = get_engine(provider, endpoint, original_model)
-
-    if stream_mode is not None:
-        request.stream = stream_mode
-
-    channel_id = f"{provider['provider']}"
-    if engine != "moderation":
-        logger.info(f"provider: {channel_id[:11]:<11} model: {request.model:<22} engine: {engine[:13]:<13} role: {role}")
-
-    last_message_role = safe_get(request, "messages", -1, "role", default=None)
-    
-    # 提前计算代理，以便 get_payload 内部创建的裸 httpx.AsyncClient 也能走代理
-    proxy = safe_get(app.state.config, "preferences", "proxy", default=None)  # global proxy
-    proxy = safe_get(provider, "preferences", "proxy", default=proxy)  # provider proxy
-
-    from core.http import proxy_context
-    with proxy_context(proxy):
-        url, headers, payload = await get_payload(request, engine, provider, api_key)
-    apply_custom_headers(headers, safe_get(provider, "preferences", "headers", default={}))  # add custom headers
-    
-
-    current_info = request_info_getter()
-    
-    # 记录发送到上游的请求头和请求体（如果配置了保留时间）
-    if current_info.get("raw_data_expires_at"):
-        try:
-            # 记录上游请求头（过滤敏感头信息）
-            safe_upstream_headers = {k: v for k, v in headers.items()
-                                    if k.lower() not in ("authorization", "x-api-key", "api-key")}
-            current_info["upstream_request_headers"] = json.dumps(safe_upstream_headers, ensure_ascii=False)
-            
-            # 使用深度截断，保留结构同时限制大小
-            # 使用 asyncio.to_thread 避免大请求体阻塞事件循环
-            upstream_payload = {k: v for k, v in payload.items() if k != 'file'}
-            current_info["upstream_request_body"] = await asyncio.to_thread(truncate_for_logging, upstream_payload)
-        except Exception as e:
-            logger.error(f"Error saving upstream request data: {str(e)}")
-    # 确保日志中一定记录模型名（使用当前请求对象上的 model）
-    if hasattr(request, "model") and getattr(request, "model", None):
-        current_info["model"] = request.model
-    
-    # 记录渠道ID和上游key索引
-    current_info["provider_id"] = channel_id
-    if api_key:
-        try:
-            # 从 provider_api_circular_list 中获取所有 keys
-            circular_list = provider_api_circular_list.get(provider['provider'])
-            if circular_list and hasattr(circular_list, 'items'):
-                api_keys_list = circular_list.items
-                if api_key in api_keys_list:
-                    current_info["provider_key_index"] = api_keys_list.index(api_key)
-        except (ValueError, TypeError, AttributeError):
-            pass
-
-    proxy = safe_get(app.state.config, "preferences", "proxy", default=None)  # global proxy
-    proxy = safe_get(provider, "preferences", "proxy", default=proxy)  # provider proxy
-    
-    # 获取该渠道启用的插件列表
-    enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
+    if interval <= 0:
+        return None
 
     try:
-        async with app.state.client_manager.get_client(url, proxy) as client:
-            if request.stream:
-                generator = fetch_response_stream(client, url, headers, payload, engine, original_model, timeout_value, enabled_plugins=enabled_plugins)
-                wrapped_generator, first_response_time = await error_handling_wrapper(
-                    generator, channel_id, engine, request.stream,
-                    app.state.error_triggers, keepalive_interval=keepalive_interval,
-                    last_message_role=last_message_role,
-                    request_url=url,
-                    app=app,
-                )
-                response = LoggingStreamingResponse(
-                    wrapped_generator,
-                    media_type="text/event-stream",
-                    current_info=current_info,
-                    app=app,
-                    debug=is_debug
-                )
-            else:
-                generator = fetch_response(client, url, headers, payload, engine, original_model, timeout_value, enabled_plugins=enabled_plugins)
-                wrapped_generator, first_response_time = await error_handling_wrapper(
-                    generator, channel_id, engine, request.stream,
-                    app.state.error_triggers, keepalive_interval=keepalive_interval,
-                    last_message_role=last_message_role,
-                    request_url=url,
-                    app=app,
-                )
+        timeout = int(timeout_value)
+    except (TypeError, ValueError):
+        timeout = 0
 
-                # 处理音频和其他二进制响应
-                if endpoint == "/v1/audio/speech":
-                    if isinstance(wrapped_generator, bytes):
-                        response = Response(content=wrapped_generator, media_type="audio/mpeg")
-                else:
-                    # 非流式响应也需要记录统计
-                    async def non_stream_iter():
-                        first_element = await anext(wrapped_generator)
-                        yield first_element
-                        async for item in wrapped_generator:
-                            yield item
-                    
-                    response = LoggingStreamingResponse(
-                        non_stream_iter(),
-                        media_type="application/json",
-                        current_info=current_info,
-                        app=app,
-                        debug=is_debug
-                    )
+    if timeout > 0 and interval >= timeout:
+        return None
 
-            # 更新成功计数和首次响应时间
-            _fire_and_forget_channel_stats(
-                update_channel_stats_func,
-                current_info["request_id"],
-                channel_id,
-                request.model,
-                current_info["api_key"],
-                success=True,
-                provider_api_key=api_key,
-            )
-            current_info["first_response_time"] = first_response_time
-            current_info["success"] = True
-            current_info["status_code"] = 200
-            current_info["provider"] = channel_id
-            return response
-
-    except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError,
-            httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout,
-            httpx.ConnectError) as e:
-        _fire_and_forget_channel_stats(
-            update_channel_stats_func,
-            current_info["request_id"],
-            channel_id,
-            request.model,
-            current_info["api_key"],
-            success=False,
-            provider_api_key=api_key,
-        )
-        raise e
-
-
-def _filter_passthrough_headers(original_headers: Optional[Dict[str, str]]) -> Dict[str, Any]:
-    """过滤入口请求头中的认证字段和需要移除的头，避免透传错误信息到上游"""
-    drop_names = {
-        "authorization", "x-api-key", "api-key", "x-goog-api-key",  # 认证相关
-        "host",  # 必须移除，否则上游服务（如 Deno Deploy）会路由错误
-        "content-length",  # 由 httpx 自动计算
-        "accept-encoding",  # 移除压缩请求，避免返回 gzip 压缩的响应导致乱码
-    }
-    return {
-        k: v
-        for k, v in (original_headers or {}).items()
-        if k.lower() not in drop_names
-    }
-
-
-async def _fetch_passthrough_stream(client, url, headers, payload, timeout, engine=None, model=None, enabled_plugins=None):
-    """
-    透传模式的流式响应处理
-    
-    直接转发上游 SSE 流，不做任何格式转换
-    
-    注意：使用特殊的超时配置，read timeout 设置为 None 以支持
-    Google Search grounding 等需要长时间处理的操作。
-    """
-    # 为流式请求创建特殊的超时配置
-    # read timeout 设置为 None，因为：
-    # 1. Gemini 使用 Google Search 时，搜索可能需要较长时间
-    # 2. 思考模式下，模型思考时可能有较长的静默期
-    # 3. 我们依赖 connect/write timeout 来处理真正的网络问题
-    stream_timeout = httpx.Timeout(
-        connect=15.0,
-        read=None,  # 无限等待读取，支持 Google Search 等长时间操作
-        write=300.0,  # 写入超时300秒，支持大型请求体（多图片/PDF）
-        pool=10.0,
-    )
-    
-    json_payload = await asyncio.to_thread(json_dumps_text, payload)
-    async with client.stream('POST', url, headers=headers, content=json_payload, timeout=stream_timeout) as response:
-        from core.plugins.interceptors import apply_response_interceptors
-        error_message = await check_response(response, "passthrough_stream")
-        if error_message:
-            error_message = await apply_response_interceptors(error_message, engine or "passthrough", model or "", is_stream=True, enabled_plugins=enabled_plugins)
-            yield error_message            
-            return
-        
-        # aiter_text 由 httpx 内部处理 UTF-8 解码（含多字节字符边界），
-        # SSE 服务端通常在每个事件后 flush，因此每个 chunk 大概率是完整的 SSE 事件。
-        async for text in response.aiter_text():
-            if text:
-                text = await apply_response_interceptors(text, engine or "passthrough", model or "", is_stream=True, enabled_plugins=enabled_plugins)
-                yield text
-
-
-async def _fetch_passthrough_response(client, url, headers, payload, timeout, engine=None, model=None, enabled_plugins=None):
-    """
-    透传模式的非流式响应处理
-    
-    直接转发上游 JSON 响应，不做任何格式转换
-    """
-    import time as _time
-    t0 = _time.time()
-    from core.plugins.interceptors import apply_response_interceptors
-    
-    json_payload = await asyncio.to_thread(json_dumps_text, payload)
-    t1 = _time.time()
-    logger.debug(f"[passthrough] json.dumps took {t1-t0:.3f}s")
-    
-    # 使用与流式请求相同的超时配置
-    # 避免整数超时覆盖客户端的精细超时设置
-    request_timeout = httpx.Timeout(
-        connect=15.0,
-        read=timeout,  # 使用传入的超时作为读取超时
-        write=300.0,  # 写入超时300秒，支持大型请求体（多图片/PDF）
-        pool=10.0,
-    )
-
-    # 快路径：未启用响应插件时，直接按文本流转发。
-    # 这样可以避免先 aread() 再 decode() 带来的整包双份内存占用。
-    if not enabled_plugins:
-        async with client.stream('POST', url, headers=headers, content=json_payload, timeout=request_timeout) as response:
-            t2 = _time.time()
-            logger.debug(f"[passthrough] POST request took {t2-t1:.3f}s, status={response.status_code}")
-
-            error_message = await check_response(response, "passthrough_non_stream")
-            if error_message:
-                yield error_message
-                return
-
-            async for text_chunk in response.aiter_text():
-                if text_chunk:
-                    yield text_chunk
-        return
-
-    response = await client.post(url, headers=headers, content=json_payload, timeout=request_timeout)
-    t2 = _time.time()
-    logger.debug(f"[passthrough] POST request took {t2-t1:.3f}s, status={response.status_code}")
-
-    error_message = await check_response(response, "passthrough_non_stream")
-    if error_message:
-        error_message = await apply_response_interceptors(error_message, engine or "passthrough", model or "", is_stream=False, enabled_plugins=enabled_plugins)
-        yield error_message
-        return
-
-    response_bytes = await response.aread()
-    t3 = _time.time()
-    logger.debug(f"[passthrough] aread() took {t3-t2:.3f}s, size={len(response_bytes)} bytes")
-
-    result = response_bytes.decode("utf-8")
-    result = await apply_response_interceptors(result, engine or "passthrough", model or "", is_stream=False, enabled_plugins=enabled_plugins)
-    yield result
-
-
-async def _passthrough_error_wrapper(generator, channel_id):
-    """
-    透传模式的简单错误包装器
-    
-    只检测 HTTP 错误（由 check_response 完成），不做 JSON 解析
-    直接透传所有内容
-    """
-    from time import time as time_now
-    start_time = time_now()
-    first_response_time = None
-    
-    async def wrapped():
-        nonlocal first_response_time
-        first_chunk = True
-        async for chunk in generator:
-            if first_chunk:
-                first_response_time = time_now() - start_time
-                first_chunk = False
-                
-                # 检查是否是错误响应（只检查 dict 类型的错误）
-                if isinstance(chunk, dict) and 'error' in chunk:
-                    status_code = chunk.get('status_code', 500)
-                    detail = chunk.get('details')
-                    error_obj = chunk.get('error')
-                    
-                    if isinstance(detail, dict) and 'error' in detail:
-                        inner = detail.get('error')
-                        if isinstance(inner, dict):
-                            detail = inner.get('message') or detail
-                        elif isinstance(inner, str):
-                            detail = inner
-                    
-                    if not detail and isinstance(error_obj, dict):
-                        detail = error_obj.get('message')
-                        if not status_code or status_code == 500:
-                            status_code = error_obj.get('code') or status_code
-                    
-                    if not detail:
-                        detail = str(chunk)
-                        
-                    try:
-                        status_code = int(status_code)
-                        if status_code < 100 or status_code > 599:
-                            status_code = 500
-                    except (TypeError, ValueError):
-                        status_code = 500
-                        
-                    raise HTTPException(
-                        status_code=status_code,
-                        detail=str(detail)
-                    )
-            
-            yield chunk
-    
-    # 透传模式：直接获取第一个 chunk，不做额外过滤
-    # SSE 流的内容（如 event:, data:）都是有效内容，不应该被跳过
-    gen = wrapped()
-    try:
-        first = await gen.__anext__()
-    except StopAsyncIteration:
-        raise HTTPException(status_code=502, detail="Upstream server returned an empty response.")
-    
-    async def final_gen():
-        yield first
-        async for chunk in gen:
-            yield chunk
-    
-    return final_gen(), first_response_time or (time_now() - start_time)
-
-
-async def process_request_passthrough(
-    request: RequestModel,
-    provider: Dict[str, Any],
-    background_tasks: BackgroundTasks,
-    app: "FastAPI",
-    request_info_getter: Callable[[], Dict[str, Any]],
-    update_channel_stats_func: Callable,
-    passthrough_ctx: Any,
-    endpoint: Optional[str] = None,
-    role: Optional[str] = None,
-    timeout_value: int = DEFAULT_TIMEOUT,
-    keepalive_interval: Optional[int] = None,
-) -> Response:
-    """
-    透传模式请求处理：
-    - 复用 channel.request_adapter 生成 url/headers
-    - payload 取入口原生请求 + 轻量修改
-    - 不跑上游响应的 Canonical 转换
-    """
-    from core.dialects.passthrough import apply_passthrough_modifications
-    from core.plugins.interceptors import apply_request_interceptors
-    from core.channels import get_channel
-
-    timeout_value = int(timeout_value)
-    model_dict = provider["_model_dict_cache"]
-    original_model = model_dict[request.model]
-
-    if is_local_api_key(provider["provider"]):
-        api_key = provider["provider"]
-    elif provider.get("api"):
-        api_key = await provider_api_circular_list[provider["provider"]].next(original_model)
-    else:
-        api_key = None
-
-    # 将实际使用的 api_key 提前存入 request_info，供重试循环精确定位出错的 key
-    current_info_early = request_info_getter()
-    current_info_early["_used_api_key"] = api_key
-
-    engine, stream_mode = get_engine(provider, endpoint, original_model)
-    if stream_mode is not None:
-        request.stream = stream_mode
-
-    channel = get_channel(engine)
-    adapter = (channel.passthrough_adapter if channel else None) or (channel.request_adapter if channel else None)
-    if not adapter:
-        raise ValueError(f"Unknown engine: {engine}")
-
-    # 提前计算代理，以便 adapter 内部创建的裸 httpx.AsyncClient 也能走代理
-    proxy = safe_get(app.state.config, "preferences", "proxy", default=None)
-    proxy = safe_get(provider, "preferences", "proxy", default=proxy)
-
-    from core.http import proxy_context
-    with proxy_context(proxy):
-        url, adapter_headers, _ = await adapter(request, engine, provider, api_key)
-
-    # ── 透传 URL 路径修正 ──
-    # passthrough_adapter 返回的 URL 对应方言的"主端点"（如 Claude 的 /messages）。
-    # 当入口请求是子路径（如 /v1/messages/count_tokens）时，需要追加路径后缀。
-    #
-    # 后缀从端点的 passthrough_root 显式配置计算，不依赖 adapter URL 的路径结构，
-    # 因此无论 base_url 配成什么样（如 https://proxy.com/anthropic/v1）都能正确工作。
-    if endpoint and passthrough_ctx.dialect_id:
-        from core.dialects.registry import get_dialect as _get_dialect
-        _dialect = _get_dialect(passthrough_ctx.dialect_id)
-        if _dialect:
-            # 查找匹配当前 endpoint 的透传根路径（显式配置，不依赖路由模板字符串）
-            _root = None
-            for _ep in _dialect.endpoints:
-                if _ep.passthrough_root and endpoint.startswith(_ep.passthrough_root):
-                    if _root is None or len(_ep.passthrough_root) > len(_root):
-                        _root = _ep.passthrough_root
-            # 用 passthrough_root 计算后缀：
-            # 例如 root="/v1/messages", endpoint="/v1/messages/count_tokens" → suffix="/count_tokens"
-            if _root and len(endpoint) > len(_root):
-                _suffix = endpoint[len(_root):]  # 如 "/count_tokens"
-                url = url.rstrip("/") + _suffix
-
-    headers: Dict[str, Any] = dict(adapter_headers or {})
-    apply_custom_headers(headers, _filter_passthrough_headers(passthrough_ctx.original_headers))
-    apply_custom_headers(headers, safe_get(provider, "preferences", "headers", default={}))
-    if not has_header_case_insensitive(headers, "Content-Type"):
-        headers["Content-Type"] = "application/json"
-
-    payload = apply_passthrough_modifications(
-        passthrough_ctx.original_payload,
-        passthrough_ctx.modifications,
-        passthrough_ctx.dialect_id,
-        request_model=request.model,
-        original_model=original_model,
-    )
-
-    # 渠道级透传 payload 修饰（把“渠道特殊逻辑”收敛在各自 channel 文件内）
-    if channel and getattr(channel, "passthrough_payload_adapter", None):
-        payload = await channel.passthrough_payload_adapter(
-            payload,
-            passthrough_ctx.modifications,
-            request,
-            engine,
-            provider,
-            api_key,
-        )
-
-    enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
-    url, headers, payload = await apply_request_interceptors(
-        request, engine, provider, api_key, url, headers, payload, enabled_plugins
-    )
-
-    if is_debug:
-        pass
-
-    current_info = request_info_getter()
-    channel_id = f"{provider['provider']}"
-    current_info["dialect_id"] = passthrough_ctx.dialect_id
-
-    if current_info.get("raw_data_expires_at"):
-        safe_upstream_headers = {
-            k: v for k, v in headers.items()
-            if k.lower() not in ("authorization", "x-api-key", "api-key", "x-goog-api-key")
-        }
-        current_info["upstream_request_headers"] = json.dumps(safe_upstream_headers, ensure_ascii=False)
-        upstream_payload = {k: v for k, v in payload.items() if k != "file"}
-        # 使用 asyncio.to_thread 避免大请求体阻塞事件循环
-        current_info["upstream_request_body"] = await asyncio.to_thread(truncate_for_logging, upstream_payload)
-
-    if getattr(request, "model", None):
-        current_info["model"] = request.model
-
-    current_info["provider_id"] = channel_id
-    if api_key:
-        try:
-            # 从 provider_api_circular_list 中获取所有 keys
-            circular_list = provider_api_circular_list.get(provider['provider'])
-            if circular_list and hasattr(circular_list, 'items'):
-                api_keys_list = circular_list.items
-                if api_key in api_keys_list:
-                    current_info["provider_key_index"] = api_keys_list.index(api_key)
-        except (ValueError, TypeError, AttributeError):
-            pass
-
-    proxy = safe_get(app.state.config, "preferences", "proxy", default=None)
-    proxy = safe_get(provider, "preferences", "proxy", default=proxy)
-
-    try:
-        async with app.state.client_manager.get_client(url, proxy) as client:
-            last_message_role = safe_get(request, "messages", -1, "role", default=None)
-
-            if request.stream:
-                # 透传模式：使用原始流处理，不做格式转换
-                generator = _fetch_passthrough_stream(
-                    client, url, headers, payload, timeout_value,
-                    engine=engine, model=request.model,
-                    enabled_plugins=enabled_plugins,
-                )
-                # 使用简单的透传错误包装器，不做 JSON 解析
-                wrapped_generator, first_response_time = await _passthrough_error_wrapper(
-                    generator, channel_id
-                )
-                response = LoggingStreamingResponse(
-                    wrapped_generator,
-                    media_type="text/event-stream",
-                    current_info=current_info,
-                    app=app,
-                    debug=is_debug,
-                )
-            else:
-                # 透传模式：使用原始响应处理，不做格式转换
-                generator = _fetch_passthrough_response(
-                    client, url, headers, payload, timeout_value,
-                    engine=engine, model=request.model,
-                    enabled_plugins=enabled_plugins,
-                )
-                # 使用简单的透传错误包装器，不做 JSON 解析
-                wrapped_generator, first_response_time = await _passthrough_error_wrapper(
-                    generator, channel_id
-                )
-
-                async def passthrough_iter():
-                    async for chunk in wrapped_generator:
-                        yield chunk
-
-                response = LoggingStreamingResponse(
-                    passthrough_iter(),
-                    media_type="application/json",
-                    current_info=current_info,
-                    app=app,
-                    debug=is_debug,
-                )
-
-            current_info["first_response_time"] = first_response_time
-    except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError,
-            httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout,
-            httpx.ConnectError) as e:
-        _fire_and_forget_channel_stats(
-            update_channel_stats_func,
-            current_info["request_id"],
-            channel_id,
-            request.model,
-            current_info["api_key"],
-            success=False,
-            provider_api_key=api_key,
-        )
-        raise e
-
-    response.headers["x-zoaholic-passthrough"] = "request"
-
-    _fire_and_forget_channel_stats(
-        update_channel_stats_func,
-        current_info["request_id"],
-        channel_id,
-        request.model,
-        current_info["api_key"],
-        success=True,
-        provider_api_key=api_key,
-    )
-    current_info["success"] = True
-    current_info["status_code"] = 200
-    current_info["provider"] = channel_id
-
-    return response
+    return interval
 
 
 class ModelRequestHandler:
@@ -753,8 +368,11 @@ class ModelRequestHandler:
         self.request_info_getter = request_info_getter
         self.update_channel_stats_func = update_channel_stats_func
         self.default_timeout = default_timeout
-        self.last_provider_indices = defaultdict(lambda: -1)
-        self.locks = defaultdict(asyncio.Lock)
+        # 修改原因：defaultdict 会让游标表和锁表随着新 key 自动增长，长期运行会增加内存占用。
+        # 修改方式：改用固定上限为 500 的 LRUDict；游标和锁在读取处显式处理缺失值。
+        # 目的：保留现有轮转和并发控制行为，同时限制缓存规模。
+        self.last_provider_indices = LRUDict(maxsize=500)
+        self.locks = LRUDict(maxsize=500)
 
     async def _build_attempt_providers(
         self,
@@ -771,31 +389,81 @@ class ModelRequestHandler:
         if not providers:
             return []
 
-        provider_names = [provider.get("provider") for provider in providers]
-        has_duplicate_slots = len(set(provider_names)) != len(provider_names)
-        should_rotate_slots = scheduling_algorithm != "fixed_priority" or has_duplicate_slots
+        async def build_unique_group(provider_slots: List[Dict[str, Any]], cursor_key: str) -> List[Dict[str, Any]]:
+            """在一个优先级组内执行原有轮转和去重逻辑。"""
+            # 修改原因：虚拟路由的 fallback 组间顺序必须稳定，但同组仍要保留原权重槽位轮转语义。
+            # 修改方式：把旧的全列表轮转和去重逻辑抽成组内函数，普通路由仍以整列表作为唯一分组。
+            # 目的：不改 handler 重试循环，只确保它收到的尝试列表已经符合链条降级顺序。
+            if not provider_slots:
+                return []
 
-        start_index = 0
-        if should_rotate_slots:
-            async with self.locks[request_model_name]:
-                if advance_cursor:
-                    self.last_provider_indices[request_model_name] = (
-                        self.last_provider_indices[request_model_name] + 1
-                    ) % len(providers)
-                elif self.last_provider_indices[request_model_name] < 0:
-                    self.last_provider_indices[request_model_name] = 0
-                start_index = self.last_provider_indices[request_model_name] % len(providers)
+            provider_names = [provider.get("provider") for provider in provider_slots]
+            has_duplicate_slots = len(set(provider_names)) != len(provider_names)
+            should_rotate_slots = scheduling_algorithm != "fixed_priority" or has_duplicate_slots
 
-        ordered_slots = providers[start_index:] + providers[:start_index]
+            start_index = 0
+            if should_rotate_slots:
+                # 修改原因：locks 改为 LRU 普通字典后，读取缺失 key 不会再自动创建 asyncio.Lock。
+                # 修改方式：先用 get 查询，缺失时显式创建并写回，写入时由 LRUDict 控制容量。
+                # 目的：保持同一 cursor_key 串行更新游标，同时避免锁表无上限增长。
+                lock = self.locks.get(cursor_key)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    self.locks[cursor_key] = lock
+
+                async with lock:
+                    # 修改原因：last_provider_indices 改为 LRU 普通字典后，读取缺失 key 不会再自动写入默认值。
+                    # 修改方式：用 get 读取当前游标，默认值沿用原 defaultdict(lambda: -1) 的行为。
+                    # 目的：不改变首次轮转从第一个 provider 开始的逻辑，同时避免游标表无上限增长。
+                    current_index = self.last_provider_indices.get(cursor_key, -1)
+                    if advance_cursor:
+                        current_index = (current_index + 1) % len(provider_slots)
+                        self.last_provider_indices[cursor_key] = current_index
+                    elif current_index < 0:
+                        current_index = 0
+                        self.last_provider_indices[cursor_key] = current_index
+                    start_index = current_index % len(provider_slots)
+
+            ordered_slots = provider_slots[start_index:] + provider_slots[:start_index]
+
+            unique_group: List[Dict[str, Any]] = []
+            seen_provider_names = set()
+            for provider in ordered_slots:
+                provider_name = provider.get("provider")
+                if provider_name in seen_provider_names:
+                    continue
+                seen_provider_names.add(provider_name)
+                unique_group.append(provider)
+            return unique_group
+
+        has_virtual_priorities = any(
+            provider.get("_virtual_route_provider") and "_virtual_priority" in provider
+            for provider in providers
+        )
+        if not has_virtual_priorities:
+            return await build_unique_group(providers, request_model_name)
+
+        # 修改原因：路由阶段会按 _virtual_priority 生成权重槽位，但旧构造逻辑可能因槽位轮转从 fallback 组开始。
+        # 修改方式：构造阶段再次按 _virtual_priority 拆组，只在组内轮转和去重，再按 priority 升序合并。
+        # 目的：让后续 while 重试循环自然先尝试完当前 chain 节点，再降级到下一个节点。
+        priority_groups: Dict[int, List[Dict[str, Any]]] = {}
+        for provider in providers:
+            try:
+                priority = int(provider.get("_virtual_priority", 0) or 0)
+            except (TypeError, ValueError):
+                priority = 0
+            priority_groups.setdefault(priority, []).append(provider)
 
         unique_providers: List[Dict[str, Any]] = []
         seen_provider_names = set()
-        for provider in ordered_slots:
-            provider_name = provider.get("provider")
-            if provider_name in seen_provider_names:
-                continue
-            seen_provider_names.add(provider_name)
-            unique_providers.append(provider)
+        for priority in sorted(priority_groups.keys()):
+            cursor_key = f"{request_model_name}::virtual_priority::{priority}"
+            for provider in await build_unique_group(priority_groups[priority], cursor_key):
+                provider_name = provider.get("provider")
+                if provider_name in seen_provider_names:
+                    continue
+                seen_provider_names.add(provider_name)
+                unique_providers.append(provider)
 
         return unique_providers
 
@@ -809,6 +477,10 @@ class ModelRequestHandler:
         original_payload: Optional[Dict[str, Any]] = None,
         original_headers: Optional[Dict[str, str]] = None,
         passthrough_only: bool = False,
+        override_providers: Optional[List[Dict[str, Any]]] = None,
+        force_api_key: Optional[str] = None,
+        override_auto_retry: Optional[bool] = None,
+        override_timeout: Optional[int] = None,
     ) -> Response:
         """
         处理模型请求
@@ -821,78 +493,116 @@ class ModelRequestHandler:
             dialect_id: 入口方言 ID（原生路由传入）
             original_payload: 原始 native 请求体（透传用）
             original_headers: 原始请求头（透传用）
+            override_auto_retry: override provider 测试是否允许按候选列表自动重试
             
         Returns:
             响应对象
         """
         config = self.app.state.config
         request_model_name = request_data.model
-        
-        # 用户 API Key 限速（统一入口，标准路由和方言路由都经过此处）
-        try:
-            final_api_key = self.app.state.api_list[api_index]
-            await self.app.state.user_api_keys_rate_limit[final_api_key].next(request_model_name)
-        except HTTPException:
-            raise
-        except Exception:
-            raise HTTPException(status_code=429, detail="Too many requests")
 
-        if not safe_get(config, 'api_keys', api_index, 'model'):
-            raise HTTPException(status_code=404, detail=f"No matching model found: {request_model_name}")
+        # ── override 模式：跳过用户限速和全局路由（测试/直接调用场景） ──
+        if override_providers is not None:
+            matching_providers = override_providers
+            num_matching_providers = len(matching_providers)
+            if num_matching_providers == 0:
+                raise HTTPException(status_code=400, detail="No providers specified for test")
+            scheduling_algorithm = "fixed_priority"
+            # 修改原因：普通单渠道测试应只测当前渠道，但虚拟路由测试需要按 chain 候选继续尝试后续节点。
+            # 修改方式：保留默认不重试；只有调用方显式传 override_auto_retry=True 时才开启 override provider 列表内重试。
+            # 目的：不改变现有渠道测试语义，同时让虚拟模型测试能覆盖完整 fallback 链条。
+            auto_retry = bool(override_auto_retry)
+            role = "test"
+        else:
+            # ── 正常路径：用户限速 + 全局路由 ──
+            try:
+                final_api_key = self.app.state.api_list[api_index]
+                await self.app.state.user_api_keys_rate_limit[final_api_key].next(request_model_name)
+            except HTTPException:
+                raise
+            except Exception:
+                raise HTTPException(status_code=429, detail="Too many requests")
 
-        # 调度算法优先级：API Key preferences > 全局 preferences > 默认值
-        scheduling_algorithm = safe_get(
-            config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM",
-            default=safe_get(config, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
+            if not safe_get(config, 'api_keys', api_index, 'model'):
+                raise HTTPException(status_code=404, detail=f"No matching model found: {request_model_name}")
+
+            scheduling_algorithm = safe_get(
+                config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM",
+                default=safe_get(config, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
+            )
+
+            request_total_tokens = 0
+            if request_data and isinstance(request_data, RequestModel):
+                for message in request_data.messages:
+                    if message.content and isinstance(message.content, str):
+                        request_total_tokens += len(message.content)
+            request_total_tokens = int(request_total_tokens / 4)
+
+            matching_providers = await get_right_order_providers(
+                request_model_name, config, api_index, scheduling_algorithm, 
+                self.app, request_total_tokens=request_total_tokens
+            )
+            matching_providers = await self._build_attempt_providers(
+                matching_providers,
+                request_model_name=request_model_name,
+                scheduling_algorithm=scheduling_algorithm,
+                advance_cursor=True,
+            )
+            num_matching_providers = len(matching_providers)
+
+            auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
+            role = safe_get(
+                config, 'api_keys', api_index, "role", 
+                default=safe_get(config, 'api_keys', api_index, "api", default="None")[:8]
+            )
+
+        # 修改原因：标准路由没有原始 FastAPI Request 参数，BYOK 真实 key 只能从鉴权阶段写入的请求上下文读取。
+        # 修改方式：只把 request_info/ContextVar 中的 BYOK 上下文识别为 BYOK；显式 force_api_key 继续保留为渠道测试或直接调用用 key。
+        # 目的：BYOK provider 在真实请求中能拿到用户上游 key，同时避免单渠道测试的显式 key 被误当作 BYOK 而跳过重试和统计。
+        current_info_for_byok_lookup = self.request_info_getter()
+        byok_real_key = (
+            current_info_for_byok_lookup.get("_byok_real_key")
+            or current_info_for_byok_lookup.get("byok_real_key")
+            or get_byok_real_key()
         )
-
-        # 估算请求 token 数
-        request_total_tokens = 0
-        if request_data and isinstance(request_data, RequestModel):
-            for message in request_data.messages:
-                if message.content and isinstance(message.content, str):
-                    request_total_tokens += len(message.content)
-        request_total_tokens = int(request_total_tokens / 4)
-
-        matching_providers = await get_right_order_providers(
-            request_model_name, config, api_index, scheduling_algorithm, 
-            self.app, request_total_tokens=request_total_tokens
+        byok_template_key = (
+            current_info_for_byok_lookup.get("_byok_template_key")
+            or current_info_for_byok_lookup.get("byok_template_key")
+            or get_byok_template_key()
         )
-        matching_providers = await self._build_attempt_providers(
-            matching_providers,
-            request_model_name=request_model_name,
-            scheduling_algorithm=scheduling_algorithm,
-            advance_cursor=True,
-        )
-        num_matching_providers = len(matching_providers)
+        if byok_template_key:
+            current_info_for_byok = self.request_info_getter()
+            current_info_for_byok["api_key"] = byok_template_key
 
         status_code = 500
         error_message = None
 
-        auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
-        role = safe_get(
-            config, 'api_keys', api_index, "role", 
-            default=safe_get(config, 'api_keys', api_index, "api", default="None")[:8]
-        )
-
         index = 0
         # 获取配置的最大重试次数上限，默认为 10
-        max_retry_limit = safe_get(config, 'preferences', 'max_retry_count', default=10)
-        if max_retry_limit < 1:
-            max_retry_limit = 1
+        # [已废弃] max_retry_count 机制已移除，重试终止完全靠 is_all_rate_limited 兜底
+        # max_retry_limit = safe_get(config, 'preferences', 'max_retry_count', default=0)
 
         # 计算最大尝试次数（包含首轮 + 自动重试）。
         # 修复：
-        # - 单 provider 分支此前未受 max_retry_limit 约束，且使用 get_items_count 会把禁用 key 也算进去，
+        # - 使用 get_enabled_items_count 排除禁用 key。
         #   容易在“只有 1 个可用 key，但配置里堆了大量禁用 key”时触发 1000+ 次重试。
-        # - 统一按“启用的 key 数量”计算，并在所有分支上应用 max_retry_limit。
+        # - 统一按“启用的 key 数量”计算。
         def _provider_key_slots(p: Dict[str, Any]) -> int:
             """返回该 provider 可用于重试的 key 数量（至少为 1）。
 
             注意：没有配置 api（例如无需 key 的渠道）也按 1 计。
             """
+            if is_byok_provider(p):
+                # 修改原因：BYOK provider 没有本地 circular list，api: ["*"] 只是模式标记。
+                # 修改方式：重试槽位固定按 1 计算，不读取 provider_api_circular_list。
+                # 目的：避免 "*" 被视作本地 key，也避免缺失 key pool 影响重试次数计算。
+                return 1
             try:
-                enabled = provider_api_circular_list[p["provider"]].get_enabled_items_count()
+                # 修改原因：provider_api_circular_list 已改为普通 dict，读取缺失 provider 时不能再隐式创建空 key 池。
+                # 修改方式：使用 get 读取现有循环列表，缺失时按 0 个启用 key 处理。
+                # 目的：保持重试次数下限逻辑不变，同时避免读路径产生长期驻留对象。
+                circular_list = provider_api_circular_list.get(p["provider"])
+                enabled = circular_list.get_enabled_items_count() if circular_list else 0
             except Exception:
                 enabled = 0
             try:
@@ -906,7 +616,7 @@ class ModelRequestHandler:
 
             设计目标：
             - 保持原有语义：总尝试次数 ≈ num_matching_providers + retry_count
-            - retry_count 受 max_retry_limit 约束
+            不设人为上限，终止靠 is_all_rate_limited 兜底
             - 仅按“启用的 key 数量”估算，避免禁用 key 造成 retry_count 虚高
             """
             n = len(providers)
@@ -917,18 +627,65 @@ class ModelRequestHandler:
                 slots = _provider_key_slots(providers[0])
                 # 单 provider：至少允许 1 次重试；若有多 key，可覆盖更多 key
                 base = slots if slots > 1 else 1
-                return min(base, max_retry_limit)
+                return base
 
             total_slots = sum(_provider_key_slots(p) for p in providers)
             tmp_retry_count = total_slots * 2
-            return min(tmp_retry_count, max_retry_limit)
+            return tmp_retry_count
+
+        # ── 入站拦截器：鉴权完成、provider 选择前 ──
+        try:
+            from core.plugins.interceptors import apply_inbound_interceptors
+            _inbound_api_key_info = {
+                "api_key": self.app.state.api_list[api_index] if not override_providers else None,
+                "api_index": api_index,
+                "model": request_model_name,
+                "role": role,
+            }
+            _inbound_enabled_plugins = safe_get(
+                config, 'api_keys', api_index, 'preferences', 'enabled_plugins',
+                default=None
+            ) if not override_providers else None
+            request_data = await apply_inbound_interceptors(
+                request_data, None, _inbound_api_key_info, _inbound_enabled_plugins
+            )
+        except Exception as _inbound_err:
+            logger.warning(f"Inbound interceptors error: {_inbound_err}")
 
         retry_count = _calc_retry_count(matching_providers)
-        max_attempts = num_matching_providers + retry_count
+        max_attempts = min(num_matching_providers + retry_count, 500)  # 绝对上限防死循环
 
         # 初始化重试路径记录
         retry_path: List[Dict[str, Any]] = []
         current_retry_count = 0
+
+        # ── 虚拟路由优先级分组索引 ──
+        # matching_providers 已按 _virtual_priority 升序排列（0,0,0,1,1,2...）
+        # 构建 priority_group_ranges: [(start, end, priority), ...]
+        # 用于重试循环中强制在同一 priority group 内走到黑，再降级
+        _is_virtual_route = any(
+            p.get("_virtual_route_provider") and "_virtual_priority" in p
+            for p in matching_providers
+        )
+        _priority_group_ranges: list = []  # [(start_idx, end_idx_exclusive, priority)]
+        if _is_virtual_route:
+            _cur_priority = None
+            _group_start = 0
+            for _i, _p in enumerate(matching_providers):
+                _pp = int(_p.get("_virtual_priority", 0) or 0)
+                if _cur_priority is not None and _pp != _cur_priority:
+                    _priority_group_ranges.append((_group_start, _i, _cur_priority))
+                    _group_start = _i
+                _cur_priority = _pp
+            if _cur_priority is not None:
+                _priority_group_ranges.append((_group_start, len(matching_providers), _cur_priority))
+
+        def _get_priority_group_range(idx: int):
+            """返回 idx 所在 priority group 的 (start, end) 范围"""
+            for start, end, _ in _priority_group_ranges:
+                if start <= idx < end:
+                    return start, end
+            return 0, num_matching_providers
 
         while True:
             if index >= max_attempts:
@@ -938,15 +695,45 @@ class ModelRequestHandler:
             provider = matching_providers[current_index]
 
             provider_name = provider['provider']
+            provider_is_byok = is_byok_provider(provider)
 
             # 检查是否所有 API 密钥都被速率限制
             model_dict = provider["_model_dict_cache"]
             original_model = model_dict[request_model_name]
-            if await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
-                error_message = "All API keys are rate limited and stop auto retry!"
-                if num_matching_providers == 1:
-                    break
-                else:
+            # 修改原因：provider_api_circular_list 改为普通 dict 后，读不存在的 provider 不应自动创建空列表。
+            # 修改方式：先用 get 取得当前 provider 的循环列表，缺失时跳过限流耗尽检查。
+            # 目的：保留原有可用 provider 流程，同时避免缺失配置造成内存增长。
+            provider_circular_list = provider_api_circular_list.get(provider_name)
+            # 修改原因：BYOK provider 没有本地 key pool，api: ["*"] 也不能进入本地限流耗尽判断。
+            # 修改方式：只有非 BYOK provider 且存在 circular list 时才调用 is_all_rate_limited。
+            # 目的：避免 "*" 被本地限流、冷却或禁用逻辑当成真实 provider key 处理。
+            if not override_providers and provider_circular_list and not provider_is_byok:
+                if await provider_circular_list.is_all_rate_limited(original_model):
+                    error_message = "All API keys are rate limited and stop auto retry!"
+                    if num_matching_providers == 1:
+                        break
+                    # 虚拟路由：检查同 priority group 是否全部耗尽
+                    if _is_virtual_route:
+                        grp_start, grp_end = _get_priority_group_range(current_index)
+                        group_all_exhausted = True
+                        for gi in range(grp_start, grp_end):
+                            gi_provider = matching_providers[gi]
+                            if is_byok_provider(gi_provider):
+                                # 修改原因：BYOK provider 不依赖本地 key pool，不能被视为本地 key 全部限流。
+                                # 修改方式：虚拟路由分组检查遇到 BYOK provider 时直接认为该组未被本地限流耗尽。
+                                # 目的：避免缺失 circular list 或 "*" 占位符导致 BYOK provider 被错误跳过。
+                                group_all_exhausted = False
+                                break
+                            gi_provider_name = gi_provider["provider"]
+                            gi_circular_list = provider_api_circular_list.get(gi_provider_name)
+                            if gi_circular_list and not await gi_circular_list.is_all_rate_limited(original_model):
+                                group_all_exhausted = False
+                                break
+                        if not group_all_exhausted:
+                            # 同组还有可用渠道 → 跳到组内下一个，不降级
+                            continue
+                        # 同组全耗尽 → 跳过整个组，直接到下一个 priority group
+                        index = (grp_end % num_matching_providers) if grp_end < num_matching_providers else grp_end
                     continue
 
             original_request_model = (original_model, request_data.model)
@@ -981,12 +768,18 @@ class ModelRequestHandler:
 
             local_timeout_value = local_timeout_value * local_provider_num_matching_providers
 
+            # override_timeout 覆盖渠道默认 timeout（测试场景用）
+            if override_timeout is not None and override_timeout > 0:
+                local_timeout_value = override_timeout
+
+            # 修改原因：keepalive_interval 默认值需要与启动初始化保持一致，避免运行时回退到关闭心跳。
+            # 修改方式：把 get_preference 的 fallback 从 99999 改为 15 秒。
+            # 目的：没有显式配置时默认发送 SSE 心跳，降低流式连接空闲断开的风险。
             keepalive_interval = get_preference(
                 self.app.state.keepalive_interval, provider_name, 
-                original_request_model, 99999
+                original_request_model, 15
             )
-            if keepalive_interval > local_timeout_value:
-                keepalive_interval = None
+            keepalive_interval = normalize_keepalive_interval(keepalive_interval, local_timeout_value)
             if is_local_api_key(provider_name):
                 keepalive_interval = None
 
@@ -1011,6 +804,10 @@ class ModelRequestHandler:
                     continue
 
                 process_fn = process_request_passthrough if (passthrough_ctx and passthrough_ctx.enabled) else process_request
+                # 修改原因：只有 BYOK provider 才应使用请求中的真实上游 key；普通 provider 仍按配置 key pool 轮换。
+                # 修改方式：按当前 provider 是否为 BYOK provider 计算 effective_force_api_key，并传给普通和透传路径。
+                # 目的：避免 BYOK key 误覆盖非 BYOK provider，同时让透传路径也支持 BYOK。
+                effective_force_api_key = byok_real_key if (byok_real_key and is_byok_provider(provider)) else force_api_key
                 response = await process_fn(
                     request_data, provider, background_tasks, self.app,
                     self.request_info_getter, self.update_channel_stats_func,
@@ -1019,10 +816,12 @@ class ModelRequestHandler:
                     role=role,
                     timeout_value=local_timeout_value,
                     keepalive_interval=keepalive_interval,
+                    force_api_key=effective_force_api_key,
                 ) if process_fn is process_request_passthrough else await process_request(
                     request_data, provider, background_tasks, self.app,
                     self.request_info_getter, self.update_channel_stats_func,
-                    endpoint, role, local_timeout_value, keepalive_interval
+                    endpoint, role, local_timeout_value, keepalive_interval,
+                    force_api_key=effective_force_api_key
                 )
 
                 # 成功时记录重试路径和重试次数
@@ -1099,8 +898,12 @@ class ModelRequestHandler:
                     error_message = str(e) or f"Unknown error: {e.__class__.__name__}"
 
                 # ── Key Rules 统一错误处理 ──
-                from core.key_rules import resolve_key_rules, match_key_rules
-                _key_rules = resolve_key_rules(provider.get("preferences") or {})
+                from core.key_rules import apply_key_rule_retry_override, resolve_key_rules, match_key_rules
+                # 修改原因：BYOK provider 没有本地 key pool，上游 401/403 只说明用户自己的 key 有问题。
+                # 修改方式：BYOK 请求跳过 key_rules 匹配和后续自动禁用/冷却。
+                # 目的：避免把不存在的 provider key pool 冷却或禁用，也避免真实 key 出现在运行时禁用快照。
+                is_current_byok_request = bool(byok_real_key) and is_byok_provider(provider)
+                _key_rules = [] if is_current_byok_request else resolve_key_rules(provider.get("preferences") or {})
                 _rule_result = match_key_rules(_key_rules, status_code, error_message) if _key_rules else None
 
                 # 规则中的 remap: 把上游非标准状态码映射为标准码
@@ -1125,12 +928,83 @@ class ModelRequestHandler:
 
                 channel_id = provider['provider']
 
-                if (self.app.state.channel_manager.cooldown_period > 0 
+                # ★ 修复：优先从 request_info 获取本次实际使用的 api_key，
+                # 避免并发场景下 after_next_current() 返回其他请求的 key，
+                # 导致冷却/禁用操作作用在错误的 key 上。
+                _current_info_for_key = self.request_info_getter()
+                # 修改原因：provider_api_circular_list 已不再自动创建缺失 provider 的 key 池。
+                # 修改方式：用 get 复用当前渠道循环列表；只有列表存在时才回退读取 after_next_current。
+                # 目的：错误处理路径仍能定位实际 key，同时避免缺失渠道名生成空对象。
+                channel_circular_list = provider_api_circular_list.get(channel_id)
+                current_api = _current_info_for_key.get("_used_api_key")
+                if not current_api and channel_circular_list:
+                    current_api = await channel_circular_list.after_next_current()
+
+                should_consider_channel_cooldown = (
+                    not is_current_byok_request
+                    and self.app.state.channel_manager.cooldown_period > 0
+                    and override_providers is None
                     and num_matching_providers > 1
-                    and all(error not in error_message for error in exclude_error_rate_limit)):
+                    and all(error not in error_message for error in exclude_error_rate_limit)
+                )
+
+                # 仅统计"启用"的 key 数量，避免禁用 key 造成误判。
+                if channel_circular_list:
+                    try:
+                        api_key_count_before_rule = channel_circular_list.get_enabled_items_count()
+                    except Exception:
+                        api_key_count_before_rule = channel_circular_list.get_items_count()
+                else:
+                    api_key_count_before_rule = 0
+
+                key_rule_disabled_current = False
+                # ── 应用 Key Rules 规则：冷却 / 禁用 ──
+                if _rule_result and current_api and channel_circular_list and not is_current_byok_request:
+                    _duration = _rule_result.get("duration", 0)
+                    _reason = _rule_result.get("reason", "key_rule")
+                    if _duration == -1:
+                        # 永久禁用
+                        await channel_circular_list.set_auto_disabled(
+                            current_api, duration=0, reason=_reason
+                        )
+                        key_rule_disabled_current = True
+                    elif _duration > 0:
+                        # 修改原因：旧逻辑只在多 key 时冷却，单渠道单 key 依赖原有重试行为；但多渠道降级时，最后一个失败 key 必须能让渠道被判定为耗尽。
+                        # 修改方式：多 key 仍按旧规则冷却；当渠道级降级条件成立时，最后一个 key 也执行冷却。
+                        # 目的：既保留单渠道单 key 的旧行为，又让多渠道虚拟路由能在所有 key 不可用后再进入 fallback。
+                        if (
+                            (api_key_count_before_rule > 1 or should_consider_channel_cooldown)
+                            and all(error not in error_message for error in exclude_error_rate_limit)
+                        ):
+                            await channel_circular_list.set_auto_disabled(
+                                current_api, duration=_duration, reason=_reason
+                            )
+                            key_rule_disabled_current = True
+
+                # 仅统计"启用"的 key 数量，避免禁用 key 造成误判。
+                # 修改原因：旧逻辑先冷却渠道再冷却 key，会把同渠道剩余 key 从候选列表中埋没。
+                # 修改方式：key 级规则执行后，再检查该渠道是否还有启用 key。
+                # 目的：只有当前渠道所有 key 都不可用时，才进入渠道级冷却和候选列表重建。
+                if channel_circular_list:
+                    try:
+                        api_key_count = channel_circular_list.get_enabled_items_count()
+                    except Exception:
+                        api_key_count = channel_circular_list.get_items_count()
+                else:
+                    api_key_count = 0
+
+                should_rebuild_after_channel_cooldown = (
+                    should_consider_channel_cooldown
+                    and (api_key_count <= 0 or not key_rule_disabled_current)
+                )
+
+                if should_rebuild_after_channel_cooldown:
+                    # 修改原因：只有当前错误确实触发 key 禁用时，才应等待当前渠道所有 key 耗尽；未命中 key_rules 时继续留在当前渠道会反复取到同一 key。
+                    # 修改方式：key 已被禁用时沿用“启用 key 数量为 0 才冷却渠道”；key 未被禁用时立即走渠道级冷却并重建候选列表。
+                    # 目的：既保留多 key 渠道先耗尽 key 的行为，又避免无匹配 key_rules 的渠道在虚拟路由中循环重试。
                     await self.app.state.channel_manager.exclude_model(channel_id, request_model_name)
                     matching_providers = await get_right_order_providers(
-                        request_model_name, config, api_index, scheduling_algorithm, 
+                        request_model_name, config, api_index, scheduling_algorithm,
                         self.app, request_total_tokens=request_total_tokens
                     )
                     matching_providers = await self._build_attempt_providers(
@@ -1143,43 +1017,24 @@ class ModelRequestHandler:
                     num_matching_providers = len(matching_providers)
                     # provider 列表发生变化（或重新排序）时，重算最大尝试次数
                     retry_count = _calc_retry_count(matching_providers)
-                    max_attempts = num_matching_providers + retry_count
+                    max_attempts = min(num_matching_providers + retry_count, 500)  # 绝对上限防死循环
                     if num_matching_providers != last_num_matching_providers:
                         index = 0
-
-                # 仅统计"启用"的 key 数量，避免禁用 key 造成误判
-                try:
-                    api_key_count = provider_api_circular_list[channel_id].get_enabled_items_count()
-                except Exception:
-                    api_key_count = provider_api_circular_list[channel_id].get_items_count()
-                # ★ 修复：优先从 request_info 获取本次实际使用的 api_key，
-                # 避免并发场景下 after_next_current() 返回其他请求的 key，
-                # 导致冷却/禁用操作作用在错误的 key 上。
-                _current_info_for_key = self.request_info_getter()
-                current_api = _current_info_for_key.get("_used_api_key") or \
-                    await provider_api_circular_list[channel_id].after_next_current()
-
-                # ── 应用 Key Rules 规则：冷却 / 禁用 ──
-                if _rule_result and current_api:
-                    _duration = _rule_result.get("duration", 0)
-                    _reason = _rule_result.get("reason", "key_rule")
-                    if _duration == -1:
-                        # 永久禁用
-                        await provider_api_circular_list[channel_id].set_auto_disabled(
-                            current_api, duration=0, reason=_reason
-                        )
-                    elif _duration > 0 and api_key_count > 1:
-                        # 定时冷却（仅多 key 时生效）
-                        if all(error not in error_message for error in exclude_error_rate_limit):
-                            await provider_api_circular_list[channel_id].set_auto_disabled(
-                                current_api, duration=_duration, reason=_reason
-                            )
+                # 当 key 被冷却但渠道仍有可用 key 时：不做 exclude_model，也不回退 index。
+                # index 正常前进，通过 max_attempts 的 modulo 循环回来时 circular_list 自动取下一个 key。
+                # 不能 index = current_index，否则 index 永远到不了 max_attempts，死循环。
 
                 # 有些错误并没有请求成功，所以需要删除请求记录
-                if (current_api 
-                    and any(error in error_message for error in exclude_error_rate_limit) 
-                    and provider_api_circular_list[provider_name].requests[current_api][original_model]):
-                    provider_api_circular_list[provider_name].requests[current_api][original_model].pop()
+                # 修改原因：直接访问 requests[current_api][original_model] 会在没有记录时创建空 deque。
+                # 修改方式：先通过 get 读取 provider、api_key、model 三层对象，只有已有记录时才 pop。
+                # 目的：兼容 deque 的同时避免错误路径制造新的空 requests 索引。
+                provider_circular_list_for_requests = provider_api_circular_list.get(provider_name)
+                api_request_map = provider_circular_list_for_requests.requests.get(current_api) if provider_circular_list_for_requests and current_api else None
+                model_requests = api_request_map.get(original_model) if api_request_map else None
+                if (current_api
+                    and any(error in error_message for error in exclude_error_rate_limit)
+                    and model_requests):
+                    model_requests.pop()
 
                 # 根据错误消息调整状态码
                 if "string_above_max_length" in error_message:
@@ -1209,7 +1064,11 @@ class ModelRequestHandler:
                 if "<head><title>413 Request Entity Too Large</title></head>" in error_message:
                     status_code = 429
 
-                logger.error(f"Error {status_code} with provider {channel_id} API key: {current_api}: {error_message}")
+                # 修改原因：BYOK 失败日志不能输出用户真实上游 key。
+                # 修改方式：BYOK 请求只打印模板身份或空值，普通请求保留原有 current_api 便于排障。
+                # 目的：上游 401/403 等错误返回给用户即可，不在服务端日志泄露 BYOK key。
+                log_api_key = byok_template_key if (byok_real_key and is_byok_provider(provider)) else current_api
+                logger.error(f"Error {status_code} with provider {channel_id} API key: {log_api_key}: {error_message}")
                 if is_debug:
                     import traceback
                     traceback.print_exc()
@@ -1220,11 +1079,21 @@ class ModelRequestHandler:
 
                 retry_enabled = (
                     auto_retry
+                    and not is_current_byok_request
                     and (
                         status_code not in [400, 413, 401, 403]
                         or urlparse(provider.get('base_url', '')).netloc == 'models.inference.ai.azure.com'
                     )
                 )
+
+                # 修改原因：Key Rules 新增 retry 三态，需要在默认硬编码判断之后提供按规则覆盖的能力。
+                # 修改方式：只有 _rule_result.retry 为 bool 时覆盖 retry_enabled，缺失时保持默认结果。
+                # 目的：支持 retry=true 强制允许重试、retry=false 强制禁止重试，同时不影响旧配置。
+                retry_enabled = apply_key_rule_retry_override(_rule_result, retry_enabled)
+
+                # 测试模式（override + auto_retry=False）：key_rule 的冷却/禁用照常执行，但不重试
+                if not auto_retry:
+                    retry_enabled = False
 
                 # 特定场景禁止重试：
                 # 1. 图像生成失败（no image was generated）通常是内容审核或模型能力问题，重试无效且增加负载
@@ -1243,6 +1112,32 @@ class ModelRequestHandler:
                         # current_retry_count 从 1 开始；最多指数到 2^5，再封顶 5 秒
                         delay = min(5.0, base_delay * (2 ** min(max(current_retry_count - 1, 0), 5)))
                         await asyncio.sleep(delay)
+                    # 虚拟路由：重试时强制留在同一 priority group 内
+                    if _is_virtual_route and _priority_group_ranges:
+                        grp_start, grp_end = _get_priority_group_range(current_index)
+                        next_idx = index % num_matching_providers
+                        if next_idx >= grp_end or next_idx < grp_start:
+                            # 即将越过当前 group → 检查组内是否还有可用 key
+                            group_has_available = False
+                            for gi in range(grp_start, grp_end):
+                                gi_provider = matching_providers[gi]
+                                if is_byok_provider(gi_provider):
+                                    # 修改原因：BYOK provider 没有本地限流状态，不能因为没有 circular list 就被视为不可用。
+                                    # 修改方式：虚拟路由重试检查遇到 BYOK provider 时直接认为组内仍有可用渠道。
+                                    # 目的：避免 "*" 占位符进入 key pool，同时保持 BYOK provider 的路由兼容性。
+                                    group_has_available = True
+                                    break
+                                gi_name = gi_provider["provider"]
+                                # 修改原因：provider_api_circular_list 改为普通 dict 后，读取缺失 provider 需要显式判空。
+                                # 修改方式：使用 get 取得已有循环列表，再执行 is_all_rate_limited 检查。
+                                # 目的：避免虚拟路由重试检查创建空 key 池。
+                                gi_circular_list = provider_api_circular_list.get(gi_name)
+                                if gi_circular_list:
+                                    if not await gi_circular_list.is_all_rate_limited(original_model):
+                                        group_has_available = True
+                                        break
+                            if group_has_available:
+                                index = grp_start  # 回到组头继续试
                     continue
 
                 # retry_enabled 但已无重试额度：跳出循环，走统一的“所有重试失败”出口
@@ -1252,6 +1147,10 @@ class ModelRequestHandler:
                 # 不重试：直接返回本次错误
                 # 失败时也记录重试信息和统计
                 current_info = self.request_info_getter()
+                # 修改原因：不重试错误会直接写入失败统计，过去没有补齐渠道和模型字段。
+                # 修改方式：在写 retry_path 和失败状态前调用统一 helper，写入最后尝试 provider 与请求模型。
+                # 目的：避免直接返回 500 或其他错误时日志 provider 显示“未知”、model 显示“-”。
+                _fill_failure_provider_info(current_info, provider_name, request_model_name)
                 if retry_path:
                     current_info["retry_path"] = json.dumps(retry_path, ensure_ascii=False)
                 current_info["retry_count"] = current_retry_count
@@ -1262,7 +1161,10 @@ class ModelRequestHandler:
                     process_time = time() - current_info["start_time"]
                     current_info["process_time"] = process_time
                 # 写入失败统计
-                background_tasks.add_task(update_stats, current_info, app=self.app)
+                # 修改原因：BackgroundTasks 仍会为每条失败统计创建待执行任务，SQLite 锁等待时会继续堆积。
+                # 修改方式：改为同步 enqueue_stats 入队，由 core.stats 的单个 consumer 批量写入。
+                # 目的：让不重试失败路径不再增加后台协程数量，同时保留失败统计。
+                enqueue_stats(current_info, app=self.app)
                 return openai_error_response(
                     f"Error: Current provider response failed: {error_message}",
                     status_code,
@@ -1273,7 +1175,10 @@ class ModelRequestHandler:
         current_info["first_response_time"] = -1
         current_info["success"] = False
         current_info["status_code"] = status_code
-        current_info["provider"] = None
+        # 修改原因：所有重试失败时旧逻辑把 provider 写成 None，丢失最后一次尝试的渠道。
+        # 修改方式：复用失败字段补全 helper，只在 provider_id 和 model 缺失时补写它们。
+        # 目的：让重试耗尽后的日志至少保留最后失败渠道和原始请求模型。
+        _fill_failure_provider_info(current_info, provider_name, request_model_name)
         # 记录最终的重试信息
         if retry_path:
             current_info["retry_path"] = json.dumps(retry_path, ensure_ascii=False)
@@ -1283,7 +1188,10 @@ class ModelRequestHandler:
             process_time = time() - current_info["start_time"]
             current_info["process_time"] = process_time
         # 写入失败统计
-        background_tasks.add_task(update_stats, current_info, app=self.app)
+        # 修改原因：所有重试失败路径可能在高并发下集中进入 SQLite 写入，BackgroundTasks 会放大协程积压。
+        # 修改方式：改为同步 enqueue_stats 入队，并交给 request_stats consumer 批量提交。
+        # 目的：保留重试耗尽后的失败日志，同时避免请求结束阶段阻塞事件循环。
+        enqueue_stats(current_info, app=self.app)
         return openai_error_response(
             f"All {request_data.model} error: {error_message}",
             status_code,

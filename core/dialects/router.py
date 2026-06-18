@@ -114,6 +114,19 @@ def _create_dialect_verify_api_key(dialect_id: str):
         app = request.app
         api_list = app.state.api_list
 
+        from core.ip_blacklist import (
+            get_client_ip_from_request_info,
+            is_global_ip_blocked,
+            is_key_ip_blocked,
+            raise_ip_blocked,
+        )
+        client_ip = get_client_ip_from_request_info()
+        if is_global_ip_blocked(app, client_ip):
+            # 修改原因：方言端点跳过 StatsMiddleware 的标准认证，但仍必须先执行全局 IP 黑名单。
+            # 修改方式：在方言 token 提取和 API Key 匹配前读取 request_info.client_ip 检查全局缓存。
+            # 目的：保证 Gemini/Claude 等方言入口也遵守“全局黑名单优先”。
+            raise_ip_blocked()
+
         dialect = get_dialect(dialect_id)
         token: str | None = None
 
@@ -131,14 +144,38 @@ def _create_dialect_verify_api_key(dialect_id: str):
 
         api_index: int | None = None
         token_for_stats = token
+        byok_real_key: str | None = None
+        byok_template_key: str | None = None
 
-     # 1) 先尝试按普通 api_key 校验
+        # 1) 先尝试按普通 api_key 校验
         try:
             api_index = api_list.index(token)
+            try:
+                from core.byok import is_byok_api_key
+
+                if is_byok_api_key(getattr(app.state, "api_keys_db", []), api_index):
+                    # 修改原因：方言入口同样不能把 BYOK 模板 key 当成可用客户端 key。
+                    # 修改方式：精确命中 byok-xxx-* 时回退到前缀解析，并由前缀解析拒绝模板本身。
+                    # 目的：保证 x-goog-api-key 和 Authorization 两类方言鉴权都必须携带真实上游 key。
+                    api_index = None
+            except Exception:
+                pass
         except ValueError:
             api_index = None
 
-        # 2) 兼容管理控制台的 admin JWT：映射到 admin api_key
+        # 2) 精确匹配失败后尝试 BYOK 前缀匹配。Gemini 方言可从 x-goog-api-key 取 token，默认提取器可从 x-api-key/Bearer 取 token。
+        if api_index is None:
+            try:
+                from core.byok import get_byok_prefixes, resolve_byok_token
+
+                byok_result = resolve_byok_token(token, get_byok_prefixes(app))
+                if byok_result is not None:
+                    api_index, byok_template_key, byok_real_key = byok_result
+                    token_for_stats = byok_template_key
+            except Exception:
+                api_index = None
+
+        # 3) 兼容管理控制台的 admin JWT：映射到 admin api_key
         if api_index is None:
             try:
                 from core.jwt_utils import is_admin_jwt
@@ -156,17 +193,23 @@ def _create_dialect_verify_api_key(dialect_id: str):
             from fastapi import HTTPException
             raise HTTPException(status_code=403, detail="Invalid or missing API Key")
 
-        # 更新 request_info 中的 API key 信息，确保统计记录正确的 key
-        try:
-            from core.middleware import request_info
-            from utils import safe_get
+        if is_key_ip_blocked(app, api_index, client_ip):
+            # 修改原因：方言入口解析出 API Key 下标后，也要执行当前 Key 的 IP 黑名单。
+            # 修改方式：用 api_index 读取 app.state.api_key_ip_blacklists 对应规则。
+            # 目的：保持方言入口与 /v1 标准入口的访问控制顺序一致。
+            raise_ip_blocked()
 
-            info = request_info.get()
-            if info:
-                info["api_key"] = token_for_stats
-                config = app.state.config
-                info["api_key_name"] = safe_get(config, "api_keys", api_index, "name", default=None)
-                info["api_key_group"] = safe_get(config, "api_keys", api_index, "group", default=None)
+        # 更新 request_info 和 request.state 中的 API key 信息，确保统计记录模板 key 而非 BYOK 真实 key。
+        try:
+            from core.byok import store_byok_request_state, update_request_info_auth
+
+            store_byok_request_state(
+                request,
+                byok_real_key=byok_real_key,
+                template_key=byok_template_key,
+                token_for_stats=token_for_stats,
+            )
+            update_request_info_auth(app, api_index, token_for_stats, byok_real_key, byok_template_key)
         except Exception:
             pass
 
