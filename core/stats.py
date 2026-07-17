@@ -706,6 +706,36 @@ def enqueue_stats(current_info: dict, app=None, get_model_prices_func=None) -> N
         _stats_flush_event.set()
 
 
+def _record_quota_usage_from_info(current_info: dict, app, check_key: str) -> None:
+    """把 request_stats 快照同步写入 QuotaRegistry。"""
+    # 修改原因：QuotaRegistry.record_usage 新增 client_ip、tokens_in 和 tokens_out 参数，用于 per-IP cost/token 与输入/输出 token 配额。
+    # 修改方式：集中从 current_info 读取 prompt_tokens、completion_tokens、total_tokens、client_ip 和价格，统一调用 record_usage。
+    # 目的：避免 D1、SQLAlchemy、批量、单条四条写入路径继续复制参数组装逻辑，降低后续 quota 字段变更风险。
+    quota_registry = getattr(app.state, 'quota_registry', None) if app else None
+    if not quota_registry or not check_key:
+        return
+
+    tokens_in = current_info.get('prompt_tokens', 0) or 0
+    tokens_out = current_info.get('completion_tokens', 0) or 0
+    total_tokens = current_info.get('total_tokens', 0) or (tokens_in + tokens_out)
+    cost = (
+        tokens_in * (current_info.get('prompt_price', 0) or 0) +
+        tokens_out * (current_info.get('completion_price', 0) or 0)
+    ) / 1_000_000
+    model = current_info.get('model', 'default') or 'default'
+    client_ip = current_info.get('client_ip', '') or ''
+    if cost > 0 or total_tokens > 0 or tokens_in > 0 or tokens_out > 0:
+        quota_registry.record_usage(
+            check_key,
+            model,
+            cost=cost,
+            tokens=total_tokens,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            client_ip=client_ip,
+        )
+
+
 def _ensure_stats_consumer_started() -> None:
     """确保 request stats 常驻 consumer 已经启动。"""
     global _stats_consumer_started, _stats_flush_event
@@ -807,6 +837,7 @@ async def _batch_write_stats(batch: list) -> None:
                     if app and check_key and hasattr(app.state, 'paid_api_keys_states'):
                         if check_key in app.state.paid_api_keys_states and current_info.get("total_tokens", 0) > 0:
                             await update_paid_api_keys_states(app, check_key)
+                    _record_quota_usage_from_info(current_info, app, check_key)
                 return
 
             async with db_semaphore:
@@ -831,6 +862,7 @@ async def _batch_write_stats(batch: list) -> None:
                 if app and check_key and hasattr(app.state, 'paid_api_keys_states'):
                     if check_key in app.state.paid_api_keys_states and current_info.get("total_tokens", 0) > 0:
                         await update_paid_api_keys_states(app, check_key)
+                _record_quota_usage_from_info(current_info, app, check_key)
             return
 
         except Exception as e:
@@ -909,6 +941,7 @@ async def update_stats(current_info: dict, app=None, get_model_prices_func=None)
                 if app and check_key and hasattr(app.state, 'paid_api_keys_states'):
                     if check_key in app.state.paid_api_keys_states and current_info.get("total_tokens", 0) > 0:
                         await update_paid_api_keys_states(app, check_key)
+                _record_quota_usage_from_info(current_info, app, check_key)
                 return
 
             # 等待获取数据库访问权限
@@ -932,6 +965,7 @@ async def update_stats(current_info: dict, app=None, get_model_prices_func=None)
             if app and check_key and hasattr(app.state, 'paid_api_keys_states'):
                 if check_key in app.state.paid_api_keys_states and current_info.get("total_tokens", 0) > 0:
                     await update_paid_api_keys_states(app, check_key)
+            _record_quota_usage_from_info(current_info, app, check_key)
             return  # 成功后直接返回
 
         except Exception as e:

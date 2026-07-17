@@ -6,7 +6,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Literal, Mapping
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, Body
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_serializer, Field
 
@@ -101,6 +101,11 @@ class ApiKeyState(BaseModel):
 
 class ApiKeysStatesResponse(BaseModel):
     api_keys_states: Dict[str, ApiKeyState]
+
+
+class QuotaResetRequest(BaseModel):
+    api_key: str
+    status_key: str
 
 
 class LogEntry(BaseModel):
@@ -1821,6 +1826,9 @@ async def api_keys_states(token: str = Depends(verify_admin_api_key)):
     app = get_app()
     
     states_dict = {}
+    # 修改原因：统一配额上线后仍要保留旧 credits 响应，避免旧前端或旧脚本读取 api_keys_states 失败。
+    # 修改方式：原 paid_api_keys_states 循环保持不变，只在后面额外附加 quota_states 字段。
+    # 目的：让 Phase 2 前端可以读取新 quota 状态，同时保持 /v1/api_keys_states 的旧结构兼容。
     for key, state in app.state.paid_api_keys_states.items():
         states_dict[key] = ApiKeyState(
             credits=state["credits"],
@@ -1830,8 +1838,52 @@ async def api_keys_states(token: str = Depends(verify_admin_api_key)):
             enabled=state["enabled"]
         )
 
+    quota_states = {}
+    quota_registry = getattr(app.state, 'quota_registry', None)
+    if quota_registry:
+        for kc in (app.state.config or {}).get('api_keys', []):
+            api = kc.get('api', '')
+            if api and quota_registry.has_quota(api):
+                quota_states[api] = quota_registry.get_key_status(api)
+
     response = ApiKeysStatesResponse(api_keys_states=states_dict)
-    return response
+    resp_dict = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
+    resp_dict['quota_states'] = quota_states
+    return resp_dict
+
+
+@router.post("/v1/api_keys/quota/reset", dependencies=[Depends(rate_limit_dependency)])
+async def reset_api_key_quota(
+    payload: QuotaResetRequest = Body(...),
+    token: str = Depends(verify_admin_api_key),
+):
+    """手动重置单个 API Key 的一条统一配额状态。"""
+
+    # 修改原因：Admin 的 Key 编辑面板需要按 Scope × Metric 正交状态手动清零额度。
+    # 修改方式：通过 admin-only 接口接收 api_key 和 quota_states 中的 status_key，调用 QuotaRegistry 清零内存计数。
+    # 目的：管理员无需重启服务或修改配置，就可以重置 Key 级、Per-IP、模型级等单条额度状态。
+    app = get_app()
+    api_key = (payload.api_key or '').strip()
+    status_key = (payload.status_key or '').strip()
+    if not api_key or not status_key:
+        raise HTTPException(status_code=400, detail="api_key and status_key are required")
+
+    quota_registry = getattr(app.state, 'quota_registry', None)
+    if not quota_registry or not quota_registry.has_quota(api_key):
+        raise HTTPException(status_code=404, detail="Quota counter not found for this API key")
+
+    try:
+        reset_result = quota_registry.reset_key_status(api_key, status_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Quota counter not found for this API key")
+
+    return JSONResponse(content={
+        "success": True,
+        "reset": reset_result,
+        "quota_state": quota_registry.get_key_status(api_key),
+    })
 
 
 @router.post("/v1/add_credits", dependencies=[Depends(rate_limit_dependency)])

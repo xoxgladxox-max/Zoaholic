@@ -8,7 +8,7 @@
 import json
 import asyncio
 from datetime import datetime
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Dict
 
 from .log_config import logger
 from .middleware import request_info
@@ -269,12 +269,60 @@ def _log_upstream_request(url, payload):
         logger.error(f"Error logging upstream request in fetch layer: {e}")
 
 
-async def fetch_response(client, url, headers, payload, engine, model, timeout=200, enabled_plugins=None):
+async def _apply_response_path_interceptors(
+    response_chunk: Any,
+    engine: str,
+    model: str,
+    is_stream: bool,
+    enabled_plugins: Optional[List[str]] = None,
+    provider: Optional[Dict[str, Any]] = None,
+    api_key_info: Optional[Dict[str, Any]] = None,
+    key_enabled_plugins: Optional[List[str]] = None,
+) -> Any:
+    """依次应用响应、渠道出站和 Key 出站拦截器。"""
+    from .plugins.interceptors import (
+        apply_response_interceptors,
+        apply_channel_outbound_interceptors,
+        apply_key_outbound_interceptors,
+    )
+
+    # 修改原因：新增出站阶段必须接在既有 response_interceptors 之后，并区分渠道级和 Key 级 enabled_plugins。
+    # 修改方式：统一封装响应返回路径，先执行旧响应拦截器，再执行 channel_outbound，最后执行 key_outbound。
+    # 目的：保证流式和非流式成功/错误 chunk 都走同一顺序，避免各 fetch 分支遗漏新阶段。
+    response_chunk = await apply_response_interceptors(
+        response_chunk, engine, model, is_stream=is_stream, enabled_plugins=enabled_plugins
+    )
+    if isinstance(response_chunk, dict) and "error" in response_chunk:
+        # 修改原因：结构化错误 chunk 后续会进入 handler 的 Key Rules，channel_outbound/key_outbound 必须在 Key Rules 之后执行。
+        # 修改方式：此处只保留旧 response_interceptors 处理，跳过新增出站阶段；最终错误响应由 handler 收尾时再执行出站阶段。
+        # 目的：让错误路径满足“响应拦截器之后、Key Rules 之后、返回客户端前”的阶段顺序。
+        return response_chunk
+    response_chunk = await apply_channel_outbound_interceptors(
+        response_chunk, engine, model, provider or {}, is_stream=is_stream, enabled_plugins=enabled_plugins
+    )
+    response_chunk = await apply_key_outbound_interceptors(
+        response_chunk, engine, model, api_key_info or {}, is_stream=is_stream, enabled_plugins=key_enabled_plugins
+    )
+    return response_chunk
+
+
+async def fetch_response(
+    client,
+    url,
+    headers,
+    payload,
+    engine,
+    model,
+    timeout=200,
+    enabled_plugins=None,
+    provider=None,
+    api_key_info=None,
+    key_enabled_plugins=None,
+):
     """
     处理非流式 API 响应，通过渠道适配器进行分发
     """
     from .channels import get_channel
-    from .plugins.interceptors import apply_response_interceptors
     
     _log_upstream_request(url, payload)
     
@@ -282,7 +330,13 @@ async def fetch_response(client, url, headers, payload, engine, model, timeout=2
     if channel and channel.response_adapter:
         async for chunk in channel.response_adapter(client, url, headers, payload, model, timeout):
             # 如果适配器返回的是字典且包含 error，则它是一个预处理过的错误
-            chunk = await apply_response_interceptors(chunk, engine, model, is_stream=False, enabled_plugins=enabled_plugins)
+            chunk = await _apply_response_path_interceptors(
+                chunk, engine, model, is_stream=False,
+                enabled_plugins=enabled_plugins,
+                provider=provider,
+                api_key_info=api_key_info,
+                key_enabled_plugins=key_enabled_plugins,
+            )
             yield chunk
             if isinstance(chunk, dict) and "error" in chunk:
                 return
@@ -298,7 +352,13 @@ async def fetch_response(client, url, headers, payload, engine, model, timeout=2
     
     error_message = await check_response(response, "fetch_response_fallback")
     if error_message:
-        error_message = await apply_response_interceptors(error_message, engine, model, is_stream=False, enabled_plugins=enabled_plugins)
+        error_message = await _apply_response_path_interceptors(
+            error_message, engine, model, is_stream=False,
+            enabled_plugins=enabled_plugins,
+            provider=provider,
+            api_key_info=api_key_info,
+            key_enabled_plugins=key_enabled_plugins,
+        )
         yield error_message        
         return
     
@@ -309,6 +369,16 @@ async def fetch_response(client, url, headers, payload, engine, model, timeout=2
     else:
         response_bytes = await response.aread()
         response_json = await asyncio.to_thread(json_loads, response_bytes)
+        # 修改原因：默认 fallback 成功响应此前绕过 response_interceptors，新出站阶段也会因此遗漏。
+        # 修改方式：在 yield 前统一调用 _apply_response_path_interceptors。
+        # 目的：让无专用 channel adapter 的非流式成功响应也覆盖响应、渠道出站和 Key 出站阶段。
+        response_json = await _apply_response_path_interceptors(
+            response_json, engine, model, is_stream=False,
+            enabled_plugins=enabled_plugins,
+            provider=provider,
+            api_key_info=api_key_info,
+            key_enabled_plugins=key_enabled_plugins,
+        )
         yield response_json
 
 
@@ -321,20 +391,28 @@ async def fetch_response_stream(
     model,
     timeout=200,
     enabled_plugins: Optional[List[str]] = None,
+    provider: Optional[Dict[str, Any]] = None,
+    api_key_info: Optional[Dict[str, Any]] = None,
+    key_enabled_plugins: Optional[List[str]] = None,
 ):
     """
     通过渠道注册中心获取流式响应适配器并处理响应流
     """
     from .channels import get_channel
-    from .plugins.interceptors import apply_response_interceptors
     
     _log_upstream_request(url, payload)
     
     channel = get_channel(engine)
     if channel and channel.stream_adapter:
         async for chunk in channel.stream_adapter(client, url, headers, payload, model, timeout):
-            # 应用响应拦截器
-            chunk = await apply_response_interceptors(chunk, engine, model, is_stream=True, enabled_plugins=enabled_plugins)
+            # 应用响应拦截器和新增出站阶段
+            chunk = await _apply_response_path_interceptors(
+                chunk, engine, model, is_stream=True,
+                enabled_plugins=enabled_plugins,
+                provider=provider,
+                api_key_info=api_key_info,
+                key_enabled_plugins=key_enabled_plugins,
+            )
             yield chunk
             # 如果适配器返回的是字典且包含 error，则它是一个预处理过的错误
             if isinstance(chunk, dict) and "error" in chunk:

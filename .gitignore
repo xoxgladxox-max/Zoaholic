@@ -24,6 +24,7 @@ __pycache__/
 *.py[cod]
 *.pyd
 *.so
+*.egg-info/
 
 .venv/
 venv/

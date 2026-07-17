@@ -8,7 +8,7 @@
 
 import asyncio
 import json
-from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 import httpx
 from fastapi import BackgroundTasks, HTTPException
@@ -48,7 +48,19 @@ def _filter_passthrough_headers(original_headers: Optional[Dict[str, str]]) -> D
     }
 
 
-async def _fetch_passthrough_stream(client, url, headers, payload, timeout, engine=None, model=None, enabled_plugins=None):
+async def _fetch_passthrough_stream(
+    client,
+    url,
+    headers,
+    payload,
+    timeout,
+    engine=None,
+    model=None,
+    enabled_plugins=None,
+    provider=None,
+    api_key_info=None,
+    key_enabled_plugins=None,
+):
     """
     透传模式的流式响应处理
     
@@ -57,7 +69,7 @@ async def _fetch_passthrough_stream(client, url, headers, payload, timeout, engi
     注意：使用特殊的超时配置，read timeout 设置为 None 以支持
     Google Search grounding 等需要长时间处理的操作。
     """
-    from .response import _log_upstream_request
+    from .response import _log_upstream_request, _apply_response_path_interceptors
     _log_upstream_request(url, payload)
     
     # 为流式请求创建特殊的超时配置
@@ -74,10 +86,18 @@ async def _fetch_passthrough_stream(client, url, headers, payload, timeout, engi
     
     json_payload = await asyncio.to_thread(json_dumps_text, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=stream_timeout) as response:
-        from core.plugins.interceptors import apply_response_interceptors
         error_message = await check_response(response, "passthrough_stream")
         if error_message:
-            error_message = await apply_response_interceptors(error_message, engine or "passthrough", model or "", is_stream=True, enabled_plugins=enabled_plugins)
+            # 修改原因：透传流式错误响应也要按 response → channel_outbound → key_outbound 的顺序处理。
+            # 修改方式：复用 response.py 的统一返回路径 helper，并传入渠道与 Key 级插件上下文。
+            # 目的：避免透传错误分支遗漏新增出站阶段。
+            error_message = await _apply_response_path_interceptors(
+                error_message, engine or "passthrough", model or "", is_stream=True,
+                enabled_plugins=enabled_plugins,
+                provider=provider,
+                api_key_info=api_key_info,
+                key_enabled_plugins=key_enabled_plugins,
+            )
             yield error_message            
             return
         
@@ -85,22 +105,39 @@ async def _fetch_passthrough_stream(client, url, headers, payload, timeout, engi
         # SSE 服务端通常在每个事件后 flush，因此每个 chunk 大概率是完整的 SSE 事件。
         async for text in response.aiter_text():
             if text:
-                text = await apply_response_interceptors(text, engine or "passthrough", model or "", is_stream=True, enabled_plugins=enabled_plugins)
+                text = await _apply_response_path_interceptors(
+                    text, engine or "passthrough", model or "", is_stream=True,
+                    enabled_plugins=enabled_plugins,
+                    provider=provider,
+                    api_key_info=api_key_info,
+                    key_enabled_plugins=key_enabled_plugins,
+                )
                 yield text
 
 
-async def _fetch_passthrough_response(client, url, headers, payload, timeout, engine=None, model=None, enabled_plugins=None):
+async def _fetch_passthrough_response(
+    client,
+    url,
+    headers,
+    payload,
+    timeout,
+    engine=None,
+    model=None,
+    enabled_plugins=None,
+    provider=None,
+    api_key_info=None,
+    key_enabled_plugins=None,
+):
     """
     透传模式的非流式响应处理
     
     直接转发上游 JSON 响应，不做任何格式转换
     """
-    from .response import _log_upstream_request
+    from .response import _log_upstream_request, _apply_response_path_interceptors
     _log_upstream_request(url, payload)
     
     import time as _time
     t0 = _time.time()
-    from core.plugins.interceptors import apply_response_interceptors
     
     json_payload = await asyncio.to_thread(json_dumps_text, payload)
     t1 = _time.time()
@@ -117,7 +154,7 @@ async def _fetch_passthrough_response(client, url, headers, payload, timeout, en
 
     # 快路径：未启用响应插件时，直接按文本流转发。
     # 这样可以避免先 aread() 再 decode() 带来的整包双份内存占用。
-    if not enabled_plugins:
+    if not enabled_plugins and not key_enabled_plugins:
         async with client.stream('POST', url, headers=headers, content=json_payload, timeout=request_timeout) as response:
             t2 = _time.time()
             logger.debug(f"[passthrough] POST request took {t2-t1:.3f}s, status={response.status_code}")
@@ -138,7 +175,13 @@ async def _fetch_passthrough_response(client, url, headers, payload, timeout, en
 
     error_message = await check_response(response, "passthrough_non_stream")
     if error_message:
-        error_message = await apply_response_interceptors(error_message, engine or "passthrough", model or "", is_stream=False, enabled_plugins=enabled_plugins)
+        error_message = await _apply_response_path_interceptors(
+            error_message, engine or "passthrough", model or "", is_stream=False,
+            enabled_plugins=enabled_plugins,
+            provider=provider,
+            api_key_info=api_key_info,
+            key_enabled_plugins=key_enabled_plugins,
+        )
         yield error_message
         return
 
@@ -147,7 +190,13 @@ async def _fetch_passthrough_response(client, url, headers, payload, timeout, en
     logger.debug(f"[passthrough] aread() took {t3-t2:.3f}s, size={len(response_bytes)} bytes")
 
     result = response_bytes.decode("utf-8")
-    result = await apply_response_interceptors(result, engine or "passthrough", model or "", is_stream=False, enabled_plugins=enabled_plugins)
+    result = await _apply_response_path_interceptors(
+        result, engine or "passthrough", model or "", is_stream=False,
+        enabled_plugins=enabled_plugins,
+        provider=provider,
+        api_key_info=api_key_info,
+        key_enabled_plugins=key_enabled_plugins,
+    )
     yield result
 
 
@@ -263,6 +312,8 @@ async def process_request_passthrough(
     timeout_value: int = DEFAULT_TIMEOUT,
     keepalive_interval: Optional[int] = None,
     force_api_key: Optional[str] = None,
+    api_key_info: Optional[Dict[str, Any]] = None,
+    key_enabled_plugins: Optional[List[str]] = None,
 ) -> Response:
     """
     透传模式请求处理：
@@ -389,6 +440,10 @@ async def process_request_passthrough(
         )
 
     enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
+    # 修改原因：透传路径也需要 Key 级出站拦截器上下文，不能只携带渠道级 enabled_plugins。
+    # 修改方式：接收 handler 传入的 api_key_info 和 key_enabled_plugins，缺失时使用空字典兼容旧调用。
+    # 目的：让透传流式和非流式响应都能执行 key_outbound 阶段。
+    api_key_info = api_key_info or {}
     url, headers, payload = await apply_request_interceptors(
         request, engine, provider, api_key, url, headers, payload, enabled_plugins
     )
@@ -475,15 +530,34 @@ async def process_request_passthrough(
                 # 修改方式：若渠道注册了 passthrough_stream_adapter，则优先使用渠道专用处理器。
                 # 目的：只让需要特殊解码的渠道接管透传响应读取，其他渠道继续走通用原样转发。
                 if channel and getattr(channel, "passthrough_stream_adapter", None):
-                    generator = channel.passthrough_stream_adapter(
+                    raw_generator = channel.passthrough_stream_adapter(
                         client, url, headers, payload, original_model, timeout_value
                     )
+
+                    async def passthrough_stream_adapter_with_outbound():
+                        from .response import _apply_response_path_interceptors
+                        # 修改原因：专用透传流式 adapter 不经过 _fetch_passthrough_stream，旧逻辑会绕过 response 和新增出站阶段。
+                        # 修改方式：只在专用 adapter 分支包一层 async generator，按统一顺序处理每个 chunk。
+                        # 目的：让 AWS Bedrock 等专用透传流式响应也覆盖 channel_outbound 和 key_outbound。
+                        async for chunk in raw_generator:
+                            yield await _apply_response_path_interceptors(
+                                chunk, engine, request.model, is_stream=True,
+                                enabled_plugins=enabled_plugins,
+                                provider=provider,
+                                api_key_info=api_key_info,
+                                key_enabled_plugins=key_enabled_plugins,
+                            )
+
+                    generator = passthrough_stream_adapter_with_outbound()
                 else:
                     # 透传模式：使用原始流处理，不做格式转换
                     generator = _fetch_passthrough_stream(
                         client, url, headers, payload, timeout_value,
                         engine=engine, model=request.model,
                         enabled_plugins=enabled_plugins,
+                        provider=provider,
+                        api_key_info=api_key_info,
+                        key_enabled_plugins=key_enabled_plugins,
                     )
                 # 使用简单的透传错误包装器，不做 JSON 解析
                 wrapped_generator, first_response_time = await _passthrough_error_wrapper(
@@ -518,15 +592,34 @@ async def process_request_passthrough(
                 # 修改方式：若渠道注册了 passthrough_response_adapter，则优先调用该处理器。
                 # 目的：让 AWS Bedrock 的 invoke 响应可以与流式透传一样收敛在 AWS channel 内。
                 if channel and getattr(channel, "passthrough_response_adapter", None):
-                    generator = channel.passthrough_response_adapter(
+                    raw_generator = channel.passthrough_response_adapter(
                         client, url, headers, payload, original_model, timeout_value
                     )
+
+                    async def passthrough_response_adapter_with_outbound():
+                        from .response import _apply_response_path_interceptors
+                        # 修改原因：专用透传非流式 adapter 不经过 _fetch_passthrough_response，旧逻辑会绕过 response 和新增出站阶段。
+                        # 修改方式：只在专用 adapter 分支包一层 async generator，按统一顺序处理每个 chunk。
+                        # 目的：让 AWS Bedrock 等专用透传非流式响应也覆盖 channel_outbound 和 key_outbound。
+                        async for chunk in raw_generator:
+                            yield await _apply_response_path_interceptors(
+                                chunk, engine, request.model, is_stream=False,
+                                enabled_plugins=enabled_plugins,
+                                provider=provider,
+                                api_key_info=api_key_info,
+                                key_enabled_plugins=key_enabled_plugins,
+                            )
+
+                    generator = passthrough_response_adapter_with_outbound()
                 else:
                     # 透传模式：使用原始响应处理，不做格式转换
                     generator = _fetch_passthrough_response(
                         client, url, headers, payload, timeout_value,
                         engine=engine, model=request.model,
                         enabled_plugins=enabled_plugins,
+                        provider=provider,
+                        api_key_info=api_key_info,
+                        key_enabled_plugins=key_enabled_plugins,
                     )
                 # 使用简单的透传错误包装器，不做 JSON 解析
                 wrapped_generator, first_response_time = await _passthrough_error_wrapper(

@@ -42,17 +42,26 @@ from .interceptors import (
     register_inbound_interceptor,
     unregister_inbound_interceptor,
     apply_inbound_interceptors,
+    # 修改原因：新增 channel_inbound、channel_outbound 和 key_outbound 三个拦截阶段，需要从 core.plugins 顶层导出。
+    # 修改方式：在现有 interceptors 导入列表中补充新阶段的注册、注销和应用便捷函数。
+    # 目的：让插件文件可以使用与 request/response 一致的导入路径。
+    register_channel_inbound_interceptor,
+    unregister_channel_inbound_interceptor,
+    apply_channel_inbound_interceptors,
     register_request_interceptor,
     unregister_request_interceptor,
     register_response_interceptor,
     unregister_response_interceptor,
-    # 修改原因：balance_enricher 是第三类插件拦截扩展点，需要从 core.plugins 顶层导出。
-    # 修改方式：在现有 interceptors 导入列表中补充注册、注销和应用三个便捷函数。
-    # 目的：让插件文件可以使用与 request/response 一致的导入路径。
+    register_channel_outbound_interceptor,
+    unregister_channel_outbound_interceptor,
+    register_key_outbound_interceptor,
+    unregister_key_outbound_interceptor,
     register_balance_enricher,
     unregister_balance_enricher,
     apply_request_interceptors,
     apply_response_interceptors,
+    apply_channel_outbound_interceptors,
+    apply_key_outbound_interceptors,
     apply_balance_enrichers,
     # 插件参数解析工具
     parse_plugin_entry,
@@ -82,14 +91,23 @@ __all__ = [
     "register_inbound_interceptor",
     "unregister_inbound_interceptor",
     "apply_inbound_interceptors",
+    "register_channel_inbound_interceptor",
+    "unregister_channel_inbound_interceptor",
+    "apply_channel_inbound_interceptors",
     "register_request_interceptor",
     "unregister_request_interceptor",
     "register_response_interceptor",
     "unregister_response_interceptor",
+    "register_channel_outbound_interceptor",
+    "unregister_channel_outbound_interceptor",
+    "register_key_outbound_interceptor",
+    "unregister_key_outbound_interceptor",
     "register_balance_enricher",
     "unregister_balance_enricher",
     "apply_request_interceptors",
     "apply_response_interceptors",
+    "apply_channel_outbound_interceptors",
+    "apply_key_outbound_interceptors",
     "apply_balance_enrichers",
     # 插件参数工具
     "parse_plugin_entry",

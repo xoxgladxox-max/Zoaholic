@@ -9,13 +9,14 @@ export interface ParamOption {
 export interface ParamSchema {
   key: string;
   label: string;
-  type: 'select' | 'text' | 'number' | 'toggle' | 'multi-select';
+  type: 'select' | 'text' | 'textarea' | 'number' | 'toggle' | 'multi-select';
   options?: ParamOption[];
   default?: unknown;
   placeholder?: string;
   min?: number;
   max?: number;
   visible_when?: Record<string, string>;
+  serialize?: 'positional' | 'key_value';
 }
 
 interface PluginParamsFormProps {
@@ -51,10 +52,41 @@ function hasExplicitKeyValueMode(options: string, schema: ParamSchema[]): boolea
 
 function shouldSerializeAsKeyValue(currentOptions: string, schema: ParamSchema[]): boolean {
   if (hasExplicitKeyValueMode(currentOptions, schema)) return true;
+  // 修改原因：部分插件有多个可视化参数，但后端 options 字符串必须保留字段名，否则 positional 格式无法表达含逗号的列表或布尔开关。
+  // 修改方式：允许 params_schema 用 serialize=key_value 显式声明 key=value 序列化。
+  // 目的：key_guard 等插件可以展示多个控件，同时不破坏既有单字符串 options 机制。
+  if (schema.some(param => param.serialize === 'key_value')) return true;
   // 修改原因：metadata.params_schema 当前没有显式声明序列化格式，但 claude_tools 的 cache 参数必须保留 key=value。
   // 修改方式：对已知需要显示参数名的单参数 key 使用 key=value；其他单参数继续使用 positional 值。
   // 目的：兼容 cache=1h，同时不破坏 retries、mode、message 等既有短格式。
   return schema.length === 1 && KEY_VALUE_DEFAULT_KEYS.has(schema[0].key);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function parseKeyValueOptionsBySchema(options: string, schema: ParamSchema[]): Record<string, string> {
+  const result: Record<string, string> = {};
+  const keys = schema.map(param => param.key).filter(Boolean);
+  const matches: Array<{ key: string; boundaryStart: number; valueStart: number }> = [];
+
+  for (const key of keys) {
+    const re = new RegExp(`(^|,)${escapeRegExp(key)}=`, 'g');
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(options)) !== null) {
+      const prefix = match[1] || '';
+      const keyStart = match.index + prefix.length;
+      matches.push({ key, boundaryStart: match.index, valueStart: keyStart + key.length + 1 });
+    }
+  }
+
+  matches.sort((a, b) => a.boundaryStart - b.boundaryStart);
+  matches.forEach((match, index) => {
+    const valueEnd = index + 1 < matches.length ? matches[index + 1].boundaryStart : options.length;
+    result[match.key] = options.slice(match.valueStart, valueEnd).trim();
+  });
+  return result;
 }
 
 function valueWithDefaults(values: Record<string, string>, schema: ParamSchema[]): Record<string, string> {
@@ -85,13 +117,28 @@ export function parsePluginOptions(options: string, schemaInput: ParamSchema[]):
       return result;
     }
 
+    return parseKeyValueOptionsBySchema(trimmed, schema);
+  }
+
+  if (schema.some(param => param.key === 'allowed_ua') && schema.some(param => param.key === 'strip_tools')) {
+    // 修改原因：key_guard 旧配置使用 ua:xxx,no_tools 这类 token 语法，升级为多控件后仍需正确回显旧值。
+    // 修改方式：识别 ua:、no_tools、strip_tools token，映射到 allowed_ua 与 strip_tools 字段。
+    // 目的：旧配置打开后可以自然迁移为 key=value 多参数格式，而不是被 positional 解析错位。
+    const allowedUa: string[] = [];
     for (const part of trimmed.split(',')) {
-      const idx = part.indexOf('=');
-      if (idx <= 0) continue;
-      const key = part.slice(0, idx).trim();
-      if (schema.some(param => param.key === key)) result[key] = part.slice(idx + 1).trim();
+      const token = part.trim();
+      if (!token) continue;
+      if (token.startsWith('ua:')) {
+        const keyword = token.slice(3).trim();
+        if (keyword) allowedUa.push(keyword);
+      } else if (token === 'no_tools') {
+        result.strip_tools = 'false';
+      } else if (token === 'strip_tools') {
+        result.strip_tools = 'true';
+      }
     }
-    return result;
+    if (allowedUa.length > 0) result.allowed_ua = allowedUa.join(MULTI_VALUE_SEPARATOR);
+    if (allowedUa.length > 0 || result.strip_tools !== undefined) return result;
   }
 
   // 修改原因：单参数插件的 options 可能是完整自由文本，文本中可能包含逗号，不能按逗号拆分。
@@ -241,6 +288,16 @@ export function PluginParamsForm({ options, schema: schemaInput, onChange, disab
                 value={value}
                 onChange={event => updateValue(param.key, event.target.value)}
                 placeholder={param.placeholder || paramsHint || '留空使用默认值'}
+              />
+            )}
+            {param.type === 'textarea' && (
+              <textarea
+                {...commonProps}
+                value={value}
+                onChange={event => updateValue(param.key, event.target.value)}
+                placeholder={param.placeholder || paramsHint || '留空使用默认值'}
+                rows={compact ? 3 : 5}
+                className={`${controlBaseClass} ${compact ? 'h-16 py-1' : 'min-h-[96px] py-2'}`}
               />
             )}
             {param.type === 'number' && (

@@ -17,6 +17,7 @@ router = APIRouter()
 
 @router.post("/v1/audio/speech", dependencies=[Depends(rate_limit_dependency)])
 async def audio_speech(
+    http_request: Request,
     request: TextToSpeechRequest,
     background_tasks: BackgroundTasks,
     api_index: str = Depends(verify_api_key)
@@ -28,7 +29,7 @@ async def audio_speech(
     """
     model_handler = get_model_handler()
     return await model_handler.request_model(
-        request, api_index, background_tasks, endpoint="/v1/audio/speech"
+        request, api_index, background_tasks, endpoint="/v1/audio/speech", raw_request=http_request
     )
 
 
@@ -76,7 +77,7 @@ async def audio_transcriptions(
 
         model_handler = get_model_handler()
         return await model_handler.request_model(
-            request_obj, api_index, background_tasks, endpoint="/v1/audio/transcriptions"
+            request_obj, api_index, background_tasks, endpoint="/v1/audio/transcriptions", raw_request=http_request
         )
     except UnicodeDecodeError:
         raise HTTPException(status_code=400, detail="Invalid audio file encoding")

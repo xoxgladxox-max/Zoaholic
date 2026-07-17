@@ -20,6 +20,8 @@ from core.passthrough import (
 
 import json
 import asyncio
+import copy
+import inspect
 from collections import OrderedDict, deque
 from core.json_utils import json_dumps_text, json_loads
 from datetime import datetime, timedelta, timezone
@@ -126,6 +128,49 @@ async def _resolve_oauth_api_key(app: "FastAPI", api_key: Optional[str], channel
             pass
         return resolved
     return api_key
+
+
+async def _apply_final_outbound_interceptors_to_response(
+    response: Response,
+    engine: str,
+    model: str,
+    provider: Dict[str, Any],
+    api_key_info: Dict[str, Any],
+    provider_enabled_plugins: Optional[List[str]],
+    key_enabled_plugins: Optional[List[str]],
+) -> Response:
+    """对最终 JSON 响应执行渠道出站和 Key 出站拦截器。"""
+    # 修改原因：结构化上游错误会先经过 handler 的 Key Rules，再由 openai_error_response 生成最终 JSONResponse；此时不能遗漏新增出站阶段。
+    # 修改方式：读取 JSONResponse 已渲染的 body，按 channel_outbound → key_outbound 顺序处理，再重新构造 JSONResponse。
+    # 目的：让不重试错误和重试耗尽错误在 Key Rules 之后、返回客户端之前仍执行出站拦截器。
+    if not isinstance(response, JSONResponse):
+        return response
+    try:
+        body = getattr(response, "body", b"")
+        if isinstance(body, bytes):
+            response_chunk = json.loads(body.decode("utf-8")) if body else None
+        elif isinstance(body, str):
+            response_chunk = json.loads(body) if body else None
+        else:
+            return response
+        if response_chunk is None:
+            return response
+
+        from core.plugins.interceptors import apply_channel_outbound_interceptors, apply_key_outbound_interceptors
+        response_chunk = await apply_channel_outbound_interceptors(
+            response_chunk, engine, model, provider, is_stream=False, enabled_plugins=provider_enabled_plugins
+        )
+        response_chunk = await apply_key_outbound_interceptors(
+            response_chunk, engine, model, api_key_info, is_stream=False, enabled_plugins=key_enabled_plugins
+        )
+        headers = {
+            key: value for key, value in dict(response.headers).items()
+            if str(key).lower() != "content-length"
+        }
+        return JSONResponse(status_code=response.status_code, content=response_chunk, headers=headers)
+    except Exception as outbound_err:
+        logger.error(f"Final outbound interceptors error: {outbound_err}")
+        return response
 
 
 def _fill_failure_provider_info(
@@ -317,6 +362,37 @@ def get_preference(
     return timeout_value
 
 
+def _clone_request_data_for_channel_attempt(request_data: Any) -> Any:
+    """为单个 provider 尝试复制请求对象。"""
+    # 修改原因：channel_inbound 在 provider 已选定后执行，若直接修改 request_data，失败重试到下一个 provider 时会继承上一个渠道的修改。
+    # 修改方式：每次 provider 尝试前优先用 Pydantic model_copy(deep=True) 深拷贝，请求对象不支持时回退到 copy.deepcopy，失败时再使用原对象。
+    # 目的：让渠道入站拦截器的修改尽量局限于当前渠道尝试，避免跨渠道重试污染。
+    try:
+        if hasattr(request_data, "model_copy"):
+            return request_data.model_copy(deep=True)
+        if hasattr(request_data, "copy"):
+            return request_data.copy(deep=True)
+        return copy.deepcopy(request_data)
+    except Exception as clone_err:
+        logger.debug(f"Failed to clone request_data for channel inbound attempt: {clone_err}")
+        return request_data
+
+
+def _callable_accepts_keyword(func: Callable, keyword: str) -> bool:
+    """判断调用对象是否接受指定关键字参数。"""
+    # 修改原因：单元测试会用精简签名的 fake process_request 替换真实函数，新增 api_key_info/key_enabled_plugins 关键字会让旧测试替身报错。
+    # 修改方式：调用前检查签名；真实函数或带 **kwargs 的替身接收新参数，旧替身则跳过该关键字。
+    # 目的：保持生产路径可传递新出站上下文，同时不破坏既有测试和外部调用替身。
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return True
+    return keyword in signature.parameters or any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in signature.parameters.values()
+    )
+
+
 def normalize_keepalive_interval(keepalive_interval: Any, timeout_value: Any) -> Optional[int]:
     """把 keepalive_interval 规范化为可用于 SSE 心跳的正整数秒数。"""
     # 修改原因：keepalive_interval 来自配置库，可能缺失、为 0/负数、字符串，或大于请求超时。
@@ -476,6 +552,7 @@ class ModelRequestHandler:
         dialect_id: Optional[str] = None,
         original_payload: Optional[Dict[str, Any]] = None,
         original_headers: Optional[Dict[str, str]] = None,
+        raw_request: Optional[Any] = None,
         passthrough_only: bool = False,
         override_providers: Optional[List[Dict[str, Any]]] = None,
         force_api_key: Optional[str] = None,
@@ -493,6 +570,7 @@ class ModelRequestHandler:
             dialect_id: 入口方言 ID（原生路由传入）
             original_payload: 原始 native 请求体（透传用）
             original_headers: 原始请求头（透传用）
+            raw_request: 原始 FastAPI Request 对象，供入站插件读取请求头
             override_auto_retry: override provider 测试是否允许按候选列表自动重试
             
         Returns:
@@ -517,6 +595,17 @@ class ModelRequestHandler:
             # ── 正常路径：用户限速 + 全局路由 ──
             try:
                 final_api_key = self.app.state.api_list[api_index]
+                # 修改原因：Phase 2 quota 需要在旧 user_api_keys_rate_limit 消耗前检查用户 key 的统一配额。
+                # 修改方式：仅对已配置 quota 的 final_api_key 调用 quota_registry.check，并传入当前模型与 request_info 中的 client_ip。
+                # 目的：让统一配额负责用户 key 的请求、token、cost、IP 维度控制，同时保留旧 next() 作为上游 key 限速层。
+                quota_registry = getattr(self.app.state, 'quota_registry', None)
+                if quota_registry is not None and quota_registry.has_quota(final_api_key):
+                    from core.middleware import request_info
+                    _ri = request_info.get()
+                    _client_ip = _ri.get('client_ip', '') if _ri else ''
+                    reject_reason = quota_registry.check(final_api_key, request_model_name, client_ip=_client_ip)
+                    if reject_reason:
+                        raise HTTPException(status_code=429, detail=reject_reason)
                 await self.app.state.user_api_keys_rate_limit[final_api_key].next(request_model_name)
             except HTTPException:
                 raise
@@ -634,21 +723,28 @@ class ModelRequestHandler:
             return tmp_retry_count
 
         # ── 入站拦截器：鉴权完成、provider 选择前 ──
+        # 修改原因：新增 key_outbound 阶段和 channel_inbound 阶段都需要同一份下游 Key 信息。
+        # 修改方式：在进入 provider 重试循环前构造 api_key_info，并读取 Key 级 enabled_plugins。
+        # 目的：避免各阶段重复读取 config，同时保证 Key 级插件配置和渠道级插件配置相互独立。
+        _interceptor_api_key_info = {
+            "api_key": self.app.state.api_list[api_index] if not override_providers else None,
+            "api_index": api_index,
+            "model": request_model_name,
+            "role": role,
+            "headers": dict(original_headers or {}),
+            "original_headers": dict(original_headers or {}),
+        }
+        _key_enabled_plugins = safe_get(
+            config, 'api_keys', api_index, 'preferences', 'enabled_plugins',
+            default=None
+        ) if not override_providers else None
         try:
             from core.plugins.interceptors import apply_inbound_interceptors
-            _inbound_api_key_info = {
-                "api_key": self.app.state.api_list[api_index] if not override_providers else None,
-                "api_index": api_index,
-                "model": request_model_name,
-                "role": role,
-            }
-            _inbound_enabled_plugins = safe_get(
-                config, 'api_keys', api_index, 'preferences', 'enabled_plugins',
-                default=None
-            ) if not override_providers else None
             request_data = await apply_inbound_interceptors(
-                request_data, None, _inbound_api_key_info, _inbound_enabled_plugins
+                request_data, raw_request, _interceptor_api_key_info, _key_enabled_plugins
             )
+        except HTTPException:
+            raise
         except Exception as _inbound_err:
             logger.warning(f"Inbound interceptors error: {_inbound_err}")
 
@@ -696,6 +792,20 @@ class ModelRequestHandler:
 
             provider_name = provider['provider']
             provider_is_byok = is_byok_provider(provider)
+            attempt_request_data = _clone_request_data_for_channel_attempt(request_data)
+
+            # ── 渠道入站拦截器：provider 已选定、channel adapter 转格式前 ──
+            try:
+                from core.plugins.interceptors import apply_channel_inbound_interceptors
+                provider_enabled_plugins = safe_get(provider, 'preferences', 'enabled_plugins', default=None)
+                # 修改原因：channel_inbound 阶段必须使用渠道级 enabled_plugins，而不是 Key 级 enabled_plugins。
+                # 修改方式：在每次 provider 尝试开始处基于 attempt_request_data 调用，并把 provider 与 api_key_info 一并传入。
+                # 目的：让渠道级插件可以在 get_payload 前按当前 provider 修改请求对象，同时不污染后续重试渠道。
+                attempt_request_data = await apply_channel_inbound_interceptors(
+                    attempt_request_data, None, provider, _interceptor_api_key_info, provider_enabled_plugins
+                )
+            except Exception as _channel_inbound_err:
+                logger.warning(f"Channel inbound interceptors error for provider {provider_name}: {_channel_inbound_err}")
 
             # 检查是否所有 API 密钥都被速率限制
             model_dict = provider["_model_dict_cache"]
@@ -715,6 +825,11 @@ class ModelRequestHandler:
                     # 虚拟路由：检查同 priority group 是否全部耗尽
                     if _is_virtual_route:
                         grp_start, grp_end = _get_priority_group_range(current_index)
+                        # 修改原因：matching_providers 在分组构建后可能因运行时过滤发生变化，
+                        # grp_end 可能越界导致 IndexError。
+                        # 修改方式：以 min(grp_end, len(matching_providers)) 做运行时边界保护。
+                        # 目的：避免虚拟路由分组检查因索引越界返回 500。
+                        grp_end = min(grp_end, len(matching_providers))
                         group_all_exhausted = True
                         for gi in range(grp_start, grp_end):
                             gi_provider = matching_providers[gi]
@@ -736,7 +851,7 @@ class ModelRequestHandler:
                         index = (grp_end % num_matching_providers) if grp_end < num_matching_providers else grp_end
                     continue
 
-            original_request_model = (original_model, request_data.model)
+            original_request_model = (original_model, attempt_request_data.model)
             
             # 处理本地聚合器 Key 代理
             if is_local_api_key(provider_name) and provider_name in self.app.state.api_list:
@@ -785,7 +900,7 @@ class ModelRequestHandler:
 
             try:
                 passthrough_ctx = None
-                if dialect_id and original_payload is not None and isinstance(request_data, RequestModel):
+                if dialect_id and original_payload is not None and isinstance(attempt_request_data, RequestModel):
                     from core.dialects.passthrough import evaluate_passthrough
                     passthrough_ctx = await evaluate_passthrough(
                         dialect_id=dialect_id,
@@ -808,21 +923,35 @@ class ModelRequestHandler:
                 # 修改方式：按当前 provider 是否为 BYOK provider 计算 effective_force_api_key，并传给普通和透传路径。
                 # 目的：避免 BYOK key 误覆盖非 BYOK provider，同时让透传路径也支持 BYOK。
                 effective_force_api_key = byok_real_key if (byok_real_key and is_byok_provider(provider)) else force_api_key
-                response = await process_fn(
-                    request_data, provider, background_tasks, self.app,
-                    self.request_info_getter, self.update_channel_stats_func,
-                    passthrough_ctx=passthrough_ctx,
-                    endpoint=endpoint,
-                    role=role,
-                    timeout_value=local_timeout_value,
-                    keepalive_interval=keepalive_interval,
-                    force_api_key=effective_force_api_key,
-                ) if process_fn is process_request_passthrough else await process_request(
-                    request_data, provider, background_tasks, self.app,
-                    self.request_info_getter, self.update_channel_stats_func,
-                    endpoint, role, local_timeout_value, keepalive_interval,
-                    force_api_key=effective_force_api_key
-                )
+                process_extra_kwargs: Dict[str, Any] = {
+                    "force_api_key": effective_force_api_key,
+                }
+                # 修改原因：响应出站阶段需要把 Key 信息传入真实 process_request，但测试替身可能不接受新增参数。
+                # 修改方式：仅当当前 process_fn 签名支持时才附加 api_key_info 和 key_enabled_plugins。
+                # 目的：在不破坏既有测试替身的同时，把生产请求所需上下文传给响应处理链。
+                if _callable_accepts_keyword(process_fn, "api_key_info"):
+                    process_extra_kwargs["api_key_info"] = _interceptor_api_key_info
+                if _callable_accepts_keyword(process_fn, "key_enabled_plugins"):
+                    process_extra_kwargs["key_enabled_plugins"] = _key_enabled_plugins
+
+                if process_fn is process_request_passthrough:
+                    response = await process_fn(
+                        attempt_request_data, provider, background_tasks, self.app,
+                        self.request_info_getter, self.update_channel_stats_func,
+                        passthrough_ctx=passthrough_ctx,
+                        endpoint=endpoint,
+                        role=role,
+                        timeout_value=local_timeout_value,
+                        keepalive_interval=keepalive_interval,
+                        **process_extra_kwargs,
+                    )
+                else:
+                    response = await process_request(
+                        attempt_request_data, provider, background_tasks, self.app,
+                        self.request_info_getter, self.update_channel_stats_func,
+                        endpoint, role, local_timeout_value, keepalive_interval,
+                        **process_extra_kwargs,
+                    )
 
                 # 成功时记录重试路径和重试次数
                 current_info = self.request_info_getter()
@@ -896,6 +1025,25 @@ class ModelRequestHandler:
                 else:
                     status_code = 500  # Internal Server Error
                     error_message = str(e) or f"Unknown error: {e.__class__.__name__}"
+
+                # ── CDN/WAF 误判修正 ──
+                # 修改原因：Cloudflare Workers 等反代被 WAF 拦截时返回 HTTP 403 + HTML 页面，
+                # 但 error_message 包含 <!DOCTYPE html> 等 CDN 特征，不是上游 API 的真实 403。
+                # 如果直接传给 key_rules，会命中 {status: [403], duration: -1} 导致 key 被永久禁用。
+                # 修改方式：在 key_rules 匹配前，检测 error_message 是否为 HTML/CDN 响应，
+                # 如果是则将 status_code 从 401/403 改为 502 (Bad Gateway)。
+                # 目的：CDN 层面的错误按网络故障处理（走 default 冷却），不误杀 key。
+                if status_code in (401, 403) and error_message:
+                    _err_lower = error_message[:500].lower()
+                    if any(sig in _err_lower for sig in (
+                        '<!doctype', '<html', 'cloudflare', 'cf-ray',
+                        '<head><title>', 'nginx', 'access denied',
+                    )):
+                        logger.info(
+                            f"[cdn_403_fix] Remapping CDN {status_code}→502 for provider {provider.get('provider','?')}, "
+                            f"error starts with: {error_message[:80]!r}"
+                        )
+                        status_code = 502
 
                 # ── Key Rules 统一错误处理 ──
                 from core.key_rules import apply_key_rule_retry_override, resolve_key_rules, match_key_rules
@@ -1115,6 +1263,10 @@ class ModelRequestHandler:
                     # 虚拟路由：重试时强制留在同一 priority group 内
                     if _is_virtual_route and _priority_group_ranges:
                         grp_start, grp_end = _get_priority_group_range(current_index)
+                        # 修改原因：与限流耗尽检查相同的越界风险。
+                        # 修改方式：grp_end 做运行时边界保护。
+                        # 目的：避免虚拟路由重试阶段因索引越界返回 500。
+                        grp_end = min(grp_end, len(matching_providers))
                         next_idx = index % num_matching_providers
                         if next_idx >= grp_end or next_idx < grp_start:
                             # 即将越过当前 group → 检查组内是否还有可用 key
@@ -1165,9 +1317,23 @@ class ModelRequestHandler:
                 # 修改方式：改为同步 enqueue_stats 入队，由 core.stats 的单个 consumer 批量写入。
                 # 目的：让不重试失败路径不再增加后台协程数量，同时保留失败统计。
                 enqueue_stats(current_info, app=self.app)
-                return openai_error_response(
+                error_response = openai_error_response(
                     f"Error: Current provider response failed: {error_message}",
                     status_code,
+                )
+                try:
+                    final_engine, _, _ = get_engine(provider, endpoint, original_model)
+                except Exception:
+                    final_engine = "unknown"
+                provider_enabled_plugins = safe_get(provider, 'preferences', 'enabled_plugins', default=None)
+                return await _apply_final_outbound_interceptors_to_response(
+                    error_response,
+                    final_engine,
+                    request_model_name,
+                    provider,
+                    _interceptor_api_key_info,
+                    provider_enabled_plugins,
+                    _key_enabled_plugins,
                 )
 
         # 所有重试都失败
@@ -1192,7 +1358,21 @@ class ModelRequestHandler:
         # 修改方式：改为同步 enqueue_stats 入队，并交给 request_stats consumer 批量提交。
         # 目的：保留重试耗尽后的失败日志，同时避免请求结束阶段阻塞事件循环。
         enqueue_stats(current_info, app=self.app)
-        return openai_error_response(
+        error_response = openai_error_response(
             f"All {request_data.model} error: {error_message}",
             status_code,
+        )
+        try:
+            final_engine, _, _ = get_engine(provider, endpoint, original_model)
+        except Exception:
+            final_engine = "unknown"
+        provider_enabled_plugins = safe_get(provider, 'preferences', 'enabled_plugins', default=None)
+        return await _apply_final_outbound_interceptors_to_response(
+            error_response,
+            final_engine,
+            request_model_name,
+            provider,
+            _interceptor_api_key_info,
+            provider_enabled_plugins,
+            _key_enabled_plugins,
         )

@@ -30,6 +30,7 @@ from core.block_watchdog import EventLoopBlockWatchdog
 from core.client_manager import ClientManager
 from core.channel_manager import ChannelManager
 from core.routing import set_debug_mode as set_routing_debug_mode
+from core.quota.runtime import QuotaRegistry
 from core.handler import (
     ModelRequestHandler,
     set_debug_mode as set_handler_debug_mode,
@@ -100,64 +101,21 @@ _db_ready.set()  # 初始状态：放行
 _last_compact_date = None  # 每天最多压缩一次
 
 
-async def _maybe_compact_db(app):
-    """凌晨低峰期自动执行 VACUUM INTO 压缩数据库。"""
+async def _do_compact_db(app):
+    """执行 VACUUM INTO 压缩数据库（纯执行，不含条件判断）。"""
     global _last_compact_date
-    import os
+    import os, sqlite3
+
+    db_path = os.path.join(os.environ.get('DATA_DIR', 'data'), 'stats.db')
+    compact_path = db_path + '.compact'
+    old_path = db_path + '.old'
+    db_size_mb = os.path.getsize(db_path) / (1024 * 1024)
+
+    # Step 1: 关闭闸门，挂起新请求
+    _db_ready.clear()
+    logger.info('[db_compact] 已挂起新请求')
 
     try:
-        prefs = {}
-        if hasattr(app, 'state') and hasattr(app.state, 'config'):
-            prefs = (app.state.config or {}).get('preferences', {})
-
-        tz_name = str(prefs.get('log_retention_timezone') or '').strip()
-        if tz_name:
-            try:
-                from zoneinfo import ZoneInfo
-                tz = ZoneInfo(tz_name)
-            except Exception:
-                tz = datetime.now().astimezone().tzinfo
-        else:
-            tz = datetime.now().astimezone().tzinfo
-        now_local = datetime.now(tz)
-        current_hour = now_local.hour
-        today = now_local.date()
-
-        # 每天最多跑一次
-        if _last_compact_date == today:
-            return
-
-        compact_start = int(prefs.get('db_compact_hour_start', 3))
-        compact_end = int(prefs.get('db_compact_hour_end', 5))
-        compact_threshold_mb = int(prefs.get('db_compact_threshold_mb', 1024))
-
-        # 时间窗口检查（支持跨午夜）
-        if compact_start <= compact_end:
-            in_window = compact_start <= current_hour < compact_end
-        else:
-            in_window = current_hour >= compact_start or current_hour < compact_end
-
-        if not in_window:
-            return
-
-        # 文件大小检查
-        db_path = os.path.join(os.environ.get('DATA_DIR', 'data'), 'stats.db')
-        if not os.path.exists(db_path):
-            return
-        db_size_mb = os.path.getsize(db_path) / (1024 * 1024)
-        if db_size_mb <= compact_threshold_mb:
-            return
-
-        compact_path = db_path + '.compact'
-        old_path = db_path + '.old'
-
-        logger.info(f'[db_compact] 触发压缩: {db_size_mb:.0f}MB > {compact_threshold_mb}MB, '
-                    f'时间 {now_local.strftime("%H:%M")} (窗口 {compact_start}:00-{compact_end}:00)')
-
-        # Step 1: 关闭闸门，挂起新请求
-        _db_ready.clear()
-        logger.info('[db_compact] 已挂起新请求')
-
         # Step 2: 等待 stats buffer 消费完
         try:
             from core.stats import _stats_buffer
@@ -169,7 +127,6 @@ async def _maybe_compact_db(app):
             pass
 
         # Step 3: VACUUM INTO
-        import sqlite3
         def do_vacuum_into():
             if os.path.exists(compact_path):
                 os.remove(compact_path)
@@ -218,16 +175,13 @@ async def _maybe_compact_db(app):
 
         await asyncio.to_thread(do_cleanup_old)
 
-        _last_compact_date = today
+        _last_compact_date = datetime.now().date()
         logger.info(f'[db_compact] 压缩完成，节省 {db_size_mb - compact_size_mb:.0f}MB')
 
     except Exception as e:
         logger.error(f'[db_compact] 压缩失败: {e}')
         # 尝试恢复
         try:
-            db_path = os.path.join(os.environ.get('DATA_DIR', 'data'), 'stats.db')
-            old_path = db_path + '.old'
-            compact_path = db_path + '.compact'
             if os.path.exists(old_path) and not os.path.exists(db_path):
                 os.rename(old_path, db_path)
                 for suffix in ['-wal', '-shm']:
@@ -242,6 +196,104 @@ async def _maybe_compact_db(app):
         # 无论成功失败都打开闸门
         _db_ready.set()
         logger.info('[db_compact] 已恢复接受请求')
+
+
+async def db_compact_loop(app):
+    """独立的数据库自动压缩定时任务。每 10 分钟检查一次。
+
+    到了时间窗口且文件超阈值就执行。如果当时请求活跃（stats buffer
+    积压 > 10 条），最多推迟 MAX_DEFER 次（默认 3 次 = 30 分钟），
+    之后强制执行。
+    """
+    global _last_compact_date
+    defer_count = 0
+    MAX_DEFER = 3
+
+    await asyncio.sleep(120)  # 启动后等 2 分钟再开始检查
+
+    while True:
+        try:
+            await asyncio.sleep(600)  # 每 10 分钟
+
+            if DISABLE_DATABASE or (DB_TYPE or "sqlite").lower() != "sqlite":
+                continue
+
+            prefs = {}
+            if hasattr(app, 'state') and hasattr(app.state, 'config'):
+                prefs = (app.state.config or {}).get('preferences', {})
+
+            tz_name = str(prefs.get('log_retention_timezone') or '').strip()
+            if tz_name:
+                try:
+                    from zoneinfo import ZoneInfo
+                    tz = ZoneInfo(tz_name)
+                except Exception:
+                    tz = datetime.now().astimezone().tzinfo
+            else:
+                tz = datetime.now().astimezone().tzinfo
+
+            now_local = datetime.now(tz)
+            today = now_local.date()
+
+            # 今天已执行
+            if _last_compact_date == today:
+                defer_count = 0
+                continue
+
+            compact_start = int(prefs.get('db_compact_hour_start', 3))
+            compact_end = int(prefs.get('db_compact_hour_end', 5))
+            compact_threshold_mb = int(prefs.get('db_compact_threshold_mb', 1024))
+
+            # 时间窗口检查
+            current_hour = now_local.hour
+            if compact_start <= compact_end:
+                in_window = compact_start <= current_hour < compact_end
+            else:
+                in_window = current_hour >= compact_start or current_hour < compact_end
+
+            if not in_window:
+                defer_count = 0
+                continue
+
+            # 文件大小检查
+            db_path = os.path.join(os.environ.get('DATA_DIR', 'data'), 'stats.db')
+            if not os.path.exists(db_path):
+                continue
+            db_size_mb = os.path.getsize(db_path) / (1024 * 1024)
+            if db_size_mb <= compact_threshold_mb:
+                continue
+
+            # 检查请求活跃度，允许有限推迟
+            busy = False
+            buffer_len = 0
+            try:
+                from core.stats import _stats_buffer
+                buffer_len = len(_stats_buffer)
+                if buffer_len > 10:
+                    busy = True
+            except ImportError:
+                pass
+
+            if busy and defer_count < MAX_DEFER:
+                defer_count += 1
+                logger.info(f'[db_compact] 请求活跃 (buffer={buffer_len}), 推迟压缩 ({defer_count}/{MAX_DEFER})')
+                continue
+
+            if defer_count >= MAX_DEFER:
+                logger.info(f'[db_compact] 已推迟 {MAX_DEFER} 次，强制执行')
+
+            logger.info(f'[db_compact] 触发压缩: {db_size_mb:.0f}MB > {compact_threshold_mb}MB, '
+                        f'时间 {now_local.strftime("%H:%M")} (窗口 {compact_start}:00-{compact_end}:00)')
+
+            await _do_compact_db(app)
+            defer_count = 0
+
+        except asyncio.CancelledError:
+            logger.info('[db_compact] Task cancelled')
+            break
+        except Exception as e:
+            logger.error(f'[db_compact] Loop error: {e}')
+            await asyncio.sleep(60)
 
 
 async def cleanup_expired_raw_data():
@@ -347,10 +399,7 @@ async def cleanup_expired_raw_data():
                         except Exception as ve:
                             logger.warning(f"SQLite incremental_vacuum failed (non-critical): {ve}")
 
-                # ---- 数据库自动压缩 (VACUUM INTO) ----
-                if (DB_TYPE or "sqlite").lower() == "sqlite":
-                    await _maybe_compact_db(app)
-                    
+
         except asyncio.CancelledError:
             logger.info("Raw data cleanup task cancelled")
             break
@@ -574,6 +623,7 @@ async def lifespan(app: FastAPI):
     # 启动定时清理任务
     cleanup_task = None
     logs_cleanup_task = None
+    compact_task = None
     block_watchdog = None
     if not DISABLE_DATABASE:
         try:
@@ -604,6 +654,9 @@ async def lifespan(app: FastAPI):
 
         cleanup_task = asyncio.create_task(cleanup_expired_raw_data())
         logger.info("Started raw data cleanup background task")
+        if (DB_TYPE or "sqlite").lower() == "sqlite":
+            compact_task = asyncio.create_task(db_compact_loop(app))
+            logger.info("Started db compact background task")
 
     if app and not hasattr(app.state, 'config'):
         # logger.warning("Config not found, attempting to reload")
@@ -661,6 +714,12 @@ async def lifespan(app: FastAPI):
             for paid_key in app.state.api_list:
                 await update_paid_api_keys_states(app, paid_key)
 
+        # 修改原因：Phase 2 统一配额系统需要在启动时读取 api.yaml 中的 quota 配置，旧 credits 状态仍继续保留。
+        # 修改方式：在 paid_api_keys_states 初始化之后创建 QuotaRegistry，并用当前 app.state.config 构建运行时计数器。
+        # 目的：让后续中间件、请求处理器和统计写入都能通过 app.state.quota_registry 使用统一配额能力。
+        app.state.quota_registry = QuotaRegistry()
+        app.state.quota_registry.init_from_config(app.state.config)
+
         # 启动日志行自动清理任务（依赖 config.preferences）
         try:
             logs_cleanup_task = asyncio.create_task(cleanup_expired_logs(app))
@@ -700,6 +759,7 @@ async def lifespan(app: FastAPI):
         # 修改方式：启动时扫描 registry 中所有声明了 oauth_provider 的渠道，并统一注册到 OAuthManager。
         # 目的：消除 Codex、Claude Code、Gemini CLI 等渠道硬编码，让内置渠道和插件渠道共享注册路径。
         _register_oauth_providers_from_registry(app.state.oauth_manager)
+        app.state.oauth_manager.start_proactive_refresh()
 
 
     if app and not hasattr(app.state, "channel_manager"):
@@ -875,6 +935,13 @@ async def lifespan(app: FastAPI):
         logs_cleanup_task.cancel()
         try:
             await logs_cleanup_task
+        except asyncio.CancelledError:
+            pass
+
+    if compact_task:
+        compact_task.cancel()
+        try:
+            await compact_task
         except asyncio.CancelledError:
             pass
     

@@ -174,9 +174,14 @@ async def get_payload(request: RequestModel, engine, provider, api_key=None):
         enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
 
         from .log_config import logger
+
+        # 自定义请求头在插件之前应用，确保插件是最后一个修改 headers 的环节
+        from core.http_headers import apply_custom_headers
+        apply_custom_headers(headers, safe_get(provider, "preferences", "headers", default={}))
+
         logger.debug(f"[get_payload] Before apply_request_interceptors, model={payload.get('model')}, enabled_plugins={enabled_plugins}")
 
-        # 应用请求拦截器（插件可在此修改 url/headers/payload）
+        # 应用请求拦截器（插件可在此修改 url/headers/payload）— 最后执行
         url, headers, payload = await apply_request_interceptors(
             request, engine, provider, api_key, url, headers, payload, enabled_plugins
         )

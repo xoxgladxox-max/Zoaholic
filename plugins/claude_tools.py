@@ -145,12 +145,13 @@ def is_claude_engine(engine: str) -> bool:
     """
     检查是否为 Claude 引擎。
     通过渠道注册表的 type_name 动态判断，不再硬编码白名单。
+    AWS Bedrock 跑的也是 Claude，需要识别。
     """
     if not isinstance(engine, str):
         return False
     engine_lower = engine.lower()
     # 直接匹配
-    if engine_lower in ("claude", "anthropic"):
+    if engine_lower in ("claude", "anthropic", "aws"):
         return True
     # 查注册表：type_name 含 "claude" 即视为 Claude 系
     try:
@@ -358,6 +359,25 @@ def update_anthropic_beta_header(headers: Dict[str, Any], features: Set[str]) ->
         headers["anthropic-beta"] = ",".join(beta_features)
 
 
+# ==================== 辅助：模型名提取 ====================
+
+def _extract_model_from_url(url: str) -> str:
+    """从 Bedrock 风格 URL 提取模型名: .../model/{model_id}/invoke..."""
+    if "/model/" not in url:
+        return ""
+    try:
+        return url.split("/model/")[1].split("/")[0]
+    except (IndexError, ValueError):
+        return ""
+
+
+def _replace_model_in_url(url: str, old: str, new: str) -> str:
+    """替换 URL 中的模型名段"""
+    if old and new and old != new and old in url:
+        return url.replace(old, new, 1)
+    return url
+
+
 # ==================== 请求拦截器 ====================
 
 async def claude_tools_request_interceptor(
@@ -372,50 +392,58 @@ async def claude_tools_request_interceptor(
     """
     Claude Tools 请求拦截器
 
-    处理 -thinking/-search/-code 等后缀的模型请求
+    处理 -thinking/-search/-code 等后缀的模型请求。
+    支持两种渠道格式：
+      - 标准 Claude：model 在 payload 里
+      - AWS Bedrock：model 在 URL 路径里（payload 不含 model 字段）
     """
-    model = payload.get("model", "")
-
-    # 早期退出：不是 Claude 引擎
     if not is_claude_engine(engine):
         return url, headers, payload
 
-    # 解析后缀
-    base_model, features, thinking_budget = parse_model_suffixes(model)
+    # ── 1. 确定 model 来源 ──
+    is_aws = (engine.lower() == "aws")
+    url_model = _extract_model_from_url(url) if is_aws else ""
 
-    # 早期退出：没有识别到任何后缀
+    if is_aws:
+        # AWS: payload 没有 model 字段，从 URL 取
+        model = url_model
+    else:
+        # 标准 Claude: 从 payload 取
+        model = payload.get("model", "")
+
+    if not model:
+        return url, headers, payload
+
+    # ── 2. 解析后缀 ──
+    base_model, features, thinking_budget = parse_model_suffixes(model)
     if not features:
         return url, headers, payload
 
-    logger.info(f"[claude_tools] Processing model: {model}, features: {features}")
+    logger.info(f"[claude_tools] model={model}, features={features}, engine={engine}")
 
-    # 更新模型名（去除后缀）
-    payload["model"] = base_model
+    # ── 3. 剥后缀：payload 和 URL 各管各的 ──
+    if is_aws:
+        # AWS: 只改 URL 里的模型名，payload 没有 model 字段
+        url = _replace_model_in_url(url, url_model, base_model)
+    else:
+        # 标准 Claude: 改 payload 里的 model
+        payload["model"] = base_model
 
-    # 应用 thinking 配置（尊重用户 overrides —— payload 里已有 thinking 则跳过）
+    # ── 4. 注入功能配置 ──
     if "thinking" in features and thinking_budget and "thinking" not in payload:
-        payload["_thinking_features"] = features  # 传 effort 级别给 apply_thinking_config
+        payload["_thinking_features"] = features
         apply_thinking_config(payload, thinking_budget, model=base_model)
 
-    # 应用 fast mode
     if "fast" in features:
         payload["speed"] = "fast"
-        logger.debug("[claude_tools] Enabled fast mode: speed=fast")
 
-    # 应用工具配置
     for feature in features:
-        if feature not in ("thinking", "fast"):
+        if feature not in ("thinking", "fast") and not feature.startswith("effort:"):
             apply_tool_config(payload, feature)
 
-    # 更新 anthropic-beta header
     update_anthropic_beta_header(headers, features)
 
-    logger.debug(f"[claude_tools] Modified payload model: {payload['model']}, "
-                 f"thinking: {'thinking' in features}, tools: {payload.get('tools', [])}")
-
-    # === 自动 prompt caching ===
-    # 请求体里已有 cache_control（客户端自己管缓存，如 CC）→ 不动
-    # 没有 → 注入顶层 cache_control，走 Anthropic 自动缓存
+    # ── 5. 自动 prompt caching ──
     _inject_auto_cache(payload, provider)
 
     return url, headers, payload

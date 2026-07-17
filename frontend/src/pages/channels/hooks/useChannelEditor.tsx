@@ -12,6 +12,7 @@ import {
 } from 'react';
 
 import { apiFetch } from '../../../lib/api';
+import type { EnabledPluginValue } from '../../../lib/pluginEntries';
 import { toastError, toastSuccess, toastWarning, fmtErr } from '../../../components/Toast';
 import { useChannelOAuth } from './useChannelOAuth';
 import type { UseChannelsCoreResult } from './useChannelsCore';
@@ -175,7 +176,7 @@ export interface UseChannelEditorResult {
   getModelDisplayName: (model: string) => string;
   formatJsonOnBlur: (value: string, setter: (value: string) => void, fieldName: string) => void;
   handleMappingChange: (idx: number, field: 'from' | 'to', value: string) => void;
-  handlePluginSheetUpdate: (payload: { enabled_plugins: string[]; preferences_patch: Record<string, any>; preferences_delete: string[] }) => void;
+  handlePluginSheetUpdate: (payload: { enabled_plugins: EnabledPluginValue[]; preferences_patch: Record<string, any>; preferences_delete: string[] }) => void;
   handleDeleteProvider: (idx: number) => Promise<void>;
   handleToggleProvider: (idx: number) => Promise<void>;
   handleCopyProvider: (provider: any) => void;
@@ -315,13 +316,6 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
     // 目的：保留原并发查询和 OAuth quota 同步逻辑，同时避免把编辑状态放回核心 hook。
     await core.queryAllBalances({ formData, isOAuthEngine, setOauthAccounts }, silent);
   }, [core, formData, isOAuthEngine]);
-
-  useEffect(() => {
-    if (isModalOpen && !isOAuthEngine && formData?.base_url && formData?.api_keys?.some(k => k.key.trim() && !k.disabled)) {
-      void queryAllBalances(true);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isModalOpen]);
 
   const openModal = async (provider: any = null, index: number | null = null) => {
     setOriginalIndex(index);
@@ -705,7 +699,7 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
     setModelDisplayKey(prev => prev + 1);
   };
 
-  const handlePluginSheetUpdate = (payload: { enabled_plugins: string[]; preferences_patch: Record<string, any>; preferences_delete: string[] }) => {
+  const handlePluginSheetUpdate = (payload: { enabled_plugins: EnabledPluginValue[]; preferences_patch: Record<string, any>; preferences_delete: string[] }) => {
     setFormData(prev => {
       if (!prev) return prev;
       const nextPrefs: Record<string, any> = { ...(prev.preferences || {}) };

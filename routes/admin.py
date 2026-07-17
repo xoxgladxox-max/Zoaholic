@@ -50,6 +50,13 @@ def _rebuild_runtime_rate_limits(app) -> None:
             "round_robin",
         )
 
+    # 修改原因：管理端热更新 api.yaml 后，统一配额配置也必须立即生效，不能等服务重启。
+    # 修改方式：复用已挂在 app.state 上的 QuotaRegistry，并用最新 config 重新初始化计数器。
+    # 目的：保持旧限速重建流程不变，同时让 Phase 2 quota 配置在保存后同步刷新。
+    quota_registry = getattr(app.state, 'quota_registry', None)
+    if quota_registry is not None:
+        quota_registry.init_from_config(config)
+
 
 async def _persist_config(app, sections_to_verify=None, changed_providers=None):
     """

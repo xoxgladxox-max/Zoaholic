@@ -1,6 +1,7 @@
 import { ClipboardPaste, LogIn, Play, ToggleRight, Trash2 } from 'lucide-react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 
+import type { EnabledPluginValue } from '../../../lib/pluginEntries';
 import type { ApiKeyObj, BalanceResult } from '../types';
 import {
   buildRoundRectPath,
@@ -121,7 +122,7 @@ export function KeyLabelOverlay({ label, hasTag, isFocused, children }: { label?
   );
 }
 
-export const UiSlot = ({ engine, slot, data, context, className, element = 'span', fallbackText, enabledPlugins }: { engine: string; slot: string; data: any; context?: Record<string, any>; className?: string; element?: 'span' | 'div'; fallbackText?: string; enabledPlugins?: string[] }) => {
+export const UiSlot = ({ engine, slot, data, context, className, element = 'span', fallbackText, enabledPlugins }: { engine: string; slot: string; data: any; context?: Record<string, any>; className?: string; element?: 'span' | 'div'; fallbackText?: string; enabledPlugins?: EnabledPluginValue[] }) => {
   const ref = useRef<HTMLElement | null>(null);
   const [loaded, setLoaded] = useState(false);
   const dataRef = useRef(data);

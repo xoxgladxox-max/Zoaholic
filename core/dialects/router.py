@@ -255,6 +255,7 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
             dialect_id=dialect_id,
             original_payload=native_body,
             original_headers=headers,
+            raw_request=request,
             passthrough_only=endpoint.passthrough_only,
         )
 

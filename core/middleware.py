@@ -312,6 +312,16 @@ class StatsMiddleware:
                 )
                 if not DISABLE_DATABASE:
                     check_api_key = safe_get(config, "api_keys", api_index, "api")
+                    # 修改原因：Phase 2 统一配额要优先于旧 credits 余额系统做耗尽预检，未配置 quota 的 key 不应受影响。
+                    # 修改方式：从 app.state 读取 quota_registry，仅在 has_quota(check_api_key) 为真时调用 is_exhausted。
+                    # 目的：在进入后续流程前拦截已耗尽的统一配额，同时保留 paid_api_keys_states 作为旧逻辑 fallback。
+                    quota_registry = getattr(app.state, 'quota_registry', None)
+                    if quota_registry is not None and quota_registry.has_quota(check_api_key):
+                        if quota_registry.is_exhausted(check_api_key):
+                            response = openai_error_response("Quota exhausted, please check your account.", 429)
+                            await response(scope, receive, send)
+                            reset_byok_context(byok_context_tokens)
+                            return
                     # 余额检查
                     if (
                         safe_get(
@@ -541,7 +551,8 @@ class StatsMiddleware:
                 if self.debug:
                     import traceback
                     traceback.print_exc()
-                logger.error("Error processing request: %s", str(e))
+                import traceback as _tb
+                logger.error("Error processing request: %s\n%s", str(e), _tb.format_exc())
                 response = openai_error_response(f"Internal server error: {str(e)}", 500)
                 await response(scope, receive_wrapper, send)
             finally:

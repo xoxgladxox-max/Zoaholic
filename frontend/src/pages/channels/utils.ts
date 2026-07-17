@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { sanitizeKeyRulesForSave } from '../../lib/keyRules';
+import { parseEnabledPluginValue, type EnabledPluginValue } from '../../lib/pluginEntries';
 import type { ApiKeyObj, BalanceResult, OAuthQuota, QuotaGauge, RowQuota, UiSlotValue } from './types';
 
 // 修改原因：Channels.tsx 拆分后，余额、插槽、SVG 和机房模式 helper 需要在多个模块复用。
@@ -336,14 +337,14 @@ export function getUiSlotValue(engine: string | undefined, slot: string): UiSlot
   return (window as any).__uiSlots?.[engine]?.[slot];
 }
 
-export function getEnabledPluginName(entry: string): string {
-  // 修改原因：provider.preferences.enabled_plugins 支持 "plugin:options" 格式，requires_plugin 只比较插件名。
-  // 修改方式：取冒号前的名称并去掉空白，和后端 parse_plugin_entry 的匹配口径保持一致。
-  // 目的：让 "oai_tier:xxx" 这类配置也能正确启用 oai_tier 的 UI slot。
-  return String(entry || '').split(':')[0].trim();
+export function getEnabledPluginName(entry: EnabledPluginValue): string {
+  // 修改原因：provider.preferences.enabled_plugins 现在同时支持旧字符串和结构化对象，requires_plugin 只比较插件名。
+  // 修改方式：统一复用 parseEnabledPluginValue 读取名称，和后端 parse_plugin_entry 的匹配口径保持一致。
+  // 目的：让 "oai_tier:xxx" 和 {name, params} 两类配置都能正确启用 UI slot。
+  return parseEnabledPluginValue(entry).name.trim();
 }
 
-export function providerHasEnabledPlugin(enabledPlugins: string[] | undefined, pluginName: string | undefined): boolean {
+export function providerHasEnabledPlugin(enabledPlugins: EnabledPluginValue[] | undefined, pluginName: string | undefined): boolean {
   // 修改原因：带 requires_plugin 的 slot 必须按当前 provider 的 enabled_plugins 判断，不能只看 engine。
   // 修改方式：遍历当前 provider 插件列表，按插件名部分匹配 requires_plugin。
   // 目的：让同一 engine 下不同 provider 可以分别启用或隐藏同一个插件 UI slot。
@@ -351,7 +352,7 @@ export function providerHasEnabledPlugin(enabledPlugins: string[] | undefined, p
   return enabledPlugins.some((entry) => getEnabledPluginName(entry) === pluginName);
 }
 
-export function getUiSlotScript(engine: string | undefined, slot: string, enabledPlugins?: string[]): string | null {
+export function getUiSlotScript(engine: string | undefined, slot: string, enabledPlugins?: EnabledPluginValue[]): string | null {
   const slotValue = getUiSlotValue(engine, slot);
   if (!slotValue) return null;
   if (typeof slotValue === 'string') return slotValue;
@@ -363,7 +364,7 @@ export function getUiSlotScript(engine: string | undefined, slot: string, enable
   return null;
 }
 
-export function hasUiSlot(engine: string | undefined, slot: string, enabledPlugins?: string[]): boolean {
+export function hasUiSlot(engine: string | undefined, slot: string, enabledPlugins?: EnabledPluginValue[]): boolean {
   return getUiSlotScript(engine, slot, enabledPlugins) !== null;
 }
 

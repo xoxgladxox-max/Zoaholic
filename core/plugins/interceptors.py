@@ -1,7 +1,7 @@
 """
 请求/响应拦截器系统
 
-提供 request、response 和 balance_enricher 三个扩展点，允许插件在请求发送前、响应返回后和余额查询后进行拦截、处理或补充。
+提供 inbound、channel_inbound、request、response、channel_outbound、key_outbound 和 balance_enricher 等扩展点，允许插件在请求进入、渠道转格式前、请求发送前、响应返回后、最终返回前和余额查询后进行拦截、处理或补充。
 
 支持插件参数：
 - enabled_plugins 格式：["plugin_name:options", "plugin_name", ...]
@@ -57,18 +57,20 @@ from contextvars import ContextVar
 from contextlib import asynccontextmanager
 import re
 
+from fastapi import HTTPException
+
 from ..log_config import logger
 
 
 # ==================== 插件参数解析工具 ====================
 
 # 响应拦截器和余额补充器调用期间的 enabled_plugins 上下文
-# 修改原因：balance_enricher 需要复用 response_interceptor 的插件参数读取方式。
-# 修改方式：继续使用同一个 ContextVar，由 apply_response_interceptors 和 apply_balance_enrichers 在调用前设置。
-# 目的：让插件在响应处理和余额补充两个阶段都能通过 get_current_plugin_options() 读取自身参数。
-_current_enabled_plugins: ContextVar[Optional[List[str]]] = ContextVar('_current_enabled_plugins', default=None)
+# 修改原因：channel_inbound、channel_outbound 和 key_outbound 也需要复用 response_interceptor 的插件参数读取方式。
+# 修改方式：继续使用同一个 ContextVar，由各 apply_* 方法在调用前设置，并在 finally 中恢复。
+# 目的：让所有带 enabled_plugins 的阶段都能通过 get_current_plugin_options() 读取自身参数。
+_current_enabled_plugins: ContextVar[Optional[List[Any]]] = ContextVar('_current_enabled_plugins', default=None)
 
-def parse_plugin_entry(entry: str) -> Tuple[str, Optional[str]]:
+def parse_plugin_entry(entry: Any) -> Tuple[str, Optional[Any]]:
     """
     解析单个插件条目，分离插件名和参数
     
@@ -90,7 +92,25 @@ def parse_plugin_entry(entry: str) -> Tuple[str, Optional[str]]:
         >>> parse_plugin_entry("my_plugin:foo,bar")
         ("my_plugin", "foo,bar")
     """
-    if not entry or not isinstance(entry, str):
+    if not entry:
+        return ("", None)
+
+    if isinstance(entry, dict):
+        # 修改原因：字符串式 plugin:options 不适合复杂参数，YAML 中应允许结构化写法。
+        # 修改方式：支持 {name, params/options} 和 {plugin_name: params} 两种对象形式。
+        # 目的：让 key_guard 等多参数插件可以落盘为可读 YAML，同时兼容旧字符串格式。
+        plugin_name = entry.get("name") or entry.get("plugin") or entry.get("plugin_name")
+        if isinstance(plugin_name, str) and plugin_name.strip():
+            options = entry.get("params", entry.get("options"))
+            return (plugin_name.strip(), options if options not in ("", None) else None)
+
+        if len(entry) == 1:
+            key, value = next(iter(entry.items()))
+            if isinstance(key, str) and key.strip():
+                return (key.strip(), value if value not in ("", None) else None)
+        return ("", None)
+
+    if not isinstance(entry, str):
         return ("", None)
     
     entry = entry.strip()
@@ -109,7 +129,7 @@ def parse_plugin_entry(entry: str) -> Tuple[str, Optional[str]]:
     return (plugin_name, options if options else None)
 
 
-def parse_enabled_plugins(enabled_plugins: Optional[List[str]]) -> Dict[str, Optional[str]]:
+def parse_enabled_plugins(enabled_plugins: Optional[List[Any]]) -> Dict[str, Optional[Any]]:
     """
     解析 enabled_plugins 列表，返回 {plugin_name: options} 映射
     
@@ -227,6 +247,24 @@ ResponseInterceptor = Callable[
     "asyncio.coroutines.coroutine"
 ]
 
+# ChannelInboundInterceptor: (request_data, request, provider, api_key_info, enabled_plugins) -> request_data
+# 修改原因：部分插件需要在渠道已确定、但尚未由 adapter 转换 payload 前修改请求对象。
+# 修改方式：新增渠道入站回调类型，参数同时包含 provider 和 key 信息，enabled_plugins 来自渠道配置。
+# 目的：支持渠道级的前置清洗、补字段和协议差异处理。
+ChannelInboundInterceptor = Callable[..., Any]
+
+# ChannelOutboundInterceptor: (response_chunk, engine, model, provider, is_stream, enabled_plugins) -> response_chunk
+# 修改原因：响应拦截器之后还需要渠道级最终处理阶段，与 Key 级最终处理分离。
+# 修改方式：新增渠道出站回调类型，保留 provider 和渠道级 enabled_plugins。
+# 目的：让渠道插件能在 Key Rules 后、返回客户端前做最后改写。
+ChannelOutboundInterceptor = Callable[..., Any]
+
+# KeyOutboundInterceptor: (response_chunk, engine, model, api_key_info, is_stream, enabled_plugins) -> response_chunk
+# 修改原因：Key 级插件不能复用渠道 enabled_plugins，否则会和 provider 配置混淆。
+# 修改方式：新增 Key 出站回调类型，接收 api_key_info 和 Key 级 enabled_plugins。
+# 目的：支持按下游 API Key 配置的最终响应处理。
+KeyOutboundInterceptor = Callable[..., Any]
+
 # BalanceEnricher: (result, engine, provider) -> result
 # 修改原因：余额查询结果需要独立于 oai_tools 等请求插件做被动信息补充。
 # 修改方式：新增专用回调类型，接收余额 result、engine 和 provider，并返回补充后的 result。
@@ -271,8 +309,14 @@ class InterceptorRegistry:
     
     def __init__(self):
         self._inbound_interceptors: Dict[str, InterceptorEntry] = {}
+        # 修改原因：新增渠道入站、渠道出站和 Key 出站三个阶段，需要与既有阶段分别排序和过滤。
+        # 修改方式：为三个阶段分别维护独立注册表，仍复用 InterceptorEntry 的优先级、启用状态、插件名和 metadata 字段。
+        # 目的：让插件可以精确声明运行时机，并让前端通过各阶段数组识别插件能力。
+        self._channel_inbound_interceptors: Dict[str, InterceptorEntry] = {}
         self._request_interceptors: Dict[str, InterceptorEntry] = {}
         self._response_interceptors: Dict[str, InterceptorEntry] = {}
+        self._channel_outbound_interceptors: Dict[str, InterceptorEntry] = {}
+        self._key_outbound_interceptors: Dict[str, InterceptorEntry] = {}
         # 修改原因：余额查询结果需要独立的后处理扩展点，不能混入 request/response interceptor。
         # 修改方式：为 balance_enricher 单独维护注册表，仍复用 InterceptorEntry 的优先级、启用状态和插件名字段。
         # 目的：让 oai_tier 等插件可以只补充 balance result，而不影响请求发送或响应内容。
@@ -308,12 +352,17 @@ class InterceptorRegistry:
         if interceptor_id in self._inbound_interceptors and not overwrite:
             raise ValueError(f"Inbound interceptor '{interceptor_id}' already registered")
         
+        # 修改原因：前端需要从每个拦截器条目的 metadata.stage 判断插件属于哪个阶段。
+        # 修改方式：注册时为未显式提供 stage 的旧插件补默认值，不覆盖插件自定义 metadata。
+        # 目的：保持旧插件兼容，同时让新旧阶段都能被统一识别。
+        metadata = dict(metadata or {})
+        metadata.setdefault("stage", "inbound_interceptors")
         entry = InterceptorEntry(
             id=interceptor_id,
             callback=callback,
             priority=priority,
             plugin_name=plugin_name,
-            metadata=metadata or {},
+            metadata=metadata,
         )
         self._inbound_interceptors[interceptor_id] = entry
         logger.debug(f"Registered inbound interceptor: {interceptor_id} (priority={priority})")
@@ -372,9 +421,105 @@ class InterceptorRegistry:
                 result = await interceptor.callback(request_data, request, api_key_info, enabled_plugins)
                 if result is not None:
                     request_data = result
+            except HTTPException:
+                logger.warning(f"Inbound interceptor '{interceptor.id}' rejected request")
+                raise
             except Exception as e:
                 logger.error(f"Inbound interceptor '{interceptor.id}' error: {e}")
         
+        return request_data
+    
+    # ==================== 渠道入站拦截器 ====================
+    
+    def register_channel_inbound_interceptor(
+        self,
+        interceptor_id: str,
+        callback: ChannelInboundInterceptor,
+        priority: int = 100,
+        plugin_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        overwrite: bool = False,
+    ) -> InterceptorEntry:
+        """
+        注册渠道入站拦截器。
+
+        该阶段在 provider 已选定、channel adapter 转换请求体之前执行。
+        回调签名为：
+            async def interceptor(request_data, request, provider, api_key_info, enabled_plugins) -> request_data
+        """
+        if interceptor_id in self._channel_inbound_interceptors and not overwrite:
+            raise ValueError(f"Channel inbound interceptor '{interceptor_id}' already registered")
+
+        # 修改原因：新增 channel_inbound 阶段后，前端需要从 metadata.stage 识别该插件能力。
+        # 修改方式：注册时补充 channel_inbound_interceptors 默认 stage，并保留调用方传入的其它 metadata。
+        # 目的：让插件列表能精确展示“渠道入站”能力，同时不要求旧插件额外声明。
+        metadata = dict(metadata or {})
+        metadata.setdefault("stage", "channel_inbound_interceptors")
+        entry = InterceptorEntry(
+            id=interceptor_id,
+            callback=callback,
+            priority=priority,
+            plugin_name=plugin_name,
+            metadata=metadata,
+        )
+        self._channel_inbound_interceptors[interceptor_id] = entry
+        logger.debug(f"Registered channel inbound interceptor: {interceptor_id} (priority={priority})")
+        return entry
+
+    def unregister_channel_inbound_interceptor(self, interceptor_id: str) -> bool:
+        """注销渠道入站拦截器"""
+        if interceptor_id in self._channel_inbound_interceptors:
+            del self._channel_inbound_interceptors[interceptor_id]
+            logger.debug(f"Unregistered channel inbound interceptor: {interceptor_id}")
+            return True
+        return False
+
+    def get_channel_inbound_interceptors(self, enabled_only: bool = True) -> List[InterceptorEntry]:
+        """获取所有渠道入站拦截器（按优先级排序）"""
+        interceptors = list(self._channel_inbound_interceptors.values())
+        if enabled_only:
+            interceptors = [i for i in interceptors if i.enabled]
+        interceptors.sort(key=lambda i: i.priority)
+        return interceptors
+
+    async def apply_channel_inbound_interceptors(
+        self,
+        request_data: Any,
+        request: Any,
+        provider: Dict[str, Any],
+        api_key_info: Dict[str, Any],
+        enabled_plugins: Optional[List[str]] = None,
+    ) -> Any:
+        """
+        应用所有渠道入站拦截器。
+
+        enabled_plugins 来自 provider.preferences.enabled_plugins。
+        """
+        interceptors = self.get_channel_inbound_interceptors(enabled_only=True)
+        token = _current_enabled_plugins.set(enabled_plugins)
+
+        # 修改原因：渠道入站阶段和请求拦截阶段使用相同 enabled_plugins 过滤规则。
+        # 修改方式：解析 enabled_plugins 中的插件名，只有显式启用的 plugin_name 才执行。
+        # 目的：避免渠道级插件未启用时误修改请求对象。
+        enabled_plugin_names = None
+        if enabled_plugins is not None:
+            enabled_plugin_names = set(parse_enabled_plugins(enabled_plugins).keys())
+
+        try:
+            for interceptor in interceptors:
+                if interceptor.plugin_name:
+                    if not enabled_plugin_names or interceptor.plugin_name not in enabled_plugin_names:
+                        continue
+
+                try:
+                    result = await interceptor.callback(request_data, request, provider, api_key_info, enabled_plugins)
+                    if result is not None:
+                        request_data = result
+                except Exception as e:
+                    logger.error(f"Channel inbound interceptor '{interceptor.id}' error: {e}")
+        finally:
+            _current_enabled_plugins.reset(token)
+
         return request_data
     
     # ==================== 请求拦截器 ====================
@@ -410,12 +555,17 @@ class InterceptorRegistry:
         if interceptor_id in self._request_interceptors and not overwrite:
             raise ValueError(f"Request interceptor '{interceptor_id}' already registered")
         
+        # 修改原因：前端需要从 metadata.stage 识别请求拦截阶段。
+        # 修改方式：注册时补充 request_interceptors 默认 stage，不覆盖已有 stage。
+        # 目的：让已有 request 插件无需改代码即可被新阶段识别逻辑兼容。
+        metadata = dict(metadata or {})
+        metadata.setdefault("stage", "request_interceptors")
         entry = InterceptorEntry(
             id=interceptor_id,
             callback=callback,
             priority=priority,
             plugin_name=plugin_name,
-            metadata=metadata or {},
+            metadata=metadata,
         )
         self._request_interceptors[interceptor_id] = entry
         logger.debug(f"Registered request interceptor: {interceptor_id} (priority={priority})")
@@ -526,12 +676,17 @@ class InterceptorRegistry:
         if interceptor_id in self._response_interceptors and not overwrite:
             raise ValueError(f"Response interceptor '{interceptor_id}' already registered")
         
+        # 修改原因：前端需要从 metadata.stage 识别响应拦截阶段。
+        # 修改方式：注册时补充 response_interceptors 默认 stage，不覆盖已有 stage。
+        # 目的：让已有 response 插件继续保持原注册方式，同时暴露清晰阶段信息。
+        metadata = dict(metadata or {})
+        metadata.setdefault("stage", "response_interceptors")
         entry = InterceptorEntry(
             id=interceptor_id,
             callback=callback,
             priority=priority,
             plugin_name=plugin_name,
-            metadata=metadata or {},
+            metadata=metadata,
         )
         self._response_interceptors[interceptor_id] = entry
         logger.debug(f"Registered response interceptor: {interceptor_id} (priority={priority})")
@@ -610,6 +765,186 @@ class InterceptorRegistry:
         
         return response_chunk
     
+    # ==================== 渠道出站拦截器 ====================
+    
+    def register_channel_outbound_interceptor(
+        self,
+        interceptor_id: str,
+        callback: ChannelOutboundInterceptor,
+        priority: int = 100,
+        plugin_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        overwrite: bool = False,
+    ) -> InterceptorEntry:
+        """
+        注册渠道出站拦截器。
+
+        该阶段在响应拦截器和 Key Rules 之后、Key 出站之前执行。
+        回调签名为：
+            async def interceptor(response_chunk, engine, model, provider, is_stream, enabled_plugins) -> response_chunk
+        """
+        if interceptor_id in self._channel_outbound_interceptors and not overwrite:
+            raise ValueError(f"Channel outbound interceptor '{interceptor_id}' already registered")
+
+        # 修改原因：新增 channel_outbound 阶段后，前端需要从 metadata.stage 识别该插件能力。
+        # 修改方式：注册时补充 channel_outbound_interceptors 默认 stage，并保留调用方传入的其它 metadata。
+        # 目的：让插件列表能精确展示“渠道出站”能力。
+        metadata = dict(metadata or {})
+        metadata.setdefault("stage", "channel_outbound_interceptors")
+        entry = InterceptorEntry(
+            id=interceptor_id,
+            callback=callback,
+            priority=priority,
+            plugin_name=plugin_name,
+            metadata=metadata,
+        )
+        self._channel_outbound_interceptors[interceptor_id] = entry
+        logger.debug(f"Registered channel outbound interceptor: {interceptor_id} (priority={priority})")
+        return entry
+
+    def unregister_channel_outbound_interceptor(self, interceptor_id: str) -> bool:
+        """注销渠道出站拦截器"""
+        if interceptor_id in self._channel_outbound_interceptors:
+            del self._channel_outbound_interceptors[interceptor_id]
+            logger.debug(f"Unregistered channel outbound interceptor: {interceptor_id}")
+            return True
+        return False
+
+    def get_channel_outbound_interceptors(self, enabled_only: bool = True) -> List[InterceptorEntry]:
+        """获取所有渠道出站拦截器（按优先级排序）"""
+        interceptors = list(self._channel_outbound_interceptors.values())
+        if enabled_only:
+            interceptors = [i for i in interceptors if i.enabled]
+        interceptors.sort(key=lambda i: i.priority)
+        return interceptors
+
+    async def apply_channel_outbound_interceptors(
+        self,
+        response_chunk: Any,
+        engine: str,
+        model: str,
+        provider: Dict[str, Any],
+        is_stream: bool,
+        enabled_plugins: Optional[List[str]] = None,
+    ) -> Any:
+        """
+        应用所有渠道出站拦截器。
+
+        enabled_plugins 来自 provider.preferences.enabled_plugins。
+        """
+        interceptors = self.get_channel_outbound_interceptors(enabled_only=True)
+        token = _current_enabled_plugins.set(enabled_plugins)
+        enabled_plugin_names = None
+        if enabled_plugins is not None:
+            enabled_plugin_names = set(parse_enabled_plugins(enabled_plugins).keys())
+
+        try:
+            for interceptor in interceptors:
+                if interceptor.plugin_name:
+                    if not enabled_plugin_names or interceptor.plugin_name not in enabled_plugin_names:
+                        continue
+
+                try:
+                    result = await interceptor.callback(response_chunk, engine, model, provider, is_stream, enabled_plugins)
+                    if result is not None:
+                        response_chunk = result
+                except Exception as e:
+                    logger.error(f"Channel outbound interceptor '{interceptor.id}' error: {e}")
+        finally:
+            _current_enabled_plugins.reset(token)
+
+        return response_chunk
+
+    # ==================== Key 出站拦截器 ====================
+    
+    def register_key_outbound_interceptor(
+        self,
+        interceptor_id: str,
+        callback: KeyOutboundInterceptor,
+        priority: int = 100,
+        plugin_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        overwrite: bool = False,
+    ) -> InterceptorEntry:
+        """
+        注册 Key 出站拦截器。
+
+        该阶段在渠道出站之后、最终返回客户端前执行。
+        回调签名为：
+            async def interceptor(response_chunk, engine, model, api_key_info, is_stream, enabled_plugins) -> response_chunk
+        """
+        if interceptor_id in self._key_outbound_interceptors and not overwrite:
+            raise ValueError(f"Key outbound interceptor '{interceptor_id}' already registered")
+
+        # 修改原因：新增 key_outbound 阶段后，前端需要从 metadata.stage 识别该插件能力。
+        # 修改方式：注册时补充 key_outbound_interceptors 默认 stage，并保留调用方传入的其它 metadata。
+        # 目的：让插件列表能精确展示“Key 出站”能力，并与渠道出站区分。
+        metadata = dict(metadata or {})
+        metadata.setdefault("stage", "key_outbound_interceptors")
+        entry = InterceptorEntry(
+            id=interceptor_id,
+            callback=callback,
+            priority=priority,
+            plugin_name=plugin_name,
+            metadata=metadata,
+        )
+        self._key_outbound_interceptors[interceptor_id] = entry
+        logger.debug(f"Registered key outbound interceptor: {interceptor_id} (priority={priority})")
+        return entry
+
+    def unregister_key_outbound_interceptor(self, interceptor_id: str) -> bool:
+        """注销 Key 出站拦截器"""
+        if interceptor_id in self._key_outbound_interceptors:
+            del self._key_outbound_interceptors[interceptor_id]
+            logger.debug(f"Unregistered key outbound interceptor: {interceptor_id}")
+            return True
+        return False
+
+    def get_key_outbound_interceptors(self, enabled_only: bool = True) -> List[InterceptorEntry]:
+        """获取所有 Key 出站拦截器（按优先级排序）"""
+        interceptors = list(self._key_outbound_interceptors.values())
+        if enabled_only:
+            interceptors = [i for i in interceptors if i.enabled]
+        interceptors.sort(key=lambda i: i.priority)
+        return interceptors
+
+    async def apply_key_outbound_interceptors(
+        self,
+        response_chunk: Any,
+        engine: str,
+        model: str,
+        api_key_info: Dict[str, Any],
+        is_stream: bool,
+        enabled_plugins: Optional[List[str]] = None,
+    ) -> Any:
+        """
+        应用所有 Key 出站拦截器。
+
+        enabled_plugins 来自 api_keys[].preferences.enabled_plugins。
+        """
+        interceptors = self.get_key_outbound_interceptors(enabled_only=True)
+        token = _current_enabled_plugins.set(enabled_plugins)
+        enabled_plugin_names = None
+        if enabled_plugins is not None:
+            enabled_plugin_names = set(parse_enabled_plugins(enabled_plugins).keys())
+
+        try:
+            for interceptor in interceptors:
+                if interceptor.plugin_name:
+                    if not enabled_plugin_names or interceptor.plugin_name not in enabled_plugin_names:
+                        continue
+
+                try:
+                    result = await interceptor.callback(response_chunk, engine, model, api_key_info, is_stream, enabled_plugins)
+                    if result is not None:
+                        response_chunk = result
+                except Exception as e:
+                    logger.error(f"Key outbound interceptor '{interceptor.id}' error: {e}")
+        finally:
+            _current_enabled_plugins.reset(token)
+
+        return response_chunk
+    
     # ==================== 余额补充器 ====================
     
     def register_balance_enricher(
@@ -639,12 +974,17 @@ class InterceptorRegistry:
         if enricher_id in self._balance_enrichers and not overwrite:
             raise ValueError(f"Balance enricher '{enricher_id}' already registered")
         
+        # 修改原因：余额补充器也会出现在插件能力列表中，需要与拦截器阶段保持同一 metadata.stage 口径。
+        # 修改方式：注册时补充 balance_enrichers 默认 stage，不覆盖已有 stage。
+        # 目的：让前端和调试接口能统一展示插件能力来源。
+        metadata = dict(metadata or {})
+        metadata.setdefault("stage", "balance_enrichers")
         entry = InterceptorEntry(
             id=enricher_id,
             callback=callback,
             priority=priority,
             plugin_name=plugin_name,
-            metadata=metadata or {},
+            metadata=metadata,
         )
         self._balance_enrichers[enricher_id] = entry
         logger.debug(f"Registered balance enricher: {enricher_id} (priority={priority})")
@@ -779,6 +1119,22 @@ class InterceptorRegistry:
         for interceptor_id in to_remove:
             del self._response_interceptors[interceptor_id]
             count += 1
+
+        # 修改原因：插件卸载时新增的渠道入站、渠道出站和 Key 出站注册项也必须清理。
+        # 修改方式：按 plugin_name 分别扫描三个新注册表，并计入注销数量。
+        # 目的：避免插件热重载或卸载后留下旧阶段回调继续生效。
+        to_remove = [i.id for i in self._channel_inbound_interceptors.values() if i.plugin_name == plugin_name]
+        for interceptor_id in to_remove:
+            del self._channel_inbound_interceptors[interceptor_id]
+            count += 1
+        to_remove = [i.id for i in self._channel_outbound_interceptors.values() if i.plugin_name == plugin_name]
+        for interceptor_id in to_remove:
+            del self._channel_outbound_interceptors[interceptor_id]
+            count += 1
+        to_remove = [i.id for i in self._key_outbound_interceptors.values() if i.plugin_name == plugin_name]
+        for interceptor_id in to_remove:
+            del self._key_outbound_interceptors[interceptor_id]
+            count += 1
         
         # 修改原因：插件卸载时如果只清理 request/response，会留下余额补充器继续污染余额结果。
         # 修改方式：按 plugin_name 同步删除 balance_enricher 注册项，并计入注销数量。
@@ -797,49 +1153,36 @@ class InterceptorRegistry:
     
     def get_stats(self) -> Dict[str, Any]:
         """获取拦截器统计信息"""
+        def _stage_stats(entries: Dict[str, InterceptorEntry], item_key: str = "interceptors") -> Dict[str, Any]:
+            # 修改原因：新增多个阶段后，统计结构不能继续为 request/response 手写两份。
+            # 修改方式：使用本地 helper 统一生成 total、enabled 和按优先级排序的条目列表，并带上 metadata。
+            # 目的：减少后续阶段扩展时遗漏统计字段的风险。
+            return {
+                "total": len(entries),
+                "enabled": len([i for i in entries.values() if i.enabled]),
+                item_key: [
+                    {
+                        "id": i.id,
+                        "priority": i.priority,
+                        "enabled": i.enabled,
+                        "plugin_name": i.plugin_name,
+                        "metadata": i.metadata,
+                    }
+                    for i in sorted(entries.values(), key=lambda x: x.priority)
+                ],
+            }
+
         return {
-            "request_interceptors": {
-                "total": len(self._request_interceptors),
-                "enabled": len([i for i in self._request_interceptors.values() if i.enabled]),
-                "interceptors": [
-                    {
-                        "id": i.id,
-                        "priority": i.priority,
-                        "enabled": i.enabled,
-                        "plugin_name": i.plugin_name,
-                    }
-                    for i in sorted(self._request_interceptors.values(), key=lambda x: x.priority)
-                ],
-            },
-            "response_interceptors": {
-                "total": len(self._response_interceptors),
-                "enabled": len([i for i in self._response_interceptors.values() if i.enabled]),
-                "interceptors": [
-                    {
-                        "id": i.id,
-                        "priority": i.priority,
-                        "enabled": i.enabled,
-                        "plugin_name": i.plugin_name,
-                    }
-                    for i in sorted(self._response_interceptors.values(), key=lambda x: x.priority)
-                ],
-            },
+            "inbound_interceptors": _stage_stats(self._inbound_interceptors),
+            "channel_inbound_interceptors": _stage_stats(self._channel_inbound_interceptors),
+            "request_interceptors": _stage_stats(self._request_interceptors),
+            "response_interceptors": _stage_stats(self._response_interceptors),
+            "channel_outbound_interceptors": _stage_stats(self._channel_outbound_interceptors),
+            "key_outbound_interceptors": _stage_stats(self._key_outbound_interceptors),
             # 修改原因：新增 balance_enricher 后，管理端和测试需要看到该扩展点的注册状态。
             # 修改方式：在 get_stats 中加入 total、enabled 和按优先级排序的 enrichers 列表。
-            # 目的：便于排查 oai_tier 是否已注册，并与 request/response 统计保持一致。
-            "balance_enrichers": {
-                "total": len(self._balance_enrichers),
-                "enabled": len([i for i in self._balance_enrichers.values() if i.enabled]),
-                "enrichers": [
-                    {
-                        "id": i.id,
-                        "priority": i.priority,
-                        "enabled": i.enabled,
-                        "plugin_name": i.plugin_name,
-                    }
-                    for i in sorted(self._balance_enrichers.values(), key=lambda x: x.priority)
-                ],
-            },
+            # 目的：便于排查 oai_tier 是否已注册，并与拦截器统计保持一致。
+            "balance_enrichers": _stage_stats(self._balance_enrichers, item_key="enrichers"),
         }
     
     def get_interceptor_plugins(self) -> List[Dict[str, Any]]:
@@ -850,66 +1193,62 @@ class InterceptorRegistry:
             插件信息列表，每个元素包含 plugin_name 和该插件注册的拦截器信息
         """
         plugins = {}
-        
-        # 收集请求拦截器的插件
-        for interceptor in self._request_interceptors.values():
-            if interceptor.plugin_name:
-                if interceptor.plugin_name not in plugins:
-                    plugins[interceptor.plugin_name] = {
-                        "plugin_name": interceptor.plugin_name,
-                        "request_interceptors": [],
-                        "response_interceptors": [],
-                        "balance_enrichers": [],
-                    }
-                plugins[interceptor.plugin_name]["request_interceptors"].append({
-                    "id": interceptor.id,
-                    "priority": interceptor.priority,
-                    "enabled": interceptor.enabled,
-                })
-        
-        # 收集响应拦截器的插件
-        for interceptor in self._response_interceptors.values():
-            if interceptor.plugin_name:
-                if interceptor.plugin_name not in plugins:
-                    plugins[interceptor.plugin_name] = {
-                        "plugin_name": interceptor.plugin_name,
-                        "request_interceptors": [],
-                        "response_interceptors": [],
-                        "balance_enrichers": [],
-                    }
-                plugins[interceptor.plugin_name]["response_interceptors"].append({
-                    "id": interceptor.id,
-                    "priority": interceptor.priority,
-                    "enabled": interceptor.enabled,
-                })
-        
-        # 修改原因：只注册 balance_enricher 的插件也应能出现在拦截器插件列表中。
-        # 修改方式：按 plugin_name 收集余额补充器，并写入 balance_enrichers 数组。
-        # 目的：让插件状态查询能完整展示 oai_tier 的响应拦截器和余额补充器。
-        for enricher in self._balance_enrichers.values():
-            if enricher.plugin_name:
-                if enricher.plugin_name not in plugins:
-                    plugins[enricher.plugin_name] = {
-                        "plugin_name": enricher.plugin_name,
-                        "request_interceptors": [],
-                        "response_interceptors": [],
-                        "balance_enrichers": [],
-                    }
-                plugins[enricher.plugin_name]["balance_enrichers"].append({
-                    "id": enricher.id,
-                    "priority": enricher.priority,
-                    "enabled": enricher.enabled,
-                })
+
+        def _empty_plugin(plugin_name: str) -> Dict[str, Any]:
+            return {
+                "plugin_name": plugin_name,
+                "inbound_interceptors": [],
+                "channel_inbound_interceptors": [],
+                "request_interceptors": [],
+                "response_interceptors": [],
+                "channel_outbound_interceptors": [],
+                "key_outbound_interceptors": [],
+                "balance_enrichers": [],
+            }
+
+        def _entry_payload(entry: InterceptorEntry) -> Dict[str, Any]:
+            # 修改原因：前端需要读取单个拦截器条目的 metadata.stage，而旧返回只包含 id/priority/enabled。
+            # 修改方式：统一把 metadata 放入每个阶段数组的条目中。
+            # 目的：让前端可以按 stage 字段识别 channel_inbound、channel_outbound 和 key_outbound 能力。
+            return {
+                "id": entry.id,
+                "priority": entry.priority,
+                "enabled": entry.enabled,
+                "metadata": entry.metadata,
+            }
+
+        def _collect(entries: Dict[str, InterceptorEntry], stage_key: str) -> None:
+            for entry in entries.values():
+                if not entry.plugin_name:
+                    continue
+                if entry.plugin_name not in plugins:
+                    plugins[entry.plugin_name] = _empty_plugin(entry.plugin_name)
+                plugins[entry.plugin_name][stage_key].append(_entry_payload(entry))
+
+        # 修改原因：插件列表需要同时展示旧阶段和新增的三个阶段。
+        # 修改方式：按阶段逐个收集注册项，输出字段名与 metadata.stage 保持一致。
+        # 目的：让 /v1/plugins/interceptors 成为前端识别全部拦截器能力的单一来源。
+        _collect(self._inbound_interceptors, "inbound_interceptors")
+        _collect(self._channel_inbound_interceptors, "channel_inbound_interceptors")
+        _collect(self._request_interceptors, "request_interceptors")
+        _collect(self._response_interceptors, "response_interceptors")
+        _collect(self._channel_outbound_interceptors, "channel_outbound_interceptors")
+        _collect(self._key_outbound_interceptors, "key_outbound_interceptors")
+        _collect(self._balance_enrichers, "balance_enrichers")
         
         return list(plugins.values())
     
     def clear(self) -> None:
         """清空所有拦截器"""
+        # 修改原因：测试和插件重载调用 clear 时必须移除所有阶段，不能只清理 request/response。
+        # 修改方式：同步清空旧阶段、新增三阶段和余额补充器注册表。
+        # 目的：避免全局注册表重用时残留任意阶段的旧回调。
+        self._inbound_interceptors.clear()
+        self._channel_inbound_interceptors.clear()
         self._request_interceptors.clear()
         self._response_interceptors.clear()
-        # 修改原因：测试和插件重载调用 clear 时也必须移除余额补充器。
-        # 修改方式：同步清空 _balance_enrichers。
-        # 目的：避免旧 balance_enricher 在全局注册表重用时残留。
+        self._channel_outbound_interceptors.clear()
+        self._key_outbound_interceptors.clear()
         self._balance_enrichers.clear()
 
 
@@ -964,6 +1303,41 @@ async def apply_inbound_interceptors(
     )
 
 
+def register_channel_inbound_interceptor(
+    interceptor_id: str,
+    callback: ChannelInboundInterceptor,
+    priority: int = 100,
+    plugin_name: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    overwrite: bool = False,
+) -> InterceptorEntry:
+    """注册渠道入站拦截器（便捷函数）"""
+    # 修改原因：插件文件需要像注册 request interceptor 一样注册 channel_inbound 阶段。
+    # 修改方式：提供模块级便捷函数并转发到全局 InterceptorRegistry。
+    # 目的：让插件无需直接持有注册表实例即可声明渠道入站能力。
+    return get_interceptor_registry().register_channel_inbound_interceptor(
+        interceptor_id, callback, priority, plugin_name, metadata, overwrite
+    )
+
+
+def unregister_channel_inbound_interceptor(interceptor_id: str) -> bool:
+    """注销渠道入站拦截器（便捷函数）"""
+    return get_interceptor_registry().unregister_channel_inbound_interceptor(interceptor_id)
+
+
+async def apply_channel_inbound_interceptors(
+    request_data: Any,
+    request: Any,
+    provider: Dict[str, Any],
+    api_key_info: Dict[str, Any],
+    enabled_plugins: Optional[List[str]] = None,
+) -> Any:
+    """应用所有渠道入站拦截器（便捷函数）"""
+    return await get_interceptor_registry().apply_channel_inbound_interceptors(
+        request_data, request, provider, api_key_info, enabled_plugins
+    )
+
+
 def register_request_interceptor(
     interceptor_id: str,
     callback: RequestInterceptor,
@@ -1000,6 +1374,50 @@ def register_response_interceptor(
 def unregister_response_interceptor(interceptor_id: str) -> bool:
     """注销响应拦截器（便捷函数）"""
     return get_interceptor_registry().unregister_response_interceptor(interceptor_id)
+
+
+def register_channel_outbound_interceptor(
+    interceptor_id: str,
+    callback: ChannelOutboundInterceptor,
+    priority: int = 100,
+    plugin_name: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    overwrite: bool = False,
+) -> InterceptorEntry:
+    """注册渠道出站拦截器（便捷函数）"""
+    # 修改原因：插件文件需要声明响应拦截器之后的渠道级最终处理阶段。
+    # 修改方式：提供模块级 register_channel_outbound_interceptor 并转发到全局注册表。
+    # 目的：保持插件注册 API 与既有 request/response 阶段一致。
+    return get_interceptor_registry().register_channel_outbound_interceptor(
+        interceptor_id, callback, priority, plugin_name, metadata, overwrite
+    )
+
+
+def unregister_channel_outbound_interceptor(interceptor_id: str) -> bool:
+    """注销渠道出站拦截器（便捷函数）"""
+    return get_interceptor_registry().unregister_channel_outbound_interceptor(interceptor_id)
+
+
+def register_key_outbound_interceptor(
+    interceptor_id: str,
+    callback: KeyOutboundInterceptor,
+    priority: int = 100,
+    plugin_name: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    overwrite: bool = False,
+) -> InterceptorEntry:
+    """注册 Key 出站拦截器（便捷函数）"""
+    # 修改原因：Key 级 enabled_plugins 需要独立的最终响应处理阶段。
+    # 修改方式：提供模块级 register_key_outbound_interceptor 并转发到全局注册表。
+    # 目的：让插件可以按下游 API Key 配置执行最终改写。
+    return get_interceptor_registry().register_key_outbound_interceptor(
+        interceptor_id, callback, priority, plugin_name, metadata, overwrite
+    )
+
+
+def unregister_key_outbound_interceptor(interceptor_id: str) -> bool:
+    """注销 Key 出站拦截器（便捷函数）"""
+    return get_interceptor_registry().unregister_key_outbound_interceptor(interceptor_id)
 
 
 def register_balance_enricher(
@@ -1050,6 +1468,34 @@ async def apply_response_interceptors(
     """应用所有响应拦截器（便捷函数）"""
     return await get_interceptor_registry().apply_response_interceptors(
         response_chunk, engine, model, is_stream, enabled_plugins
+    )
+
+
+async def apply_channel_outbound_interceptors(
+    response_chunk: Any,
+    engine: str,
+    model: str,
+    provider: Dict[str, Any],
+    is_stream: bool,
+    enabled_plugins: Optional[List[str]] = None,
+) -> Any:
+    """应用所有渠道出站拦截器（便捷函数）"""
+    return await get_interceptor_registry().apply_channel_outbound_interceptors(
+        response_chunk, engine, model, provider, is_stream, enabled_plugins
+    )
+
+
+async def apply_key_outbound_interceptors(
+    response_chunk: Any,
+    engine: str,
+    model: str,
+    api_key_info: Dict[str, Any],
+    is_stream: bool,
+    enabled_plugins: Optional[List[str]] = None,
+) -> Any:
+    """应用所有 Key 出站拦截器（便捷函数）"""
+    return await get_interceptor_registry().apply_key_outbound_interceptors(
+        response_chunk, engine, model, api_key_info, is_stream, enabled_plugins
     )
 
 
@@ -1133,17 +1579,20 @@ class InterceptedClient:
         return False
 
     async def _intercept(self, url: str, headers: Optional[Dict] = None) -> Tuple[str, Dict]:
-        """对 url 和 headers 应用请求拦截器"""
+        """对 url 和 headers 应用请求拦截器，并追加自定义请求头"""
         if self._client is None:
             raise RuntimeError("InterceptedClient is closed")
         headers = dict(headers or {})
-        if not self._enabled_plugins:
-            return url, headers
-        url, headers, _ = await apply_request_interceptors(
-            None, self._engine, self._provider, self._api_key,
-            str(url), headers, {},
-            self._enabled_plugins,
-        )
+        if self._enabled_plugins:
+            url, headers, _ = await apply_request_interceptors(
+                None, self._engine, self._provider, self._api_key,
+                str(url), headers, {},
+                self._enabled_plugins,
+            )
+        # 自定义请求头：与 core/request.py 保持一致
+        from core.http_headers import apply_custom_headers
+        from utils import safe_get
+        apply_custom_headers(headers, safe_get(self._provider, "preferences", "headers", default={}))
         return url, headers
 
     async def get(self, url, *, headers=None, **kwargs):

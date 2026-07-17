@@ -368,6 +368,22 @@ export function useChannelsCore(): UseChannelsCoreResult {
     const formData = context?.formData ?? null;
     const isOAuthEngine = !!context?.isOAuthEngine;
     const setOauthAccounts: any = context?.setOauthAccounts || (() => undefined);
+    if (silent && formData?.provider) {
+      // 修改原因：编辑面板打开时不再自动请求余额，但仍需要保留最近一次手动查询的展示结果。
+      // 修改方式：silent 调用只读取 provider 维度的 localStorage 缓存，10 分钟内命中则直接写回 balanceResults 并结束。
+      // 目的：避免打开面板触发 /v1/channels/balance，同时让已有余额信息可以快速恢复显示。
+      const cacheKey = `zoaholic_balance_${formData.provider}`;
+      const cached = localStorage.getItem(cacheKey);
+      if (cached) {
+        try {
+          const { results: cachedResults, timestamp } = JSON.parse(cached);
+          if (Date.now() - timestamp < 10 * 60 * 1000) {
+            setBalanceResults(cachedResults);
+            return;
+          }
+        } catch { /* 缓存损坏忽略 */ }
+      }
+    }
     // 修改原因：OAuth 渠道的余额查询不依赖 Base URL 和 preferences.balance，而是由后端 OAuthManager 按账号标识查询。
     // 修改方式：仅普通渠道继续强制要求 base_url 和 balance 配置，OAuth 渠道直接进入 active key 查询。
     // 目的：让 Codex 等 OAuth 渠道的余额按钮可以点击并刷新 quota。
@@ -447,6 +463,15 @@ export function useChannelsCore(): UseChannelsCoreResult {
       }
     };
     await Promise.all(Array.from({ length: Math.min(concurrency, activeKeys.length) }, () => runNext()));
+    if (formData.provider) {
+      // 修改原因：余额查询改为纯手动触发后，下一次打开编辑面板应复用最近一次手动查询结果。
+      // 修改方式：手动查询完成后把当前 provider 的结果和写入时间存到 localStorage。
+      // 目的：让手动查询按钮继续负责刷新数据，面板打开只负责读取缓存而不发起网络请求。
+      const cacheKey = `zoaholic_balance_${formData.provider}`;
+      try {
+        localStorage.setItem(cacheKey, JSON.stringify({ results, timestamp: Date.now() }));
+      } catch { /* localStorage 不可写时忽略，余额手动查询结果仍已显示 */ }
+    }
     setBalanceLoading(false);
   };
 

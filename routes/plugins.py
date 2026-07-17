@@ -24,8 +24,8 @@ PLUGINS_DIR = Path("plugins")
 
 
 def _get_plugin_info_dict(info) -> dict:
-    """将 PluginInfo 转换为字典"""
-    return {
+    """将 PluginInfo 转换为字典，包含拦截器阶段信息"""
+    result = {
         "name": info.name,
         "version": info.version,
         "description": info.description,
@@ -39,6 +39,28 @@ def _get_plugin_info_dict(info) -> dict:
         "error": info.error,
         "metadata": info.metadata,
     }
+    # 从拦截器 registry 补充各阶段信息
+    try:
+        registry = get_interceptor_registry()
+        for plugin_info in registry.get_interceptor_plugins():
+            if plugin_info.get("plugin_name") == info.name:
+                for stage in ("inbound_interceptors", "channel_inbound_interceptors",
+                              "request_interceptors", "response_interceptors",
+                              "channel_outbound_interceptors", "key_outbound_interceptors"):
+                    entries = plugin_info.get(stage, [])
+                    if entries:
+                        result[stage] = entries
+                        # 合并 entry metadata 到顶层（description、params_hint 等）
+                        for entry in entries:
+                            for k, v in entry.get("metadata", {}).items():
+                                if k != "stage" and k not in result.get("metadata", {}):
+                                    if not isinstance(result["metadata"], dict):
+                                        result["metadata"] = {}
+                                    result["metadata"][k] = v
+                break
+    except Exception:
+        pass
+    return result
 
 
 @router.get("", dependencies=[Depends(rate_limit_dependency)])
@@ -119,8 +141,16 @@ async def list_interceptor_plugins(_: int = Depends(verify_admin_api_key)):
             "description": full_info.description if full_info else None,
             "author": full_info.author if full_info else None,
             "enabled": full_info.enabled if full_info else False,
-            "request_interceptors": plugin_info["request_interceptors"],
-            "response_interceptors": plugin_info["response_interceptors"],
+            # 修改原因：拦截器系统新增 channel_inbound、channel_outbound 和 key_outbound 三个阶段，插件列表接口不能只返回旧 request/response。
+            # 修改方式：所有阶段字段都从 registry 输出中读取，不存在时回退为空数组，兼容旧运行时状态。
+            # 目的：让前端可以通过阶段数组和条目 metadata.stage 识别插件适用位置。
+            "inbound_interceptors": plugin_info.get("inbound_interceptors", []),
+            "channel_inbound_interceptors": plugin_info.get("channel_inbound_interceptors", []),
+            "request_interceptors": plugin_info.get("request_interceptors", []),
+            "response_interceptors": plugin_info.get("response_interceptors", []),
+            "channel_outbound_interceptors": plugin_info.get("channel_outbound_interceptors", []),
+            "key_outbound_interceptors": plugin_info.get("key_outbound_interceptors", []),
+            "balance_enrichers": plugin_info.get("balance_enrichers", []),
             "metadata": full_info.metadata if full_info else {},
         })
     

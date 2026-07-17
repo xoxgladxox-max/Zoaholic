@@ -2,7 +2,7 @@
 Embeddings 路由
 """
 
-from fastapi import APIRouter, Depends, BackgroundTasks
+from fastapi import APIRouter, Depends, BackgroundTasks, Request
 
 from core.models import EmbeddingRequest
 from routes.deps import rate_limit_dependency, verify_api_key, get_model_handler
@@ -12,6 +12,7 @@ router = APIRouter()
 
 @router.post("/v1/embeddings", dependencies=[Depends(rate_limit_dependency)])
 async def embeddings(
+    http_request: Request,
     request: EmbeddingRequest,
     background_tasks: BackgroundTasks,
     api_index: int = Depends(verify_api_key)

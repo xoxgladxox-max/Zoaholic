@@ -8,7 +8,7 @@
 
 import asyncio
 import json
-from typing import Any, Callable, Dict, Optional, TYPE_CHECKING, Union
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING, Union
 
 import httpx
 from fastapi import BackgroundTasks, HTTPException
@@ -49,7 +49,9 @@ async def process_request(
     role: Optional[str] = None,
     timeout_value: int = DEFAULT_TIMEOUT,
     keepalive_interval: Optional[int] = None,
-    force_api_key: Optional[str] = None
+    force_api_key: Optional[str] = None,
+    api_key_info: Optional[Dict[str, Any]] = None,
+    key_enabled_plugins: Optional[List[str]] = None,
 ) -> Response:
     """
     向单个 provider 发送请求并处理响应
@@ -145,7 +147,7 @@ async def process_request(
     from core.http import proxy_context
     with proxy_context(proxy):
         url, headers, payload = await get_payload(request, engine, provider, api_key)
-    apply_custom_headers(headers, safe_get(provider, "preferences", "headers", default={}))  # add custom headers
+    # custom headers 已在 get_payload → apply_request_interceptors 之前统一应用
     
 
     current_info = request_info_getter()
@@ -197,6 +199,10 @@ async def process_request(
     
     # 获取该渠道启用的插件列表
     enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
+    # 修改原因：新增 key_outbound 阶段需要 Key 级 enabled_plugins，不能复用渠道级 enabled_plugins。
+    # 修改方式：由 handler 传入 api_key_info 和 key_enabled_plugins；缺失时使用空字典和 None 兼容测试路径。
+    # 目的：让响应返回路径能够分别执行渠道出站和 Key 出站拦截器。
+    api_key_info = api_key_info or {}
 
     # 判断实际上游流式模式（stream_mode 核心逻辑）
     client_wants_stream = bool(request.stream)
@@ -226,7 +232,13 @@ async def process_request(
     try:
         async with app.state.client_manager.get_client(url, proxy) as client:
             if upstream_stream:
-                generator = fetch_response_stream(client, url, headers, payload, engine, original_model, timeout_value, enabled_plugins=enabled_plugins)
+                generator = fetch_response_stream(
+                    client, url, headers, payload, engine, original_model, timeout_value,
+                    enabled_plugins=enabled_plugins,
+                    provider=provider,
+                    api_key_info=api_key_info,
+                    key_enabled_plugins=key_enabled_plugins,
+                )
                 wrapped_generator, first_response_time = await error_handling_wrapper(
                     generator, channel_id, engine, True,
                     app.state.error_triggers, keepalive_interval=keepalive_interval,
@@ -260,7 +272,13 @@ async def process_request(
                         debug=is_debug
                     )
             else:
-                generator = fetch_response(client, url, headers, payload, engine, original_model, timeout_value, enabled_plugins=enabled_plugins)
+                generator = fetch_response(
+                    client, url, headers, payload, engine, original_model, timeout_value,
+                    enabled_plugins=enabled_plugins,
+                    provider=provider,
+                    api_key_info=api_key_info,
+                    key_enabled_plugins=key_enabled_plugins,
+                )
                 wrapped_generator, first_response_time = await error_handling_wrapper(
                     generator, channel_id, engine, False,
                     app.state.error_triggers, keepalive_interval=keepalive_interval,

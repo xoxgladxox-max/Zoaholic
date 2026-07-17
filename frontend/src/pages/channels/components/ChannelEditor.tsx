@@ -5,28 +5,19 @@ import * as Switch from '@radix-ui/react-switch';
 import {
   Plus, Edit, Brain, Trash2, ArrowRight, RefreshCw,
   Server, X, CheckCircle2, Settings2, Copy, ToggleRight, ToggleLeft,
-  Folder, Puzzle, Network, CopyCheck, Power, Play,
+  Folder, Puzzle, Network, CopyCheck, Play,
   Check, Wallet, Link2, GripVertical, ChevronUp, ChevronDown,
   ClipboardPaste, LogIn, Download, LayoutList, LayoutGrid, MoreHorizontal, Package, FileUp
 } from 'lucide-react';
 import { InterceptorSheet } from '../../../components/InterceptorSheet';
 import { ProviderLogo } from '../../../components/ProviderLogos';
 import { PipelineView } from './PipelineView';
-import {
-  formatKeyRuleKeywordsInput,
-  formatKeyRuleStatusInput,
-  getKeyRuleRetryMode,
-  parseKeyRuleKeywordsInput,
-  parseKeyRuleStatusInput,
-  setKeyRuleRetryMode,
-  type KeyRuleRetryMode,
-} from '../../../lib/keyRules';
 import { summarizeVirtualChain } from '../../../lib/virtualModels';
 import { apiFetch } from '../../../lib/api';
 import { toastError, fmtErr } from '../../../components/Toast';
 import type { ChannelOption } from '../types';
 import { SCHEDULE_ALGORITHMS, getBalancePercent, hasUiSlot } from '../utils';
-import { DeferredInput, RackCard, RackGrid, UiSlot } from './KeyComponents';
+import { RackCard, RackGrid, UiSlot } from './KeyComponents';
 import { FullKeyRow } from './FullKeyRow';
 
 import type { UseChannelEditorResult } from '../hooks/useChannelEditor';
@@ -77,6 +68,22 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, [keyMoreMenuOpen]);
+
+  useEffect(() => {
+    // 修改原因：余额查询已改为纯手动触发，打开编辑面板时不能再静默请求后端余额接口。
+    // 修改方式：面板打开且存在 provider 时，只从 localStorage 读取最近一次手动查询缓存并写回 balanceResults。
+    // 目的：保留余额显示缓存，同时避免打开面板产生自动网络请求。
+    if (isModalOpen && formData?.provider) {
+      const cacheKey = `zoaholic_balance_${formData.provider}`;
+      const cached = localStorage.getItem(cacheKey);
+      if (cached) {
+        try {
+          const { results: cachedResults } = JSON.parse(cached);
+          setBalanceResults(cachedResults);
+        } catch { /* ignore */ }
+      }
+    }
+  }, [isModalOpen, formData?.provider]);
 
   return (
     <>
@@ -1138,104 +1145,6 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                       </div>
                     </div>
 
-                    {/* Key 错误处理规则 */}
-                    <div className="border-t border-border pt-4">
-                      <div className="flex items-center justify-between mb-3">
-                        <label className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                          <Power className="w-3.5 h-3.5 text-red-500" /> Key 错误处理规则
-                        </label>
-                        <div className="flex gap-1.5">
-                          {[{ label: '标准', rules: [
-                            { match: { status: [429] }, duration: 30 },
-                            { match: { status: [401, 403] }, duration: -1 },
-                            { match: 'default', duration: 60 },
-                          ]}, { label: '激进', rules: [
-                            { match: { status: [429] }, duration: 10 },
-                            { match: { status: [401, 403, 500] }, duration: -1 },
-                            { match: 'default', duration: 30 },
-                          ]}, { label: '宽松', rules: [
-                            { match: { status: [429] }, duration: 60 },
-                            { match: { status: [401, 403] }, duration: -1 },
-                          ]}].map(tpl => (
-                            <button
-                              key={tpl.label}
-                              type="button"
-                              onClick={() => updatePreference('key_rules', tpl.rules)}
-                              className="text-[10px] font-medium px-2 py-1 rounded bg-muted hover:bg-muted/80 text-muted-foreground hover:text-foreground transition-colors"
-                            >
-                              {tpl.label}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                      <p className="text-xs text-muted-foreground mb-3">
-                        按顺序匹配，首条命中生效。Key 处理：冷却=暂时停用，永久禁用=需手动恢复。重试：自动=沿用内置逻辑(4xx不重试，5xx/429重试)，换Key=强制用其他Key重试，报错=跳过重试直接返回客户端。
-                      </p>
-
-                      {/* 规则列表 */}
-                      {/* 修改原因：旧版 Key Rules 使用序号列和两行卡片，导致规则区域过高且条件与动作被割裂。 */}
-                      {/* 修改方式：改为桌面端单行、移动端两行的紧凑列表，并用底部分隔线替代卡片背景。 */}
-                      {/* 目的：保留原有编辑、重试三态和 remap 折叠功能，同时减少纵向空间占用。 */}
-                      <div className="space-y-1">
-                        {(formData.preferences.key_rules || []).map((rule: any, idx: number) => {
-                          const rules = formData.preferences.key_rules || [];
-                          const replaceRule = (r: any) => { const n = [...rules]; n[idx] = r; updatePreference('key_rules', n); };
-                          const updateRule = (p: any) => replaceRule({ ...rules[idx], ...p });
-                          const clearField = (f: 'remap' | 'retry') => { const r = { ...rules[idx] }; delete r[f]; replaceRule(r); };
-                          const removeRule = () => updatePreference('key_rules', rules.filter((_: any, i: number) => i !== idx));
-                          const mt = rule.match === 'default' ? 'default' : rule.match?.keyword ? 'keyword' : 'status';
-                          const retryMode = getKeyRuleRetryMode(rule);
-                          const durationMode = rule.duration === -1 ? '-1' : Number(rule.duration) > 0 ? 'cd' : '0';
-                          const controlClass = 'h-6 bg-background border border-border rounded px-1 py-0 text-[11px] leading-none text-foreground';
-                          const inputClass = `${controlClass} font-mono`;
-                          const retryOptions: [KeyRuleRetryMode, string, string][] = [['default', '自动', '沿用内置重试逻辑'], ['force', '换Key', '强制用其他Key重试'], ['disable', '报错', '跳过重试直接返回']];
-                          return (
-                            <div key={idx} className="border-b border-border py-1 text-[11px]">
-                              <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-1 sm:flex-nowrap">
-                                <div className="flex min-w-0 items-center gap-1 sm:shrink-0">
-                                  <select value={mt} onChange={e => { const v = e.target.value; if (v === 'default') updateRule({ match: 'default' }); else if (v === 'status') updateRule({ match: { status: [429] } }); else updateRule({ match: { keyword: [''] } }); }} className={`${controlClass} w-[64px] sm:w-[66px]`}>
-                                    <option value="status">状态码</option>
-                                    <option value="keyword">关键词</option>
-                                    <option value="default">default</option>
-                                  </select>
-                                  {mt === 'status' && <DeferredInput inputMode="numeric" value={formatKeyRuleStatusInput(rule.match?.status)} onCommit={v => updateRule({ match: { status: parseKeyRuleStatusInput(v) } })} placeholder="429" className={`${inputClass} w-[68px]`} />}
-                                  {mt === 'keyword' && <DeferredInput value={formatKeyRuleKeywordsInput(rule.match?.keyword)} onCommit={v => updateRule({ match: { keyword: parseKeyRuleKeywordsInput(v) } })} placeholder="quota, rate limit" className={`${inputClass} w-[110px] sm:w-[118px]`} />}
-                                  <button type="button" onClick={removeRule} className="ml-auto inline-flex h-6 w-6 items-center justify-center text-red-500/60 hover:text-red-500 sm:hidden" title="删除"><X className="h-3 w-3" /></button>
-                                </div>
-                                <span className="hidden h-5 w-px bg-border sm:block" aria-hidden="true" />
-                                <div className="flex min-w-0 flex-wrap items-center gap-1 sm:flex-1 sm:flex-nowrap">
-                                  <select value={durationMode} onChange={e => { const v = e.target.value; if (v === '-1') updateRule({ duration: -1 }); else if (v === '0') updateRule({ duration: 0 }); else updateRule({ duration: Number(rule.duration) > 0 ? Number(rule.duration) : 60 }); }} className={`${controlClass} w-[72px]`}>
-                                    <option value="cd">冷却</option>
-                                    <option value="-1">永久禁用</option>
-                                    <option value="0">不处理</option>
-                                  </select>
-                                  {Number(rule.duration) > 0 && <><input type="number" min={1} value={rule.duration} onChange={e => updateRule({ duration: Math.max(1, parseInt(e.target.value, 10) || 1) })} className={`${inputClass} w-[46px]`} /><span className="text-[10px] text-muted-foreground">s</span></>}
-                                  <div className="inline-flex h-6 overflow-hidden rounded border border-border" title="重试控制">
-                                    {retryOptions.map(([v, l, tip]) => (
-                                      <button key={v} type="button" title={tip} onClick={() => replaceRule(setKeyRuleRetryMode(rule, v))} className={`px-1.5 text-[10px] leading-none transition-colors ${retryMode === v ? v === 'force' ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-semibold' : v === 'disable' ? 'bg-red-500/15 text-red-600 dark:text-red-400 font-semibold' : 'bg-muted text-muted-foreground font-semibold' : 'text-muted-foreground hover:bg-muted/50 hover:text-foreground'}`}>{l}</button>
-                                    ))}
-                                  </div>
-                                  {rule.remap != null ? (<span className="inline-flex h-6 items-center gap-0.5"><span className="text-[10px] text-muted-foreground">↔</span><input type="number" min={100} max={599} value={rule.remap} onChange={e => { const raw = e.target.value.trim(); if (!raw) clearField('remap'); else updateRule({ remap: raw }); }} placeholder="码" title="错误码映射" className={`${inputClass} w-[42px]`} /><button type="button" onClick={() => clearField('remap')} className="inline-flex h-6 w-4 items-center justify-center text-[10px] text-muted-foreground hover:text-foreground" title="移除映射">×</button></span>) : (<button type="button" onClick={() => updateRule({ remap: '' })} className="inline-flex h-6 w-6 items-center justify-center rounded border border-transparent text-[11px] text-muted-foreground hover:border-border hover:text-foreground" title="添加错误码映射">↔</button>)}
-                                </div>
-                                <button type="button" onClick={removeRule} className="ml-auto hidden h-6 w-6 shrink-0 items-center justify-center text-red-500/60 hover:text-red-500 sm:inline-flex" title="删除"><X className="h-3 w-3" /></button>
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-
-                      {/* 添加规则 */}
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const rules = formData.preferences.key_rules || [];
-                          updatePreference('key_rules', [...rules, { match: { status: [429] }, duration: 30 }]);
-                        }}
-                        className="text-xs text-primary hover:text-primary/80 flex items-center gap-1 mt-2"
-                      >
-                        <Plus className="w-3 h-3" /> 添加规则
-                      </button>
-                    </div>
                   </div>
                 </section>}
 
@@ -1263,6 +1172,9 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                           return { ...prev, preferences: { ...prev.preferences, enabled_plugins: plugins } };
                         });
                       }}
+                      onSystemPromptChange={(v) => updatePreference('system_prompt', v)}
+                      keyRules={formData.preferences.key_rules || []}
+                      onKeyRulesChange={(rules) => updatePreference('key_rules', rules)}
                       formatJsonOnBlur={formatJsonOnBlur}
                     />
 
@@ -1309,10 +1221,6 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                           })}
                         </div>
                       </div>
-                    </div>
-                    <div>
-                      <label className="text-sm font-medium text-foreground mb-1.5 block">系统提示词 (System Prompt)</label>
-                      <textarea value={formData.preferences.system_prompt || ''} onChange={e => updatePreference('system_prompt', e.target.value)} rows={3} className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground" />
                     </div>
                     <div className="flex items-center justify-between p-3 bg-muted/50 rounded-lg border border-border">
                       <span className="text-sm text-foreground">启用 Tools (函数调用)</span>

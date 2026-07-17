@@ -522,6 +522,7 @@ async def responses_handler(
         dialect_id="openai-responses",
         original_payload=native_body,
         original_headers=dict(request.headers),
+        raw_request=request,
     )
 
 
@@ -565,6 +566,7 @@ async def responses_subpath_handler(
         dialect_id="openai-responses",
         original_payload=native_body,
         original_headers=dict(request.headers),
+        raw_request=request,
         passthrough_only=True,
     )
 

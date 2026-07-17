@@ -114,7 +114,7 @@ CLAUDE_CODE_ANTHROPIC_BETA = (
     "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,"
     "context-management-2025-06-27,prompt-caching-scope-2026-01-05,"
     "structured-outputs-2025-12-15,fast-mode-2026-02-01,"
-    "redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
+    "token-efficient-tools-2026-03-28"
 )
 
 # 修改原因：CPA 在 refresh 遇到 429 时会按 refresh_token 记录 Retry-After 阻塞窗口。

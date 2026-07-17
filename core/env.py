@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+# 修改原因：当前部署的 python3 是 3.8，运行时会执行 set[str] 这类新式类型标注并导致导入失败。
+# 修改方式：启用 postponed annotations，让类型标注延迟为字符串，不改变 env_bool 的运行逻辑。
+# 目的：确保用户要求的 python3 导入验证可以通过，并保持对较新 Python 的兼容性。
 import os
 from typing import Final
 

@@ -2,7 +2,7 @@
 Moderations 路由
 """
 
-from fastapi import APIRouter, Depends, BackgroundTasks
+from fastapi import APIRouter, Depends, BackgroundTasks, Request
 
 from core.models import ModerationRequest
 from routes.deps import rate_limit_dependency, verify_api_key, get_model_handler
@@ -12,6 +12,7 @@ router = APIRouter()
 
 @router.post("/v1/moderations", dependencies=[Depends(rate_limit_dependency)])
 async def moderations(
+    http_request: Request,
     request: ModerationRequest,
     background_tasks: BackgroundTasks,
     api_index: int = Depends(verify_api_key)

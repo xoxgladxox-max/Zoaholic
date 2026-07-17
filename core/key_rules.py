@@ -188,7 +188,7 @@ def resolve_key_rules(preferences: Dict[str, Any]) -> List[dict]:
     # ── 全部为空：使用硬编码默认规则 ──
     return _normalize_rules([
         {"match": {"status": [401, 403]}, "duration": -1},
-        {"match": "default", "duration": 3},
+        {"match": "default", "duration": 60},
     ])
 
 

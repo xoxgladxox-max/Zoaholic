@@ -85,8 +85,16 @@ export interface PluginOption {
   version: string;
   description: string;
   enabled: boolean;
+  // 修改原因：后端新增 channel_inbound、channel_outbound 和 key_outbound 阶段，插件类型需要包含完整阶段字段。
+  // 修改方式：在旧 request/response 字段之外增加新阶段数组，并保留 metadata 兼容插件参数 schema。
+  // 目的：让渠道编辑器、完整配置面板和 Pipeline 共享同一份插件能力结构。
+  inbound_interceptors?: any[];
+  channel_inbound_interceptors?: any[];
   request_interceptors: any[];
   response_interceptors: any[];
+  channel_outbound_interceptors?: any[];
+  key_outbound_interceptors?: any[];
+  balance_enrichers?: any[];
   metadata?: any;
 }
 

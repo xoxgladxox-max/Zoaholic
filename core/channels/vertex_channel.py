@@ -11,6 +11,7 @@ import copy
 import time
 import base64
 import asyncio
+import os
 import httpx
 from datetime import datetime
 
@@ -34,7 +35,7 @@ from ..response_context import mark_adapter_metrics_managed, mark_content_start,
 from ..stream_utils import aiter_decoded_lines
 from ..usage import extract_cache_usage
 from ..file_utils import extract_base64_data
-from .claude_channel import gpt2claude_tools_json
+from .claude_channel import gpt2claude_tools_json, fetch_claude_response_stream
 from core.oauth.providers.base import OAuthProvider
 
 
@@ -171,7 +172,11 @@ async def get_access_token(client_email, private_key):
     """获取 Vertex AI 访问令牌"""
     jwt = await asyncio.to_thread(create_jwt, client_email, private_key)
 
-    async with httpx.AsyncClient() as client:
+    # 修改原因：服务账号 JWT 换取 Google access_token 时直接访问 oauth2.googleapis.com，代理环境下裸连容易超时。
+    # 修改方式：按常见大小写环境变量读取 HTTPS_PROXY 或 HTTP_PROXY，并传给 httpx 的单数 proxy 参数。
+    # 目的：无代理环境传 None 保持原行为，有代理环境时 token 请求可以正常通过代理访问 Google。
+    proxy_url = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy') or os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')
+    async with httpx.AsyncClient(proxy=proxy_url) as client:
         response = await client.post(
             "https://oauth2.googleapis.com/token",
             data={
@@ -1133,7 +1138,10 @@ def register():
         description="Google Vertex AI (Claude)",
         request_adapter=get_vertex_claude_payload,
         response_adapter=fetch_vertex_claude_response,
-        stream_adapter=fetch_vertex_claude_response_stream,
+        # 修改原因：Vertex Claude streamRawPredict 返回标准 Anthropic SSE，不是 Vertex Gemini 的逐行 JSON 流。
+        # 修改方式：注册时直接复用 claude_channel.fetch_claude_response_stream；旧函数保留但不再作为适配器使用。
+        # 目的：正确解析 message_start、content_block_delta、message_delta 等 Claude SSE 事件。
+        stream_adapter=fetch_claude_response_stream,
         models_adapter=fetch_vertex_claude_models,
         oauth_provider=VertexProvider(),
         ui_slots={

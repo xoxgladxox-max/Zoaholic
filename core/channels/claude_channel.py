@@ -24,6 +24,7 @@ from ..response_context import mark_adapter_metrics_managed, mark_content_start,
 from ..stream_utils import aiter_decoded_lines
 from ..usage import extract_cache_usage
 from ..file_utils import extract_base64_data
+from ..log_config import logger
 
 
 # ============================================================
