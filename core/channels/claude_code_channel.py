@@ -3,12 +3,12 @@
 本文件自包含 Claude Code OAuth provider、渠道注册和响应头额度采集逻辑。
 复用 claude_channel 的 request/response adapter，只处理 OAuth 认证和额度采集。
 
-OAuth 流程参考 CLIProxyAPI (CPA) 的 internal/auth/claude/ 实现：
+OAuth 流程参考 sub2api 的 internal/pkg/oauth/ 实现：
 - Auth URL: https://claude.ai/oauth/authorize
-- Token URL: https://api.anthropic.com/v1/oauth/token
+- Token URL: https://platform.claude.com/v1/oauth/token
 - Client ID: 9d1c250a-e61b-44d9-88ed-5944d1962f5e
-- Redirect: http://localhost:54545/callback
-- Scope: user:profile user:inference user:sessions:claude_code ...
+- Redirect: https://platform.claude.com/oauth/code/callback
+- Scope: org:create_api_key user:profile user:inference user:sessions:claude_code ...
 - PKCE: S256
 - Token exchange/refresh 用 JSON body（不是 form-urlencoded）
 """
@@ -45,16 +45,24 @@ _oauth_manager = None
 
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 AUTH_URL = "https://claude.ai/oauth/authorize"
-DEFAULT_TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
-DEFAULT_REDIRECT_URI = "http://localhost:54545/callback"
-SCOPES = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+# 修改原因：Anthropic 已将 OAuth token 端点从 api.anthropic.com 迁移到 platform.claude.com，旧地址返回 405。
+# 修改方式：对齐 sub2api 的 oauth.TokenURL 和 oauth.RedirectURI。
+# 目的：修复 CC OAuth 登录 token exchange 405 报错。
+DEFAULT_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+DEFAULT_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
+SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 
 DEFAULT_BASE_URL = "https://api.anthropic.com"
 
 CLAUDE_REFRESH_MIN_BACKOFF = 5
 CLAUDE_REFRESH_MAX_BACKOFF = 300
 CLAUDE_REFRESH_MAX_RETRIES = 3
-CLAUDE_CODE_USER_AGENT = "claude-code/2.1.97"
+# 修改原因：Anthropic 会根据 User-Agent 的产品名+版本号判定是否为官方 CLI 请求，
+#   旧值 claude-code/2.1.97 已被识别为第三方。
+# 修改方式：对齐 sub2api constants.go 中 CLICurrentVersion 和 DefaultHeaders["User-Agent"]。
+# 目的：降低被判定 third-party 而走 extra usage 的概率。
+CLAUDE_CODE_CLI_VERSION = "2.1.161"
+CLAUDE_CODE_USER_AGENT = f"claude-cli/{CLAUDE_CODE_CLI_VERSION} (external, cli)"
 
 # ── Session ID 缓存（per api_key，1 小时 TTL） ──
 _session_id_cache: dict[str, tuple[str, float]] = {}
@@ -110,11 +118,14 @@ def _strip_gateway_headers(headers: dict) -> dict:
         k: v for k, v in headers.items()
         if not any(k.lower().startswith(p) for p in _GATEWAY_HEADER_PREFIXES)
     }
+# 修改原因：anthropic-beta 头的完整集合是 Anthropic 判定请求来源的关键维度之一，
+#   缺少任何"官方 CLI 请求才带"的 beta 都会被降级到第三方额度。
+# 修改方式：对齐 sub2api FullClaudeCodeMimicryBetas() 的完整列表及顺序。
+# 目的：确保与真实 Claude Code CLI 流量一致，避免 third-party 降级。
 CLAUDE_CODE_ANTHROPIC_BETA = (
     "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,"
-    "context-management-2025-06-27,prompt-caching-scope-2026-01-05,"
-    "structured-outputs-2025-12-15,fast-mode-2026-02-01,"
-    "token-efficient-tools-2026-03-28"
+    "prompt-caching-scope-2026-01-05,effort-2025-11-24,"
+    "context-management-2025-06-27,extended-cache-ttl-2025-04-11"
 )
 
 # 修改原因：CPA 在 refresh 遇到 429 时会按 refresh_token 记录 Retry-After 阻塞窗口。
@@ -300,9 +311,9 @@ class ClaudeCodeProvider(OAuthProvider):
     4. 不需要 id_token 解析（邮箱直接在 account.email_address 里）
     """
 
-    # 修改原因：CPA 的 Claude Code OAuth redirect_uri 固定为 localhost:54545/callback，路由层会读取这个字段。
-    # 修改方式：在 provider 上显式声明手动模式回调地址，避免落回 OAuthProvider 基类的 localhost:8080/callback。
-    # 目的：保证授权 URL 和 token exchange 使用 Anthropic 白名单内的固定回调地址。
+    # 修改原因：Anthropic OAuth 回调地址已迁移到 platform.claude.com/oauth/code/callback，不再用 localhost。
+    # 修改方式：声明新的回调地址，路由层读取后传给 authorize 和 exchange 两步。
+    # 目的：保证与 Anthropic 白名单一致。
     localhost_redirect_uri = DEFAULT_REDIRECT_URI
 
     @property
@@ -407,7 +418,7 @@ class ClaudeCodeProvider(OAuthProvider):
             "Authorization": f"Bearer {access_token}",
             "anthropic-beta": "oauth-2025-04-20",
             "Content-Type": "application/json",
-            "User-Agent": "claude-code/2.1.97",
+            "User-Agent": CLAUDE_CODE_USER_AGENT,
         }
         try:
             async with httpx.AsyncClient(timeout=15) as client:
@@ -511,7 +522,8 @@ class ClaudeCodeProvider(OAuthProvider):
         token_url = self._resolve_token_url(config)
         headers = {
             "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": "axios/1.13.6",
         }
         attempts = CLAUDE_REFRESH_MAX_RETRIES if refresh_token else 1
         last_error: Exception | None = None
@@ -781,7 +793,7 @@ _CC_TOOL_STUBS: list[dict] = [
 _BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
 _BILLING_SALT = "59cf53e54c78"
 _BILLING_SAMPLE_INDEXES = (4, 7, 20)
-_BILLING_CC_VERSION = "2.1.97"
+_BILLING_CC_VERSION = CLAUDE_CODE_CLI_VERSION
 _BILLING_ENTRYPOINT = "cli"
 
 
@@ -824,9 +836,13 @@ def _build_billing_header(messages: list, version: str = "", entrypoint: str = "
     digest = hashlib.sha256(
         f"{_BILLING_SALT}{sampled}{ver}".encode()
     ).hexdigest()[:3]
+    # 修改原因：新版 Claude Code CLI 已取消 cch=... 签名字段（sub2api issue #3358），
+    #   继续注入它反而会让伪装请求偏离真实 CLI 流量。
+    # 修改方式：移除 cch=00000 字段，仅保留 cc_version + cc_entrypoint。
+    # 目的：与真实 CLI 流量一致。
     return (
         f"{_BILLING_HEADER_PREFIX} cc_version={ver}.{digest}; "
-        f"cc_entrypoint={ep}; cch=00000;"
+        f"cc_entrypoint={ep};"
     )
 
 
@@ -859,37 +875,60 @@ def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None) -> di
     # 目的：保证本次请求只使用本次 sanitize 产生的反向映射。
     _reset_reverse_maps()
 
-    # ── Layer 1: 确保 billing header 存在 ──
+    # ── Layer 1: system prompt 重写（对齐 sub2api gateway_claude_oauth_body.go） ──
+    # 修改原因：Anthropic 通过 system 块的结构和内容判定是否为真实 CLI 请求，
+    #   把用户自定义 system prompt 直接放在 system 里会被识别为第三方。
+    # 修改方式：
+    #   1) system 块替换为 [billing_block, CC身份前缀]——与真实 CLI 一致
+    #   2) 原始 system prompt 转移到 messages 开头作为 user/assistant 对注入
+    # 目的：让模型仍能收到完整指令，同时 system 块形态与真实 CLI 一致。
+    _CC_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
     system = payload.get("system")
-    if not _has_billing_header(system):
-        # 从请求头 UA 动态解析版本号和 entrypoint
-        _ua = ""
-        if headers:
-            _ua_key, _ua_val = _get_header_case_insensitive(headers, "User-Agent")
-            _ua = str(_ua_val or "")
-        billing_text = _build_billing_header(
-            payload.get("messages", []),
-            version=_parse_version_from_ua(_ua),
-            entrypoint=_parse_entrypoint_from_ua(_ua),
-        )
-        billing_block = {"type": "text", "text": billing_text}
-        if system is None:
-            payload["system"] = [
-                billing_block,
-                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
-            ]
-        elif isinstance(system, str):
-            payload["system"] = [
-                billing_block,
-                {"type": "text", "text": system},
-            ] if system.strip() else [billing_block]
-        elif isinstance(system, list):
-            payload["system"] = [billing_block, *system]
-        else:
-            payload["system"] = [billing_block, system]
+    _ua = ""
+    if headers:
+        _ua_key, _ua_val = _get_header_case_insensitive(headers, "User-Agent")
+        _ua = str(_ua_val or "")
+    billing_text = _build_billing_header(
+        payload.get("messages", []),
+        version=_parse_version_from_ua(_ua),
+        entrypoint=_parse_entrypoint_from_ua(_ua),
+    )
+    billing_block = {"type": "text", "text": billing_text}
+    cc_identity_block = {"type": "text", "text": _CC_IDENTITY}
+
+    # 提取原始 system prompt 文本
+    original_system_text = ""
+    if isinstance(system, str):
+        original_system_text = system.strip()
+    elif isinstance(system, list):
+        parts = []
+        for blk in system:
+            if isinstance(blk, dict):
+                t = (blk.get("text") or "").strip()
+                if t and not t.startswith(_BILLING_HEADER_PREFIX) and t != _CC_IDENTITY:
+                    parts.append(t)
+            elif isinstance(blk, str) and blk.strip():
+                parts.append(blk.strip())
+        original_system_text = "\n\n".join(parts)
+
+    # 替换 system 为官方形态
+    payload["system"] = [billing_block, cc_identity_block]
+
+    # 原始 system prompt 转移到 messages 开头
+    if original_system_text and original_system_text != _CC_IDENTITY:
+        injection_pair = [
+            {"role": "user", "content": [{"type": "text", "text": f"[System Instructions]\n{original_system_text}"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Understood. I will follow these instructions."}]},
+        ]
+        messages = payload.get("messages", [])
+        payload["messages"] = injection_pair + (messages if isinstance(messages, list) else [])
 
     # ── Layer 3: Tool name 重命名 ──
-    # 收集本次请求实际发生的重命名，用于 messages 历史中的一致替换
+    # 修改原因：原有的 _TOOL_RENAME_MAP 只覆盖了40个通用名，Clonoth 等客户端特有的
+    #   snake_case 工具名（list_dir, save_memory, discord_manage 等）不在映射表中，
+    #   原样发给上游会被 Anthropic 判定为第三方。
+    # 修改方式：先查映射表，未命中且包含下划线的名称自动转 PascalCase。
+    # 目的：确保所有工具名都以 PascalCase 形式发往上游，响应侧再反向还原。
     renamed: dict[str, str] = {}
     tools = payload.get("tools")
     if isinstance(tools, list):
@@ -898,8 +937,17 @@ def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None) -> di
                 name = tool.get("name", "")
                 lower = name.lower()
                 if lower in _TOOL_RENAME_MAP and name != _TOOL_RENAME_MAP[lower]:
-                    renamed[name] = _TOOL_RENAME_MAP[lower]
-                    tool["name"] = _TOOL_RENAME_MAP[lower]
+                    new_name = _TOOL_RENAME_MAP[lower]
+                    renamed[name] = new_name
+                    tool["name"] = new_name
+                elif "_" in name or "-" in name:
+                    # 自动 snake_case/kebab-case → PascalCase
+                    new_name = "".join(
+                        seg.capitalize() for seg in name.replace("-", "_").split("_") if seg
+                    )
+                    if new_name and new_name != name:
+                        renamed[name] = new_name
+                        tool["name"] = new_name
 
     # messages 中的 tool_use / tool_result 也要同步重命名
     if renamed:
@@ -1084,11 +1132,26 @@ def _apply_claude_code_headers(headers: dict, api_key: str | None) -> None:
     if _get_header_case_insensitive(headers, "x-client-request-id")[0] is None:
         headers["x-client-request-id"] = str(uuid.uuid4())
 
-    # X-Stainless SDK 头 — 模拟 Node.js/@anthropic-ai/sdk
+    # anthropic-version — 固定值，官方 CLI 始终携带
+    if _get_header_case_insensitive(headers, "anthropic-version")[0] is None:
+        headers["anthropic-version"] = "2023-06-01"
+
+    # Anthropic-Dangerous-Direct-Browser-Access — 官方 CLI 固定携带
+    if _get_header_case_insensitive(headers, "Anthropic-Dangerous-Direct-Browser-Access")[0] is None:
+        headers["Anthropic-Dangerous-Direct-Browser-Access"] = "true"
+
+    # X-Stainless SDK 头 — 完整模拟 Node.js/@anthropic-ai/sdk 指纹
+    # 修改原因：sub2api 注入 8 个 X-Stainless 头，我们之前只有 4 个，缺失的头会被判第三方。
+    # 修改方式：对齐 sub2api DefaultHeaders 的完整列表。
+    # 目的：请求头指纹与真实 Claude CLI 流量一致。
     for hdr, val in [
         ("X-Stainless-Retry-Count", "0"),
         ("X-Stainless-Runtime", "node"),
+        ("X-Stainless-Runtime-Version", "v24.3.0"),
         ("X-Stainless-Lang", "js"),
+        ("X-Stainless-Package-Version", "0.94.0"),
+        ("X-Stainless-OS", "Linux"),
+        ("X-Stainless-Arch", "arm64"),
         ("X-Stainless-Timeout", "600"),
     ]:
         if _get_header_case_insensitive(headers, hdr)[0] is None:

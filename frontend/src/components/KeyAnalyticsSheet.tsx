@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   X, RefreshCw, Activity, BarChart3, AlertCircle,
   ChevronDown, ChevronUp, Globe, Box
@@ -43,11 +43,56 @@ interface SummaryResponse {
   data?: SummaryData[];
 }
 
+interface IpQuotaSummary {
+  remaining_ratio: number;
+  exhausted: boolean;
+  rule_count: number;
+  bucket_count: number;
+  label?: string;
+  measure?: string;
+  current?: number;
+  limit?: number;
+  remaining?: number;
+}
+
+interface QuotaLimitStatus {
+  measure: string;
+  aggregate: string;
+  current: number;
+  limit: number;
+  remaining: number;
+  remaining_ratio: number;
+  period: number | string;
+  window: string;
+  label: string;
+  reset_at?: number;
+}
+
+interface QuotaBucketStatus {
+  dimensions: Record<string, string>;
+  current: number;
+  limit: number;
+  remaining: number;
+  remaining_ratio: number;
+  limits: QuotaLimitStatus[];
+}
+
+interface QuotaRuleStatus {
+  id: string;
+  group_by: string[];
+  where: Record<string, string>;
+  measure: string;
+  aggregate: string;
+  label?: string;
+  buckets: QuotaBucketStatus[];
+}
+
 interface IpEntry {
   ip?: string | null;
   request_count: number;
   last_used?: string | null;
   blocked?: boolean;
+  quota_summary?: IpQuotaSummary | null;
 }
 
 interface ModelEntry {
@@ -57,6 +102,26 @@ interface ModelEntry {
   completion_tokens: number;
   total_tokens?: number;
   cost: number;
+}
+
+interface IpTrendEntry {
+  timestamp: string;
+  request_count: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost: number;
+}
+
+interface IpDetail {
+  ip: string;
+  request_count: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost: number;
+  last_used?: string | null;
+  model_distribution: ModelEntry[];
+  trend: IpTrendEntry[];
+  quota_rules: QuotaRuleStatus[];
 }
 
 interface TrendEntry {
@@ -160,11 +225,36 @@ const getSuccessRateColor = (value: number | null) => {
   return 'text-red-600 dark:text-red-500';
 };
 
+const QUOTA_MEASURE_LABELS: Record<string, string> = {
+  request: '请求次数',
+  cost: '金额',
+  token: '总 Token',
+  token_in: '输入 Token',
+  token_out: '输出 Token',
+  ip: '不同 IP 数',
+};
+
+const formatQuotaValue = (measure: string, value: number) => (
+  measure === 'cost' ? formatCost(value) : formatTokens(value)
+);
+
+const formatQuotaReset = (timestamp?: number) => {
+  if (!timestamp) return '';
+  const date = new Date(timestamp * 1000);
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleString();
+};
+
 const getModelTokens = (entry: ModelEntry) => {
   const explicitTotal = toNumber(entry.total_tokens);
   if (explicitTotal > 0) return explicitTotal;
   return toNumber(entry.prompt_tokens) + toNumber(entry.completion_tokens);
 };
+
+const normalizeIpTrendData = (rows: IpTrendEntry[]): TrendPoint[] => rows.map(row => ({
+  timestamp: row.timestamp,
+  requests: toNumber(row.request_count),
+  tokens: toNumber(row.prompt_tokens) + toNumber(row.completion_tokens),
+}));
 
 const normalizeTrendData = (rows: TrendEntry[]) => {
   // 修改原因：详情接口当前按时间和模型返回趋势，后续也可能直接返回包含 Token 的时间桶。
@@ -209,6 +299,10 @@ export function KeyAnalyticsSheet({ open, onOpenChange, apiKeyValue, apiKeyName 
   const [trendData, setTrendData] = useState<TrendPoint[]>([]);
   const [errorData, setErrorData] = useState<ErrorEntry[]>([]);
   const [errorsExpanded, setErrorsExpanded] = useState(false);
+  const [expandedIp, setExpandedIp] = useState<string | null>(null);
+  const [ipDetails, setIpDetails] = useState<Record<string, IpDetail>>({});
+  const [ipDetailLoading, setIpDetailLoading] = useState<string | null>(null);
+  const [ipDetailErrors, setIpDetailErrors] = useState<Record<string, string>>({});
 
   const displayName = apiKeyName || (apiKeyValue ? `${apiKeyValue.slice(0, 8)}...${apiKeyValue.slice(-4)}` : '—');
 
@@ -225,6 +319,10 @@ export function KeyAnalyticsSheet({ open, onOpenChange, apiKeyValue, apiKeyName 
     setTrendData([]);
     setErrorData([]);
     setErrorsExpanded(false);
+    setExpandedIp(null);
+    setIpDetails({});
+    setIpDetailLoading(null);
+    setIpDetailErrors({});
 
     try {
       const hash = await keyHash(apiKeyValue);
@@ -257,6 +355,47 @@ export function KeyAnalyticsSheet({ open, onOpenChange, apiKeyValue, apiKeyName 
       setLoading(false);
     }
   }, [apiKeyValue, timeRange]);
+
+  const toggleIpDetail = useCallback(async (ip?: string | null) => {
+    if (!ip) return;
+    if (expandedIp === ip) {
+      setExpandedIp(null);
+      return;
+    }
+
+    setExpandedIp(ip);
+    if (ipDetails[ip] || ipDetailLoading === ip) return;
+
+    setIpDetailLoading(ip);
+    setIpDetailErrors(prev => {
+      const next = { ...prev };
+      delete next[ip];
+      return next;
+    });
+    try {
+      const hash = await keyHash(apiKeyValue);
+      const granularity = timeRange > 48 ? 'day' : 'hour';
+      const params = new URLSearchParams({
+        ip,
+        hours: String(timeRange),
+        granularity,
+      });
+      const response = await apiFetch(`/v1/stats/key_analytics/${hash}/ip?${params.toString()}`);
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.detail || `HTTP ${response.status}`);
+      }
+      const detail = await response.json() as IpDetail;
+      setIpDetails(prev => ({ ...prev, [ip]: detail }));
+    } catch (error) {
+      setIpDetailErrors(prev => ({
+        ...prev,
+        [ip]: error instanceof Error ? error.message : '加载失败',
+      }));
+    } finally {
+      setIpDetailLoading(current => current === ip ? null : current);
+    }
+  }, [apiKeyValue, expandedIp, ipDetailLoading, ipDetails, timeRange]);
 
   useEffect(() => {
     if (open && apiKeyValue) {
@@ -441,17 +580,174 @@ export function KeyAnalyticsSheet({ open, onOpenChange, apiKeyValue, apiKeyName 
                       <tr>
                         <th className="px-4 py-2.5">IP</th>
                         <th className="px-4 py-2.5 text-right">请求量</th>
+                        <th className="px-4 py-2.5 text-right">实时配额</th>
                         <th className="px-4 py-2.5 text-right">最近使用</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-border">
-                      {ipData.map((entry, i) => (
-                        <tr key={`${entry.ip || 'unknown'}-${i}`} className={`hover:bg-muted/50 transition-colors ${entry.blocked ? 'bg-red-500/5' : ''}`}>
-                          <td className="px-4 py-2.5 font-mono text-xs text-foreground">{entry.ip || '—'}</td>
-                          <td className="px-4 py-2.5 text-right text-muted-foreground">{toNumber(entry.request_count).toLocaleString()}</td>
-                          <td className="px-4 py-2.5 text-right text-xs text-muted-foreground whitespace-nowrap">{formatDateTime(entry.last_used)}</td>
-                        </tr>
-                      ))}
+                      {ipData.map((entry, i) => {
+                        const ip = entry.ip || '';
+                        const isExpanded = Boolean(ip) && expandedIp === ip;
+                        const detail = ip ? ipDetails[ip] : undefined;
+                        const detailTrend = detail ? normalizeIpTrendData(detail.trend || []) : [];
+                        return (
+                          <Fragment key={`${entry.ip || 'unknown'}-${i}`}>
+                            <tr className={`hover:bg-muted/50 transition-colors ${entry.blocked ? 'bg-red-500/5' : ''}`}>
+                              <td className="px-4 py-2.5">
+                                <button
+                                  type="button"
+                                  onClick={() => void toggleIpDetail(entry.ip)}
+                                  disabled={!ip}
+                                  aria-expanded={isExpanded}
+                                  className="flex items-center gap-2 font-mono text-xs text-foreground disabled:cursor-default"
+                                >
+                                  {ip && (isExpanded
+                                    ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />
+                                    : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />)}
+                                  {entry.ip || '—'}
+                                </button>
+                              </td>
+                              <td className="px-4 py-2.5 text-right text-muted-foreground">{toNumber(entry.request_count).toLocaleString()}</td>
+                              <td className="px-4 py-2.5 text-right">
+                                {entry.quota_summary ? (
+                                  <div className="ml-auto w-24" title={`${entry.quota_summary.current || 0}/${entry.quota_summary.limit || 0}`}>
+                                    <div className="mb-1 flex items-center justify-end gap-1 text-[10px] text-muted-foreground">
+                                      <span className={entry.quota_summary.exhausted ? 'text-red-500' : ''}>{Math.round(toNumber(entry.quota_summary.remaining_ratio) * 100)}%</span>
+                                      <span>· {entry.quota_summary.rule_count} 规则</span>
+                                    </div>
+                                    <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+                                      <div
+                                        className={`h-full rounded-full ${entry.quota_summary.exhausted ? 'bg-red-500' : entry.quota_summary.remaining_ratio < 0.3 ? 'bg-amber-500' : 'bg-emerald-500'}`}
+                                        style={{ width: `${Math.max(1, toNumber(entry.quota_summary.remaining_ratio) * 100)}%` }}
+                                      />
+                                    </div>
+                                  </div>
+                                ) : <span className="text-[10px] text-muted-foreground">未配置</span>}
+                              </td>
+                              <td className="px-4 py-2.5 text-right text-xs text-muted-foreground whitespace-nowrap">{formatDateTime(entry.last_used)}</td>
+                            </tr>
+                            {isExpanded && (
+                              <tr className={entry.blocked ? 'bg-red-500/[0.03]' : 'bg-muted/20'}>
+                                <td colSpan={4} className="p-0">
+                                  <div className="border-t border-border px-4 py-4">
+                                    {ipDetailLoading === ip ? (
+                                      <div className="h-28 flex items-center justify-center text-xs text-muted-foreground">
+                                        <RefreshCw className="w-3.5 h-3.5 animate-spin mr-2" /> 正在加载 IP 明细
+                                      </div>
+                                    ) : ipDetailErrors[ip] ? (
+                                      <div className="h-20 flex items-center justify-center text-xs text-red-600 dark:text-red-500">
+                                        {ipDetailErrors[ip]}
+                                      </div>
+                                    ) : detail ? (
+                                      <div className="space-y-4">
+                                        {(detail.quota_rules || []).length > 0 && (
+                                          <div className="rounded-lg border border-primary/20 bg-primary/[0.03] p-3">
+                                            <div className="mb-2 flex items-center justify-between gap-2">
+                                              <div className="text-xs font-semibold text-foreground">当前窗口配额</div>
+                                              <div className="text-[10px] text-muted-foreground">不随历史时间范围变化</div>
+                                            </div>
+                                            <div className="space-y-2">
+                                              {detail.quota_rules.flatMap(rule => (rule.buckets || []).length > 0
+                                                ? rule.buckets.map((bucket, bucketIndex) => (
+                                                <div key={`${rule.id}-${bucketIndex}`} className="rounded-md border border-border bg-background p-2">
+                                                  <div className="mb-1.5 flex flex-wrap items-center gap-1.5 text-[10px]">
+                                                    <span className="font-medium text-foreground">{rule.label || QUOTA_MEASURE_LABELS[rule.measure] || rule.measure}</span>
+                                                    {Object.entries(bucket.dimensions || {}).map(([dimension, value]) => (
+                                                      <span key={dimension} className="rounded bg-muted px-1.5 py-0.5 font-mono text-muted-foreground">{dimension}={value}</span>
+                                                    ))}
+                                                    <span className="ml-auto text-muted-foreground">{rule.aggregate}</span>
+                                                  </div>
+                                                  <div className="space-y-1.5">
+                                                    {(bucket.limits || []).map((limit, limitIndex) => {
+                                                      const ratio = Math.max(0, Math.min(1, toNumber(limit.remaining_ratio)));
+                                                      return (
+                                                        <div key={limitIndex}>
+                                                          <div className="mb-1 flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+                                                            <span>{limit.label} · {limit.window === 'fixed' ? '固定窗口' : '滑动窗口'}{limit.reset_at ? ` · ${formatQuotaReset(limit.reset_at)} 刷新` : ''}</span>
+                                                            <span className="whitespace-nowrap">{formatQuotaValue(rule.measure, toNumber(limit.current))} / {formatQuotaValue(rule.measure, toNumber(limit.limit))}</span>
+                                                          </div>
+                                                          <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+                                                            <div className={`h-full rounded-full ${ratio <= 0 ? 'bg-red-500' : ratio < 0.3 ? 'bg-amber-500' : 'bg-emerald-500'}`} style={{ width: `${Math.max(1, ratio * 100)}%` }} />
+                                                          </div>
+                                                        </div>
+                                                      );
+                                                    })}
+                                                  </div>
+                                                </div>
+                                              ))
+                                                : [(
+                                                  <div key={`${rule.id}-empty`} className="rounded-md border border-border bg-background p-2 text-[10px] text-muted-foreground">
+                                                    <span className="font-medium text-foreground">{rule.label || QUOTA_MEASURE_LABELS[rule.measure] || rule.measure}</span>
+                                                    <span className="ml-2">当前窗口尚无分桶记录</span>
+                                                  </div>
+                                                )])}
+                                            </div>
+                                          </div>
+                                        )}
+                                        <div className="grid grid-cols-3 gap-2">
+                                          <div className="rounded-lg border border-border bg-background px-3 py-2">
+                                            <div className="text-[10px] text-muted-foreground">请求</div>
+                                            <div className="mt-0.5 text-sm font-semibold text-foreground">{toNumber(detail.request_count).toLocaleString()}</div>
+                                          </div>
+                                          <div className="rounded-lg border border-border bg-background px-3 py-2">
+                                            <div className="text-[10px] text-muted-foreground">Token</div>
+                                            <div className="mt-0.5 text-sm font-semibold text-foreground">{formatTokens(toNumber(detail.prompt_tokens) + toNumber(detail.completion_tokens))}</div>
+                                          </div>
+                                          <div className="rounded-lg border border-amber-500/20 bg-background px-3 py-2">
+                                            <div className="text-[10px] text-amber-600 dark:text-amber-400">费用</div>
+                                            <div className="mt-0.5 text-sm font-semibold text-amber-600 dark:text-amber-400">{formatCost(toNumber(detail.cost))}</div>
+                                          </div>
+                                        </div>
+
+                                        {detailTrend.length > 0 && (
+                                          <div className="h-36 rounded-lg border border-border bg-background p-2">
+                                            <ResponsiveContainer width="100%" height="100%">
+                                              <LineChart data={detailTrend} margin={{ top: 8, right: 8, bottom: 0, left: -20 }}>
+                                                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--muted))" vertical={false} />
+                                                <XAxis dataKey="timestamp" stroke={AXIS_COLOR} fontSize={9} tickFormatter={(value) => formatTrendTick(String(value), timeRange)} />
+                                                <YAxis yAxisId="requests" stroke={AXIS_COLOR} fontSize={9} />
+                                                <YAxis yAxisId="tokens" orientation="right" stroke={AXIS_COLOR} fontSize={9} tickFormatter={formatTokens} />
+                                                <Tooltip
+                                                  contentStyle={tooltipStyle}
+                                                  itemStyle={{ fontSize: '11px' }}
+                                                  labelStyle={{ fontSize: '11px', fontWeight: 'bold' }}
+                                                  labelFormatter={(value) => formatDateTime(String(value))}
+                                                  formatter={(value: number | string, name: string) => {
+                                                    const num = toNumber(value);
+                                                    return [name === 'Token' ? formatTokens(num) : num.toLocaleString(), name];
+                                                  }}
+                                                />
+                                                <Line yAxisId="requests" type="monotone" dataKey="requests" name="请求量" stroke={LINE_COLORS[0]} strokeWidth={1.75} dot={false} connectNulls />
+                                                <Line yAxisId="tokens" type="monotone" dataKey="tokens" name="Token" stroke={LINE_COLORS[1]} strokeWidth={1.75} dot={false} connectNulls />
+                                              </LineChart>
+                                            </ResponsiveContainer>
+                                          </div>
+                                        )}
+
+                                        <div className="rounded-lg border border-border bg-background overflow-hidden">
+                                          <div className="grid grid-cols-[minmax(0,1fr)_64px_72px_78px] gap-2 bg-muted/60 px-3 py-2 text-[10px] text-muted-foreground">
+                                            <span>模型</span><span className="text-right">请求</span><span className="text-right">Token</span><span className="text-right">费用</span>
+                                          </div>
+                                          {detail.model_distribution.length > 0 ? detail.model_distribution.map((model, modelIndex) => (
+                                            <div key={`${model.model || 'unknown'}-${modelIndex}`} className="grid grid-cols-[minmax(0,1fr)_64px_72px_78px] gap-2 border-t border-border px-3 py-2 text-xs">
+                                              <span className="truncate font-mono text-foreground" title={model.model || ''}>{model.model || '—'}</span>
+                                              <span className="text-right text-muted-foreground">{toNumber(model.request_count).toLocaleString()}</span>
+                                              <span className="text-right text-foreground">{formatTokens(getModelTokens(model))}</span>
+                                              <span className="text-right font-mono text-amber-600 dark:text-amber-400">{formatCost(toNumber(model.cost))}</span>
+                                            </div>
+                                          )) : (
+                                            <div className="border-t border-border px-3 py-5 text-center text-xs text-muted-foreground">暂无模型明细</div>
+                                          )}
+                                        </div>
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                </td>
+                              </tr>
+                            )}
+                          </Fragment>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>

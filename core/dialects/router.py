@@ -193,6 +193,19 @@ def _create_dialect_verify_api_key(dialect_id: str):
             from fastapi import HTTPException
             raise HTTPException(status_code=403, detail="Invalid or missing API Key")
 
+        # 修改原因：Key 级启用开关需要覆盖方言入口（如 /v1beta、/v1/messages），不能只拦标准 /v1 路由。
+        # 修改方式：与 core/auth.py 使用同一判定函数；admin JWT 映射的索引豁免，避免控制台失联。
+        # 目的：禁用后该 Key 在所有协议入口均被拒绝，重新启用即恢复。
+        try:
+            from core.auth import is_api_key_disabled, _is_admin_jwt_token
+            if is_api_key_disabled(app, api_index) and not _is_admin_jwt_token(token):
+                from fastapi import HTTPException
+                raise HTTPException(status_code=403, detail="API Key has been disabled")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
         if is_key_ip_blocked(app, api_index, client_ip):
             # 修改原因：方言入口解析出 API Key 下标后，也要执行当前 Key 的 IP 黑名单。
             # 修改方式：用 api_index 读取 app.state.api_key_ip_blacklists 对应规则。
@@ -274,13 +287,21 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
                 render_fn = stream_renderer or dialect.render_stream
                 # 默认拍扁：方言未声明 structured_stream 时，自动将结构化 content list 拍扁为 markdown string
                 should_flatten = not dialect.structured_stream
-                async for chunk in resp.body_iterator:
-                    chunk_text = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
-                    if should_flatten:
-                        chunk_text = _flatten_stream_content(chunk_text)
-                    converted = await render_fn(chunk_text) if render_fn else chunk_text
-                    if converted:
-                        yield converted
+                source_iterator = resp.body_iterator
+                try:
+                    async for chunk in source_iterator:
+                        chunk_text = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                        if should_flatten:
+                            chunk_text = _flatten_stream_content(chunk_text)
+                        converted = await render_fn(chunk_text) if render_fn else chunk_text
+                        if converted:
+                            yield converted
+                finally:
+                    # 修改原因：关闭外层方言流不会自动关闭 async for 正在消费的内层生成器。
+                    # 修改方式：无论正常结束、客户端断开还是转换异常，都显式关闭原响应迭代器。
+                    # 目的：退出 client.stream 上下文并把连接归还 httpx 连接池。
+                    if hasattr(source_iterator, "aclose"):
+                        await source_iterator.aclose()
 
             return LoggingStreamingResponse(convert_stream(), media_type="text/event-stream",
                                             current_info=current_info, app=app, debug=debug,
