@@ -14,6 +14,7 @@ import { ProviderLogo } from '../../../components/ProviderLogos';
 import { PipelineView } from './PipelineView';
 import { summarizeVirtualChain } from '../../../lib/virtualModels';
 import { apiFetch } from '../../../lib/api';
+import { createApiKeyClientId } from '../../../lib/apiKeyClientId';
 import { toastError, fmtErr } from '../../../components/Toast';
 import type { ChannelOption } from '../types';
 import { SCHEDULE_ALGORITHMS, getBalancePercent, hasUiSlot } from '../utils';
@@ -363,7 +364,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                         {formData.api_keys.map((keyObj, idx) => {
                           if (focusedKeyIdx === idx) {
                             return (
-                              <div key={`full-${idx}`} className="w-full basis-full">
+                              <div key={`full-${keyObj._clientId}`} style={{ gridColumn: '1 / -1' }}>
                                 {/* 修改原因：机房模式中被选中的卡片需要展开为原完整行，才能编辑完整 Key、备注和全部操作。
                                     修改方式：在 flex-wrap 网格中用 w-full basis-full 包裹共用完整行渲染，让展开项独占一整行。
                                     目的：其他未选中卡片继续保持紧凑排列，选中项上下自然换行。 */}
@@ -398,7 +399,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
 
                           return (
                             <RackCard
-                              key={idx}
+                              key={keyObj._clientId}
                               idx={idx}
                               keyObj={keyObj}
                               providerName={formData.provider}
@@ -417,7 +418,6 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                         })}
                         <div
                           className="relative h-[92px] overflow-hidden rounded-lg border border-dashed border-border/60 bg-card/50 text-foreground transition-all duration-200 hover:border-primary/40 flex flex-col items-center justify-center gap-1.5"
-                          style={{ width: 'calc((100% - 5 * 6px) / 6)' }}
                         >
                           <button type="button" onClick={addEmptyKey} className="flex items-center gap-1 rounded px-2 py-1 text-[10px] text-primary hover:bg-muted"><Plus className="w-3 h-3" /> 添加</button>
                           {isOAuthEngine ? (
@@ -431,7 +431,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                       <>
                         {formData.api_keys.map((keyObj, idx) => (
                           <FullKeyRow
-                            key={idx}
+                            key={keyObj._clientId}
                             keyObj={keyObj}
                             idx={idx}
                             formData={formData}
@@ -478,7 +478,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                           ) : (
                             <button type="button" onClick={() => { setBatchPasteOpen(true); setBatchImportOpen(false); }} className="text-muted-foreground hover:text-primary flex items-center gap-1"><ClipboardPaste className="w-3.5 h-3.5" /> 批量粘贴</button>
                           )}
-                          <button type="button" onClick={() => setFormData(prev => prev ? ({...prev, api_keys: [...prev.api_keys, {key: '*', disabled: false}]}) : prev)} className="text-muted-foreground hover:text-foreground flex items-center gap-1">* BYOK</button>
+                          <button type="button" onClick={() => setFormData(prev => prev ? ({...prev, api_keys: [...prev.api_keys, {_clientId: createApiKeyClientId(), key: '*', disabled: false}]}) : prev)} className="text-muted-foreground hover:text-foreground flex items-center gap-1">* BYOK</button>
                         </div>
                       </div>
                     )}
@@ -637,7 +637,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                                 body: JSON.stringify({ provider: formData.provider, type: formData.engine, data }),
                               });
                               const json = await res.json();
-                              if (!res.ok) { setBatchImportError(json?.error || '导入失败'); } else { setBatchImportResult(json); refreshOAuthAccounts?.(); }
+                              if (!res.ok) { setBatchImportError(json?.error || '导入失败'); } else { setBatchImportResult(json); refreshOAuthAccounts?.({ syncFormKeys: true }); }
                             } catch (err: any) { setBatchImportError(err.message || '请求失败'); }
                             setBatchImportLoading(false);
                           }}
@@ -718,7 +718,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                               onClick={() => {
                                 setFormData(prev => prev ? ({
                                   ...prev,
-                                  api_keys: [...prev.api_keys, ...newKeys.map(k => ({ key: k, disabled: false }))],
+                                  api_keys: [...prev.api_keys, ...newKeys.map(k => ({ _clientId: createApiKeyClientId(), key: k, disabled: false }))],
                                 }) : prev);
                                 setBatchPasteOpen(false); setBatchPasteText('');
                               }}
@@ -732,10 +732,14 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                   )}
 
                   {isOAuthEngine && (
-                    <div className="mt-2 flex justify-end">
-                      {/* 修改原因：OAuth 凭据需要一个管理员显式导出入口，用于迁移或备份当前渠道。 */}
-                      {/* 修改方式：在 OAuth Key 列表底部增加小按钮，点击后下载 /v1/oauth/export 返回的 JSON。 */}
-                      {/* 目的：避免在普通账号列表中暴露 refresh_token，同时保留受控导出能力。 */}
+                    <div className="mt-2 flex justify-end gap-3">
+                      <button
+                        type="button"
+                        onClick={() => refreshOAuthAccounts?.({ syncFormKeys: true })}
+                        className="text-xs text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 flex items-center gap-1"
+                      >
+                        <RefreshCw className="w-3 h-3" /> 同步 OAuth 账号
+                      </button>
                       <button
                         type="button"
                         onClick={exportOAuthCredentials}

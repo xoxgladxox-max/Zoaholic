@@ -12,6 +12,7 @@ import {
 } from 'react';
 
 import { apiFetch } from '../../../lib/api';
+import { createApiKeyClientId } from '../../../lib/apiKeyClientId';
 import type { EnabledPluginValue } from '../../../lib/pluginEntries';
 import { toastError, toastSuccess, toastWarning, fmtErr } from '../../../components/Toast';
 import { useChannelOAuth } from './useChannelOAuth';
@@ -142,7 +143,7 @@ export interface UseChannelEditorResult {
   refreshKeyStatus: UseChannelsCoreResult['refreshKeyStatus'];
   restoreChannelModalScrollLock: () => void;
   applyChannelModalScrollLock: () => void;
-  refreshOAuthAccounts: () => Promise<void>;
+  refreshOAuthAccounts: (opts?: { syncFormKeys?: boolean }) => Promise<void>;
   openModal: (provider?: any, index?: number | null) => Promise<void>;
   updateFormData: (field: keyof ProviderFormData, value: any) => void;
   updatePreference: (field: keyof ProviderFormData['preferences'], value: any) => void;
@@ -280,21 +281,25 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
   const restoreChannelModalScrollLock = useCallback(() => {
     if (!channelModalBodyStyleRef.current) return;
     channelModalBodyStyleRef.current = null;
-    const scrollY = channelModalScrollYRef.current;
-    // Radix Dialog 关闭后会异步恢复 body style，需要等它完成再滚动
+    const savedTop = channelModalScrollYRef.current;
+    // 页面实际滚动容器是 Layout 的 <main>，不是 window；Radix Dialog 关闭后会异步恢复 body style 与焦点，分两帧恢复避免被覆盖。
     requestAnimationFrame(() => {
-      window.scrollTo(0, scrollY);
+      requestAnimationFrame(() => {
+        const scroller = document.querySelector('main');
+        if (scroller) scroller.scrollTop = savedTop;
+      });
     });
   }, []);
 
   const applyChannelModalScrollLock = useCallback(() => {
     if (channelModalBodyStyleRef.current) return;
-    const currentScrollY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
-    channelModalScrollYRef.current = currentScrollY;
+    // 页面实际滚动容器是 Layout 的 <main className="flex-1 overflow-auto">，window.scrollY 恒为 0。
+    const scroller = document.querySelector('main');
+    channelModalScrollYRef.current = scroller ? scroller.scrollTop : 0;
     channelModalBodyStyleRef.current = { locked: true } as any;
   }, []);
 
-  const isChannelScrollLockedDialogOpen = isModalOpen || testDialogOpen || keyTestDialogOpen;
+  const isChannelScrollLockedDialogOpen = isModalOpen || testDialogOpen || keyTestDialogOpen || analyticsOpen;
 
   useEffect(() => {
     // 修改原因：旧逻辑把 restoreChannelModalScrollLock 放在依赖 isModalOpen 的 effect cleanup 中，false → true 打开弹窗时会先执行旧 cleanup，导致刚设置的滚动锁被立即清掉。
@@ -360,13 +365,13 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
             const [k, v] = entries[0];
             const trimmed = String(k).trim();
             const label = v ? String(v).trim() : undefined;
-            if (trimmed.startsWith('!')) return { key: trimmed.substring(1), disabled: true, label };
-            return { key: trimmed, disabled: false, label };
+            if (trimmed.startsWith('!')) return { _clientId: createApiKeyClientId(), key: trimmed.substring(1), disabled: true, label };
+            return { _clientId: createApiKeyClientId(), key: trimmed, disabled: false, label };
           }
         }
         const trimmed = String(raw).trim();
-        if (trimmed.startsWith('!')) return { key: trimmed.substring(1), disabled: true };
-        return { key: trimmed, disabled: false };
+        if (trimmed.startsWith('!')) return { _clientId: createApiKeyClientId(), key: trimmed.substring(1), disabled: true };
+        return { _clientId: createApiKeyClientId(), key: trimmed, disabled: false };
       };
 
       let parsedKeys: ApiKeyObj[] = [];
@@ -493,7 +498,7 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
   const addEmptyKey = () => {
     if (!formData) return;
     const newIdx = formData.api_keys.length;
-    updateFormData('api_keys', [...formData.api_keys, { key: '', disabled: false }]);
+    updateFormData('api_keys', [...formData.api_keys, { _clientId: createApiKeyClientId(), key: '', disabled: false }]);
     setTimeout(() => {
       setFocusedKeyIdx(newIdx);
       requestAnimationFrame(() => {
@@ -544,6 +549,12 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
         return;
       }
     }
+    // 删除中间项时同步修正聚焦下标，避免后继 Key 顶替被删行的展开/焦点状态。
+    setFocusedKeyIdx(current => {
+      if (current === null) return null;
+      if (current === idx) return null;
+      return current > idx ? current - 1 : current;
+    });
     updateFormData('api_keys', formData.api_keys.filter((_, i) => i !== idx));
   };
 
@@ -555,7 +566,7 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
     const newKeys = [...formData.api_keys];
     newKeys[idx] = { ...newKeys[idx], key: lines[0] };
     const existingSet = new Set(newKeys.map(k => k.key));
-    const newKeyObjs = lines.slice(1).filter(k => !existingSet.has(k)).map(k => ({ key: k, disabled: false }));
+    const newKeyObjs = lines.slice(1).filter(k => !existingSet.has(k)).map(k => ({ _clientId: createApiKeyClientId(), key: k, disabled: false }));
     newKeys.splice(idx + 1, 0, ...newKeyObjs);
     updateFormData('api_keys', newKeys);
   };
