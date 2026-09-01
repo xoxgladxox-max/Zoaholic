@@ -85,7 +85,7 @@ _reverse_prop_map: ContextVar[dict] = ContextVar("_ccc_reverse_prop_map", defaul
 # 修改原因：普通 Claude 渠道挂载插件时，需要与 claude-code 核心 channel 使用同一组默认版本和 billing 参数。
 # 修改方式：将核心 channel 的默认版本、billing salt、采样索引和 header 前缀提升为插件常量。
 # 目的：让插件生成的 User-Agent 和 billing header 与 Claude Code 伪装逻辑保持一致。
-DEFAULT_CLAUDE_CODE_VERSION = "2.1.161"
+DEFAULT_CLAUDE_CODE_VERSION = "2.1.251"
 DEFAULT_BILLING_SALT = "59cf53e54c78"
 DEFAULT_ENTRYPOINT_ENV = "CLAUDE_CODE_ENTRYPOINT"
 DEFAULT_ENTRYPOINT = "cli"
