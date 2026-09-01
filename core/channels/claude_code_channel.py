@@ -61,7 +61,7 @@ CLAUDE_REFRESH_MAX_RETRIES = 3
 #   旧值 claude-code/2.1.97 已被识别为第三方。
 # 修改方式：对齐 sub2api constants.go 中 CLICurrentVersion 和 DefaultHeaders["User-Agent"]。
 # 目的：降低被判定 third-party 而走 extra usage 的概率。
-CLAUDE_CODE_CLI_VERSION = "2.1.161"
+CLAUDE_CODE_CLI_VERSION = "2.1.251"
 CLAUDE_CODE_USER_AGENT = f"claude-cli/{CLAUDE_CODE_CLI_VERSION} (external, cli)"
 
 # ── Session ID 缓存（per api_key，1 小时 TTL） ──
